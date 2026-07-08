@@ -1459,6 +1459,70 @@ class TestBuildAnthropicKwargs:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["output_config"] == {"effort": "max"}
 
+    def test_response_format_json_schema_maps_to_output_config_format(self):
+        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "answer as JSON"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "plugin_structured_output", "schema": schema},
+            },
+        )
+        assert kwargs["output_config"] == {
+            "format": {"type": "json_schema", "schema": schema}
+        }
+
+    def test_response_format_merges_with_effort_output_config(self):
+        # output_config.format must not clobber output_config.effort set by
+        # reasoning_config on the same request — they are sibling keys.
+        schema = {"type": "object"}
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "think hard, answer as JSON"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "high"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": schema},
+            },
+        )
+        assert kwargs["output_config"] == {
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": schema},
+        }
+
+    def test_response_format_ignored_for_non_claude_anthropic_compatible_model(self):
+        # Third-party Anthropic-Messages-compatible endpoints (minimax,
+        # qwen3, glm, …) are not guaranteed to support output_config.format.
+        kwargs = build_anthropic_kwargs(
+            model="minimax-m2",
+            messages=[{"role": "user", "content": "answer as JSON"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+        )
+        assert "output_config" not in kwargs
+
+    def test_response_format_none_is_a_no_op(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            response_format=None,
+        )
+        assert "output_config" not in kwargs
+
     def test_opus_4_7_strips_sampling_params(self):
         # Opus 4.7 returns 400 on non-default temperature/top_p/top_k.
         # build_anthropic_kwargs must strip them as a safety net even if an

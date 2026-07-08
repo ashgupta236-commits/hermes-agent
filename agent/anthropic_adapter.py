@@ -2463,6 +2463,7 @@ def build_anthropic_kwargs(
     base_url: str | None = None,
     fast_mode: bool = False,
     drop_context_1m_beta: bool = False,
+    response_format: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -2501,6 +2502,16 @@ def build_anthropic_kwargs(
     fast-mode beta header for ~2.5x faster output throughput on Opus 4.6.
     Currently only supported on native Anthropic endpoints (not third-party
     compatible ones).
+
+    When *response_format* carries the OpenAI-compatible
+    ``{"type": "json_schema", "json_schema": {"schema": {...}, ...}}`` shape
+    (as built by ``agent/plugin_llm.py``'s ``_json_response_format``), it is
+    translated into Anthropic's native, GA ``output_config.format`` —
+    constrained decoding that guarantees schema-valid JSON, no beta header
+    required. Merged into any ``output_config`` already set by
+    *reasoning_config* (e.g. ``{"effort": ...}``) rather than overwriting it.
+    Ignored for non-Claude Anthropic-Messages-compatible endpoints, which
+    are not guaranteed to support this Anthropic-specific field.
     """
     system, anthropic_messages = convert_messages_to_anthropic(
         messages, base_url=base_url, model=model
@@ -2690,6 +2701,24 @@ def build_anthropic_kwargs(
             betas.extend(_OAUTH_ONLY_BETAS)
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
+
+    # ── Structured outputs (GA) ───────────────────────────────────────
+    # Translate the OpenAI-compatible response_format shape into Anthropic's
+    # native output_config.format. Without this, a caller-supplied JSON
+    # schema (e.g. via plugin_llm.complete_structured) reached the model as
+    # nothing more than a text-embedded hint — Anthropic never enforced it,
+    # and the only signal of a miss was jsonschema.validate() failing after
+    # the fact. Gated to genuine Claude models: third-party Anthropic-
+    # Messages-compatible endpoints aren't guaranteed to support this field.
+    if response_format and _is_claude_model(model):
+        schema = None
+        if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+            schema = (response_format.get("json_schema") or {}).get("schema")
+        if schema is not None:
+            kwargs["output_config"] = {
+                **(kwargs.get("output_config") or {}),
+                "format": {"type": "json_schema", "schema": schema},
+            }
 
     return kwargs
 

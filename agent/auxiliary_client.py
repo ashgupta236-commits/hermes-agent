@@ -1205,6 +1205,20 @@ class _AnthropicCompletionsAdapter:
             max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
         temperature = kwargs.get("temperature")
 
+        # Translate extra_body.response_format (the OpenAI-compatible shape
+        # agent/plugin_llm.py's _json_response_format() builds) into
+        # Anthropic's native output_config.format, mirroring the
+        # extra_body.reasoning translation on the Codex Responses adapter
+        # above. Without this, plugin_llm.complete_structured() callers got
+        # no server-side enforcement on native Anthropic models — only a
+        # text-embedded schema hint plus best-effort post-hoc validation.
+        extra_body = kwargs.get("extra_body")
+        response_format = (
+            extra_body.get("response_format") if isinstance(extra_body, dict) else None
+        )
+        if response_format is None:
+            response_format = kwargs.get("response_format")
+
         normalized_tool_choice = None
         if isinstance(tool_choice, str):
             normalized_tool_choice = tool_choice
@@ -1223,6 +1237,7 @@ class _AnthropicCompletionsAdapter:
             reasoning_config=None,
             tool_choice=normalized_tool_choice,
             is_oauth=self._is_oauth,
+            response_format=response_format,
         )
         # Opus 4.7+ rejects any non-default temperature/top_p/top_k; only set
         # temperature for models that still accept it. build_anthropic_kwargs
