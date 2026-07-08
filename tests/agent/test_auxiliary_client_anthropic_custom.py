@@ -89,6 +89,52 @@ def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
     assert not isinstance(client, AnthropicAuxiliaryClient)
 
 
+def test_anthropic_completions_adapter_threads_response_format_from_extra_body():
+    """_AnthropicCompletionsAdapter.create() must forward
+    extra_body["response_format"] (the OpenAI-compatible shape
+    plugin_llm._json_response_format() builds) to build_anthropic_kwargs, so
+    plugin_llm.complete_structured() callers get real output_config.format
+    enforcement on native Anthropic models instead of a silently-dropped hint.
+    """
+    from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    adapter = _AnthropicCompletionsAdapter(
+        real_client=MagicMock(), model="claude-opus-4-8", is_oauth=False
+    )
+
+    with patch(
+        "agent.anthropic_adapter.build_anthropic_kwargs",
+        return_value={"model": "claude-opus-4-8", "messages": []},
+    ) as mock_build, patch(
+        "agent.anthropic_adapter.create_anthropic_message",
+        return_value=MagicMock(content=[], usage=None),
+    ), patch(
+        "agent.transports.get_transport",
+        return_value=MagicMock(
+            normalize_response=MagicMock(
+                return_value=MagicMock(
+                    content="", tool_calls=None, reasoning=None, finish_reason="stop"
+                )
+            )
+        ),
+    ):
+        adapter.create(
+            messages=[{"role": "user", "content": "answer as JSON"}],
+            extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": schema},
+                }
+            },
+        )
+
+    assert mock_build.call_args.kwargs["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"schema": schema},
+    }
+
+
 def test_custom_endpoint_chat_completions_still_uses_openai_wire():
     """Regression: default path (no api_mode) must remain OpenAI client."""
     from agent.auxiliary_client import _try_custom_endpoint, AnthropicAuxiliaryClient
