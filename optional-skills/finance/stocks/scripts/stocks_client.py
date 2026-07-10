@@ -574,8 +574,8 @@ def cmd_compare(symbols: list[str]) -> None:
             price_f = float(entry["price"]) if entry["price"] else None
             high_f = float(entry["52w_high"]) if entry["52w_high"] else None
             low_f = float(entry["52w_low"]) if entry["52w_low"] else None
-            if price_f and low_f and price_f > 0 and low_f > 0:
-                perf = ((price_f - low_f) / low_f) * 100
+            if price_f and high_f and low_f and price_f > 0 and high_f > low_f:
+                perf = ((price_f - low_f) / (high_f - low_f)) * 100
                 entry["52w_performance_pct"] = fmt_pct(perf)
         except (ValueError, TypeError, ZeroDivisionError):
             pass
