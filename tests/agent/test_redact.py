@@ -1046,3 +1046,55 @@ class TestRedactCdpUrl:
 
     def test_none_returns_empty(self):
         assert redact_cdp_url(None) == ""
+
+
+class TestCfgDottedReDoSGuard:
+    r"""Regression guard for the _CFG_DOTTED_RE catastrophic-backtracking bug.
+
+    The previous unbounded form (``(?:[A-Za-z0-9_\-]+\.)+[A-Za-z0-9_.\-]*``)
+    backtracked ~O(n^3.3) on a long dotted non-matching run. Because CPython's
+    ``re`` engine holds the GIL for the whole match, a ~4.9 KB adversarial input
+    froze the dashboard event loop for ~367 s ("event loop stalled ... GIL
+    pressure suspected"). The fix bounds the ambiguous quantifiers; these tests
+    pin both halves of the contract: still-linear on adversarial input, and
+    redaction behavior unchanged on real config secrets.
+    """
+
+    def test_adversarial_dotted_run_is_fast(self):
+        import time
+
+        from agent.redact import _CFG_DOTTED_RE
+
+        # ~8 KB of dotted tokens with a trailing secret word but no '=' — the
+        # worst case for the old pattern (forces maximal backtracking). Must
+        # complete well under a second; the old pattern took minutes here.
+        adversarial = "a." * 4000 + "secret"
+        start = time.monotonic()
+        _CFG_DOTTED_RE.sub("K=***", adversarial)
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, f"_CFG_DOTTED_RE took {elapsed:.1f}s — ReDoS regression"
+
+    def test_still_redacts_namespaced_config_secrets(self):
+        # The generous bounds ({1,40} segments, {0,80}-char runs) exceed any
+        # real config key, so genuine secrets must still be masked.
+        for line, leaked in [
+            ("spring.datasource.password=hunter2", "hunter2"),
+            ("app.api.key=xyz123", "xyz123"),
+            ("com.example.service.secret=topsecret", "topsecret"),
+            ("a.b.c.token=tok_9999", "tok_9999"),
+            ("server.security.oauth2.client.credential=cred123", "cred123"),
+        ]:
+            out = redact_sensitive_text(line, force=True)
+            assert leaked not in out, f"leaked secret from {line!r}: {out!r}"
+
+    def test_leaves_non_secret_dotted_keys_alone(self):
+        # A dotted key with NO secret word in it (and prose) must be unchanged.
+        # (A key like ``...no.secret.word=v`` DOES contain "secret" and is
+        # redacted by both the old and new patterns — that is not a leave-alone
+        # case; the bar here is behavior identical to the original pattern.)
+        for line in [
+            "my.app.database.hostname=localhost",
+            "com.example.service.timeout=30",
+            "config loaded from spring.datasource.url successfully",
+        ]:
+            assert redact_sensitive_text(line, force=True) == line
