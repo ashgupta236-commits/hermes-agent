@@ -1354,3 +1354,49 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+---
+
+## Cursor Cloud specific instructions
+
+Environment-specific notes for cloud agents. The startup update script already
+runs `uv sync --locked --python 3.11 --extra all --extra dev`, so `.venv` is
+present and matches CI. `uv` is preinstalled at `~/.local/bin/uv` (on `PATH`
+via `~/.bashrc`). Always activate the env first: `source .venv/bin/activate`.
+
+- **Python toolchain:** managed CPython **3.11** provisioned by `uv` (repo caps
+  `requires-python` at `<3.14`). The system `python3` is 3.12 — ignore it and
+  use `.venv`.
+- **Lint / typecheck / test** (all standard, no special setup):
+  - Blocking lint: `ruff check .` (only `PLW1514` is enforced) and
+    `python scripts/check-windows-footguns.py --all`.
+  - `ty check` is **advisory only** — it reports ~10k pre-existing diagnostics
+    and CI runs it with `--exit-zero`. Do not treat its non-zero exit as a
+    failure.
+  - Tests: **always** use `scripts/run_tests.sh` (never bare `pytest`); it runs
+    per-file subprocess isolation in a hermetic env. The full suite is ~1900
+    files — scope to a path (e.g. `scripts/run_tests.sh tests/acp/`) for quick
+    checks. `integration`-marked tests are skipped by default.
+- **Running the agent needs a model endpoint.** No provider key ships in the
+  environment, so `hermes` cannot reach a real LLM out of the box. To smoke-test
+  the full agent loop with **no external key**, point it at a local
+  OpenAI-compatible server via `~/.hermes/config.yaml`:
+  ```yaml
+  model:
+    default: <model-id>
+    provider: custom
+    base_url: http://127.0.0.1:<port>/v1
+    api_key: no-key-required
+  ```
+  Then `hermes -z "hello"` (one-shot, stdout = reply only) or
+  `hermes chat -q "hello"` (full CLI path; creates a persisted session in the
+  SQLite store). For a real model instead, set the provider key in
+  `~/.hermes/.env` (e.g. `NOUS_API_KEY` / `OPENROUTER_API_KEY`) and run
+  `hermes model`. State/config live under `~/.hermes/` (profile-aware).
+- **Node surfaces are separate and optional** (not covered by the update
+  script). TUI (`ui-tui/`), web dashboard (`web/`), and Electron desktop
+  (`apps/desktop/`) each need their own `npm install`/`npm ci` (Node ≥20 is
+  available via nvm). See the TUI/desktop dev commands already documented above.
+- **`hermes doctor`** is a safe read-only health check; optional-toolset
+  warnings (missing API keys / system deps for browser, web-search, image-gen,
+  messaging platforms, etc.) are expected and not failures.
