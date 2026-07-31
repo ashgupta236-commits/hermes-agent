@@ -1377,22 +1377,37 @@ via `~/.bashrc`). Always activate the env first: `source .venv/bin/activate`.
     per-file subprocess isolation in a hermetic env. The full suite is ~1900
     files — scope to a path (e.g. `scripts/run_tests.sh tests/acp/`) for quick
     checks. `integration`-marked tests are skipped by default.
-- **Running the agent needs a model endpoint.** No provider key ships in the
-  environment, so `hermes` cannot reach a real LLM out of the box. To smoke-test
-  the full agent loop with **no external key**, point it at a local
-  OpenAI-compatible server via `~/.hermes/config.yaml`:
+- **Model provider — LOCKED default for this environment.** The agent is
+  configured to use the **Nous inference API** (OpenAI-compatible) with
+  **`moonshotai/kimi-k3`** as the default model, wired as a *named custom
+  provider* in `~/.hermes/config.yaml`:
   ```yaml
+  providers:
+    nous-api:
+      api: https://inference-api.nousresearch.com/v1
+      key_env: NOUS_API_KEY
+      default_model: moonshotai/kimi-k3
   model:
-    default: <model-id>
-    provider: custom
-    base_url: http://127.0.0.1:<port>/v1
-    api_key: no-key-required
+    default: moonshotai/kimi-k3
+    provider: nous-api
   ```
+  The API key is read from the **`NOUS_API_KEY`** env var. Set it as a Cursor
+  **Secret** named `NOUS_API_KEY` (Secrets panel) so it is injected into every
+  cloud VM and `hermes` works out of the box; if the `~/.hermes/config.yaml`
+  above is ever missing (fresh home, no snapshot), recreate it exactly as shown.
   Then `hermes -z "hello"` (one-shot, stdout = reply only) or
-  `hermes chat -q "hello"` (full CLI path; creates a persisted session in the
-  SQLite store). For a real model instead, set the provider key in
-  `~/.hermes/.env` (e.g. `NOUS_API_KEY` / `OPENROUTER_API_KEY`) and run
-  `hermes model`. State/config live under `~/.hermes/` (profile-aware).
+  `hermes chat -q "hello"` (full CLI path; persists a session in the SQLite
+  store) run against the real model. Notes:
+  - The **built-in `nous` provider is OAuth-only** and ignores a raw key — the
+    `nous-api` custom-provider mapping above is what makes the API key work.
+  - Switch models by changing `model.default` (+ `default_model`) to any id
+    from `GET https://inference-api.nousresearch.com/v1/models` (321 available,
+    e.g. `openai/gpt-5.6-sol`, `anthropic/claude-opus-4.8`).
+  - Never commit the key or `~/.hermes/.env`. This is independent of any
+    separate EC2/AWS Hermes OAuth (Grok/GPT) setup — do not touch that.
+  - Keyless local smoke test alternative: `provider: custom` + a loopback
+    `base_url` + `api_key: no-key-required`. State/config live under
+    `~/.hermes/` (profile-aware).
 - **Node surfaces are separate and optional** (not covered by the update
   script). TUI (`ui-tui/`), web dashboard (`web/`), and Electron desktop
   (`apps/desktop/`) each need their own `npm install`/`npm ci` (Node ≥20 is
