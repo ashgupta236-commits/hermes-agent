@@ -1,0 +1,6 @@
+name: novra-triage
+version: "0.1.0"
+description: "NOVRA Tier-0 prompt triage for the Hermes gateway. Three lanes: GREEN (silent), AMBER (plan-first advisory), RED (reserved-act / wall / freeze / secrets hard stop). Inject-only — it contributes context to the user turn and can never block or rewrite a prompt. Native port of novra-os/.claude/hooks/prompt-triage.sh v3.1, which cannot run here because Hermes has no inbound hook-script mechanism."
+author: "NOVRA"
+hooks:
+  - pre_llm_call
