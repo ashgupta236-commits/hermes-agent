@@ -129,14 +129,28 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. ``skipped`` is a PASS, because
+  # that is the path filter working as intended on an unrelated PR.
   #
   # Branch protection should require ONLY this check.
+  #
+  # 2026-08-05 — ``detect`` MUST stay in ``needs``. Every job below hangs off
+  # it, so when detect fails GitHub marks them all ``skipped`` — which is
+  # indistinguishable from the path-filter skip this gate accepts. detect was
+  # absent from this list, and the evaluator only tested ``r == 'failure'``, so
+  # its failure never reached the tally and the roll-up printed "All checks
+  # passed" with zero tests, zero lint, zero typecheck and no supply-chain scan
+  # having run. Verified: deleting scripts/ci/classify_changes.py exits the
+  # detect step 2; a syntax error exits it 1.
+  #
+  # The worst case is self-referential: a PR that breaks classify_changes.py or
+  # the detect-changes action is exactly the PR that switches off every check
+  # meant to catch it.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
     needs:
+      - detect
       - tests
       - lint
       - typecheck
@@ -154,16 +168,37 @@ jobs:
     steps:
       - name: Evaluate job results
         env:
-          RESULTS: ${{ toJSON(needs.*.result) }}
+          # toJSON(needs), not toJSON(needs.*.result): the names make the verdict
+          # legible, and they let detect be singled out as the precondition.
+          RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "$RESULTS" | python3 -c "
           import json, sys
-          results = json.load(sys.stdin)
-          failed = [r for r in results if r == 'failure']
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed')
+          needs = json.load(sys.stdin)
+          results = {n: (i or {}).get('result') for n, i in needs.items()}
+
+          # The precondition, checked first and by name. If detect did not SUCCEED,
+          # every downstream skip is meaningless and the run verified nothing.
+          detect = results.pop('detect', None)
+          if detect != 'success':
+              print(f'::error::detect did not succeed (result: {detect!r}). Every job that depends on it was skipped, so nothing was verified — this is not a pass.')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+
+          # skipped stays a PASS (the path filter). Anything that is neither success
+          # nor skipped FAILS — so cancelled, timed_out and any result GitHub adds
+          # later fail closed, instead of sliding past an '== failure' test.
+          bad = {n: r for n, r in results.items() if r not in ('success', 'skipped')}
+          if bad:
+              for n, r in sorted(bad.items()):
+                  print(f'::error::{n}: {r}')
+              print(f'::error::{len(bad)} job(s) did not pass')
+              sys.exit(1)
+
+          ran = sorted(n for n, r in results.items() if r == 'success')
+          skip = sorted(n for n, r in results.items() if r == 'skipped')
+          print('ran:     ' + (', '.join(ran) or '(none)'))
+          print('skipped: ' + (', '.join(skip) or '(none)') + '   [path filter]')
+          print('All required checks pass')
           "
 
   # ─────────────────────────────────────────────────────────────────────
