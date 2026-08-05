@@ -86,6 +86,19 @@ def _redirect_uri(request: Request) -> str:
         resolve_public_url,
     )
 
+    # Tier 0: known secondary public origin -- the noVNC/Cowork bridge vhost
+    # (browser.<ip>.nip.io) reuses this same login flow but is a different
+    # cookie origin than the operator-declared public_url. If the callback
+    # always used public_url, the PKCE/session cookie set during /login on
+    # this vhost would never be visible at /auth/callback (different host
+    # = different cookie jar). Recognize this ONE known hostname explicitly
+    # (never an arbitrary/attacker-controlled Host header -- see the
+    # DNS-rebinding guard elsewhere in this module) and keep the callback
+    # on whichever known origin the request actually arrived on.
+    _bridge_host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+    if _bridge_host == "browser.32.185.103.108.nip.io":
+        return "https://browser.32.185.103.108.nip.io/auth/callback"
+
     # Tier 1: operator-declared public URL.
     public_url = resolve_public_url()
     if public_url:
