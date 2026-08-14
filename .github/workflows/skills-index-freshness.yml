@@ -5,11 +5,14 @@ name: Skills Index Freshness Check
 # stale OR the file disappears entirely OR a major source has collapsed,
 # this workflow opens a GitHub issue so we hear about it before users do.
 #
-# Triggered every 4 hours so we catch a stuck cron within one tick.
+# Triggered every 12 hours. The alarm threshold is 26 hours of staleness, so a 12-hour
+# tick still detects a stuck cron with better than 2x margin — every 4 hours bought no
+# extra safety against a 26-hour threshold, it just billed 3x the Actions minutes
+# (GitHub rounds every job up to a full minute, so cadence is the cost here).
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */12 * * *'
   workflow_dispatch:
 
 permissions:
