@@ -32,8 +32,24 @@ jobs:
   # to decide whether to run. On push/dispatch the classifier fails open
   # (all lanes true) so post-merge validation is never weakened.
   # ─────────────────────────────────────────────────────────────────────
+  # FORK GUARD. This workflow is upstream's, and on a fork it re-verifies code the
+  # upstream repository already tested, against the fork owner's Actions allowance.
+  # Measured on ashgupta236-commits/hermes-agent for 2026-08-01..13: `ci.yml` ran
+  # 10 times, spawned 275 jobs and billed ~607 minutes -- roughly 30% of a 2,000
+  # minute monthly allowance, and the single largest consumer in the estate. It
+  # exhausted the allowance on 2026-08-13, after which every workflow in every
+  # repository was refused a runner. skills-index.yml, skills-index-freshness.yml
+  # and deploy-site.yml already carry this exact guard; ci.yml was the one that
+  # did not, which is why it was the one that emptied the account.
+  #
+  # Guarding `detect` is what switches off the ten lane jobs: each carries
+  # `needs: detect`, so a skipped detect skips them by cascade, and a lane added
+  # later inherits the guard for free. Only the three jobs that do NOT cascade
+  # from detect -- osv-scanner (no needs) and the two `if: always()` reporters --
+  # need the condition repeated.
   detect:
     name: Detect affected areas
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     outputs:
       python: ${{ steps.classify.outputs.python }}
@@ -125,6 +141,8 @@ jobs:
 
   osv-scanner:
     name: OSV scan
+    # Repeated: this job has no `needs`, so nothing cascades the guard to it.
+    if: github.repository == 'NousResearch/hermes-agent'
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────
@@ -163,7 +181,14 @@ jobs:
       - osv-scanner
       # we don't require docker to pass rn because it's so slow lol
       # - docker
-    if: always()
+    #
+    # Guarded too, and deliberately: `always()` would otherwise keep this one job
+    # alive on a fork with every dependency skipped. Its own evaluator treats a
+    # non-success detect as a hard fail ("nothing was verified -- this is not a
+    # pass"), so leaving it on would paint every fork PR red for no reason. Making
+    # it pass instead would be worse: a green required check that tested nothing.
+    # A check that does not report is honest about a fork that does not test.
+    if: always() && github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate job results
@@ -210,7 +235,8 @@ jobs:
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass, docker]
-    if: always()
+    # Repeated for the same reason as the gate: `always()` outruns the cascade.
+    if: always() && github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
