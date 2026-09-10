@@ -49,7 +49,7 @@ def _is_transient(text: str) -> bool:
 
 
 class ClaudeCodeExecutive:
-    name = "claude_code"
+    name: str = "claude_code"
 
     def __init__(
         self,
@@ -175,7 +175,7 @@ class ClaudeCodeExecutive:
         model_usage = data.get("modelUsage") or {}
         models_used = list(model_usage.keys())
         residency_ok = self._residency_ok(req.model, models_used)
-        base = dict(
+        base: dict[str, Any] = dict(
             model_requested=req.model,
             models_used=models_used,
             input_tokens=int(usage.get("input_tokens", 0)) + int(usage.get("cache_read_input_tokens", 0)) + int(usage.get("cache_creation_input_tokens", 0)),

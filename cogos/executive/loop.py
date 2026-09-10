@@ -24,7 +24,7 @@ from cogos.config import CogosConfig
 from cogos.events import EventBus
 from cogos.executive.controller import Assessment, MetaCognitiveController
 from cogos.prompts import PROMPTS
-from cogos.governance.immune import wrap_untrusted
+from cogos.governance.immune import scan_for_injection, wrap_untrusted
 from cogos.ids import iso_now, new_id
 from cogos.memory import MemoryManager
 from cogos.observability import CalibrationTracker, DecisionJournal, ResourceLedger, Tracer
@@ -337,7 +337,14 @@ class Executive:
         memory_lines: list[str] = []
         try:
             mems = self.memory.retrieve(state.objective, limit=6, mission_id=state.mission_id)
-            memory_lines = [f"[{m.memory_class.value} {m.confidence:.2f}] {m.content[:200]}" for m in mems]
+            for m in mems:
+                flags = scan_for_injection(m.content)
+                if flags:
+                    # Poisoned memory is quarantined from the workspace and reported, never followed.
+                    self.tracer.emit("blocked", f"memory {m.id} quarantined: injection flags {flags}", data={"memory_id": m.id, "flags": flags})
+                    state.notes.append(f"memory {m.id} quarantined (injection flags {flags})")
+                    continue
+                memory_lines.append(f"[{m.memory_class.value} {m.confidence:.2f}] {m.content[:200]}")
         except Exception as exc:  # noqa: BLE001 - memory failures must not stop cognition
             self.tracer.emit("error", f"memory retrieval failed: {exc}")
         recent = [t.summary for t in self.store.traces(state.mission_id, limit=400) if t.kind in ("operation", "verify", "failure", "specialist")][-8:]
@@ -366,14 +373,14 @@ class Executive:
             "contradictions": [c.model_dump(mode="json") for c in state.unresolved_contradictions()[:5]],
             "directives": assessment.directives,
             "verification_pending": verification_pending,
-            "criteria_verification_pending": any(not c.satisfied for c in state.success_criteria) and planner.is_plan_exhausted() and not verification_pending and not state.resources.get("controller", {}).get("criteria_checked_cycle") == state.usage.cycles,
+            "criteria_verification_pending": any(not c.satisfied for c in state.success_criteria) and planner.is_plan_exhausted() and not verification_pending and state.resources.get("controller", {}).get("criteria_checked_sig") != self._criteria_sig(state),
             "synthesis_exists": bool(state.synthesis),
             "human_requests": [h.model_dump(mode="json") for h in state.unanswered_human_requests()],
             "independent_work_remaining": bool(ready),
             "plan_exhausted": planner.is_plan_exhausted(),
             "allowed_operations": allowed_ops,
             "tools": [s.name for s in self.fabric.specs()],
-            "research_tools": [n for n in ("web_search", "web_fetch", "read_file", "search_text") if self.fabric.spec(n) is not None and self.fabric.spec(n).available] + ["web_search"],
+            "research_tools": [n for n in ("web_search", "web_fetch", "read_file", "search_text") if (spec_n := self.fabric.spec(n)) is not None and spec_n.available] + ["web_search"],
             "falsification_target": falsify_target,
             "tournament": tournament,
             "belief_lines": beliefs.summary_for_workspace(limit=8),
@@ -401,6 +408,10 @@ class Executive:
             decision.task_id = ""
         return decision
 
+    @staticmethod
+    def _criteria_sig(state: MissionState) -> list[int]:
+        return [len(state.completed_tasks()), len(state.tests), len(state.evidence), len(state.claims), len(state.unresolved_contradictions()), int(bool(state.synthesis))]
+
     def _fallback_select(self, state: MissionState, planner: Planner, ready: list[Task], verification_pending: list[str]) -> Optional[StepDecision]:
         if verification_pending:
             return StepDecision(operation=OperationKind.VERIFY, task_id=verification_pending[0], rationale="fallback: verify pending outputs", confidence=0.5)
@@ -427,6 +438,22 @@ class Executive:
             calls = decision.tool_calls or ([] if not task else self._calls_from_task(task))
             if not calls:
                 out.errors.append("no tool calls specified")
+            # Web search has no local substrate: delegate it to a researcher specialist (Claude Code WebSearch).
+            searches = [c for c in calls if c.tool == "web_search" and self.fabric.spec("web_search") is None]
+            if searches:
+                calls = [c for c in calls if c.tool != "web_search"]
+                queries = [str(c.arguments().get("query") or c.purpose) for c in searches]
+                spec = SpecialistSpec(role="researcher", objective="Search the web and report sourced findings for: " + "; ".join(queries), tools=["web_search", "web_fetch"], context_keys=["unknowns"], max_turns=12, evidence_standard="primary sources; cite URL, date, scope; note repeated sources")
+                run = self.foundry.run(spec, state)
+                ledger.add_subagent()
+                ledger.add_model_call(run.response)
+                if run.report is not None:
+                    rep = run.report.model_dump(mode="json")
+                    rep["_injection_flags"] = run.injection_flags
+                    out.specialist_reports.append(rep)
+                    self.tracer.emit("specialist", f"researcher (web search): {run.report.conclusion[:160]}", data={"role": "researcher", "queries": queries, "model": run.model})
+                else:
+                    out.errors.append(f"web search specialist failed: {run.response.error[:160]}")
             for spec in calls:
                 res = self._tool(state, ToolCall(tool=spec.tool, arguments=spec.arguments(), task_id=out.task_id, purpose=spec.purpose), ledger, task)
                 out.tool_results.append(res)
@@ -486,13 +513,15 @@ class Executive:
                 ledger.add_subagent()
                 ledger.add_model_call(run.response)
                 self._check_residency(state, run.response, "specialist")
+                if run.report is not None and run.spec.independent and not run.report.blocked:
+                    self._extract_disagreements(state, run, out, planner)
                 if run.report is not None:
                     rep = run.report.model_dump(mode="json")
                     rep["_injection_flags"] = run.injection_flags
                     out.specialist_reports.append(rep)
                     self.tracer.emit("specialist", f"{run.spec.role} ({run.model}): {run.report.conclusion[:160]} conf={run.report.confidence:.2f}" + (" BLOCKED" if run.report.blocked else ""), data={"role": run.spec.role, "model": run.model, "independent": run.spec.independent, "confidence": run.report.confidence, "findings": len(run.report.findings), "blocked": run.report.blocked, "injection_flags": run.injection_flags, "turns": run.response.turns}, cost={"cost_usd": run.response.cost_usd, "input_tokens": run.response.input_tokens, "output_tokens": run.response.output_tokens})
                 else:
-                    out.errors.append(f"specialist {run.spec.role} failed: {run.response.error[:200]}")
+                    out.errors.append(f"specialist {run.spec.role} failed ({run.response.error_kind or 'structural'}): {run.response.error[:200]}")
                     self.tracer.emit("failure", f"specialist {run.spec.role} failed: {run.response.error[:160]}", data={"error_kind": run.response.error_kind})
                     if run.response.error_kind == "transient":
                         ledger.add_retry()
@@ -519,6 +548,41 @@ class Executive:
             else:
                 out.completion_refusal = gate.summary
         return out
+
+    def _executive_position(self, state: MissionState) -> str:
+        if state.synthesis.get("conclusion"):
+            return str(state.synthesis["conclusion"])
+        leading = [h for h in state.hypotheses if h.status == "leading"] or sorted(state.hypotheses, key=lambda h: -h.confidence)
+        if leading:
+            return leading[0].statement
+        top = sorted(state.claims, key=lambda c: -(c.confidence * c.decision_relevance))
+        return top[0].proposition if top else ""
+
+    def _extract_disagreements(self, state: MissionState, run: Any, out: OperationOutcome, planner: Planner) -> None:
+        """Independent cognition protocol: compare positions, keep material disagreements, target evidence."""
+        from cogos.agent_foundry.foundry import DisagreementReport
+
+        position = self._executive_position(state)
+        if not position or run.report is None:
+            return
+        req = CognitionRequest(kind="challenge", system_prompt=PROMPTS["challenge"], prompt=f"QUESTION: {run.spec.objective}\n\nPOSITION A (executive): {position}\n\nPOSITION B (independent {run.spec.role}): {run.report.conclusion}\n\nFINDINGS B: {json.dumps([f.model_dump(mode='json') for f in run.report.findings], default=str)[:8000]}", schema_name="DisagreementReport", output_schema=schema_for(DisagreementReport), model=self.config.executive.model, mission_id=state.mission_id, metadata={"question": run.spec.objective, "executive_position": position, "specialist_position": run.report.conclusion})
+        resp = self._cognition(state, req)
+        if not resp.ok:
+            return
+        try:
+            report = DisagreementReport.model_validate(resp.parsed)
+        except Exception:  # noqa: BLE001
+            return
+        state.resources.setdefault("controller", {})["challenged"] = True
+        material = [d for d in report.disagreements if d.material]
+        out.disagreements = [d.model_dump(mode="json") for d in report.disagreements]
+        self.tracer.emit("decision", f"independent challenge: {len(report.disagreements)} disagreement(s), {len(material)} material", data={"disagreements": out.disagreements, "executive_position": position[:300], "specialist_position": run.report.conclusion[:300]})
+        for d in material[:3]:
+            title = f"Resolve disagreement: {d.topic[:70]}"
+            if any(t.title == title for t in state.tasks):
+                continue
+            planner.add_tasks_from_specs([TaskSpec(key=f"dis_{abs(hash(d.topic)) % 10_000}", title=title, description=d.resolution_plan or "gather discriminating primary evidence", operation_hint="instantiate_specialist", parameters_json=json.dumps({"role": "source_auditor", "objective": f"Discriminate between: (A) {d.executive_position[:200]} vs (B) {d.specialist_position[:200]}. {d.resolution_plan}", "tools": ["web_search", "web_fetch", "read_file"], "max_turns": 12}), priority=0.9, parallel_safe=True)])
+            state.notes.append(f"material disagreement recorded: {d.topic[:120]}")
 
     def _calls_from_task(self, task: Task) -> list[Any]:
         from cogos.schemas.cognition import ToolCallSpec
@@ -561,10 +625,15 @@ class Executive:
         if task is not None:
             p = task.parameters
             if p.get("commands") or p.get("test_command") or p.get("verify_commands"):
-                cmds = p.get("commands") or p.get("verify_commands") or [p.get("test_command")]
-                if isinstance(cmds, str):
-                    cmds = [cmds]
-                result = engine.verify_code(list(cmds), cwd=p.get("cwd"), task_id=task.id)
+                raw_cmds = p.get("commands") or p.get("verify_commands") or [p.get("test_command")]
+                cmds: list[str] = [str(raw_cmds)] if isinstance(raw_cmds, str) else [str(c) for c in raw_cmds if c]
+                before = len(self.fabric.call_log)
+                result = engine.verify_code(cmds, cwd=p.get("cwd"), task_id=task.id)
+                for res in self.fabric.call_log[before:]:
+                    if res.error_kind in ("denied", "requires_human", "unavailable") and not any(b.operation.startswith(f"{res.tool} ") and not b.resolved for b in state.blocked_operations):
+                        state.blocked_operations.append(BlockedOperation(operation=f"{res.tool} {json.dumps({'command': cmds}, default=str)[:160]}", action_class=res.verdict.action_class if res.verdict else ActionClass.REVERSIBLE_LOCAL, reason=res.error, what_would_unblock="enable the verification tool (shell/tests) in governance policy or provide an allowed alternative", task_id=task.id))
+                        state.capability_state[res.tool] = {"last_verdict": res.error_kind, "reason": res.error}
+                        self.tracer.emit("blocked", f"verification tool {res.tool} unavailable: {res.error}", data={"task_id": task.id})
                 if p.get("expect_failure"):
                     # A reproduction step succeeds when the failure is observed.
                     observed = result.status == VerificationStatus.FAILED
@@ -574,7 +643,8 @@ class Executive:
                         rec.summary = "(reproduction) " + rec.summary
                         rec.status = VerificationStatus.PASSED if observed else VerificationStatus.FAILED
             elif p.get("research"):
-                result = engine.verify_research()
+                relevant = [c.id for c in state.claims if c.decision_relevance >= 0.5]
+                result = engine.verify_research(relevant or None)
             elif task.artifact_ids:
                 result = engine.verify_task(task)
             else:
@@ -584,8 +654,12 @@ class Executive:
                 task.verification_ids.append(result.id)
         if result is None:
             # Criteria pass: evaluate every unsatisfied criterion against verified state.
-            checks = [engine.verify_criterion(c) for c in state.success_criteria if not c.satisfied]
-            state.resources.setdefault("controller", {})["criteria_checked_cycle"] = state.usage.cycles
+            checks = []
+            for c in state.success_criteria:
+                if c.satisfied:
+                    continue
+                checks.append(engine.verify_criterion(c, evidence_ok=self._runtime_criterion_evidence(state, c)))
+            state.resources.setdefault("controller", {})["criteria_checked_sig"] = self._criteria_sig(state)
             if checks:
                 failed = [c for c in checks if c.status != VerificationStatus.PASSED]
                 result = VerificationResult(target_type="criteria", target_id=state.mission_id, status=VerificationStatus.PASSED if not failed else VerificationStatus.INCONCLUSIVE, summary=f"{len(checks) - len(failed)}/{len(checks)} criteria verified; " + "; ".join(c.summary[:100] for c in failed), checks=[chk for c in checks for chk in c.checks])
@@ -599,6 +673,30 @@ class Executive:
                         engine.verify_criterion(c)
         self.tracer.emit("verify", f"{result.target_type}:{result.target_id} {result.status.value} — {result.summary[:160]}", data=result.model_dump(mode="json"))
         return result
+
+    def _runtime_criterion_evidence(self, state: MissionState, criterion: Any) -> Optional[bool]:
+        """Deterministic checks the runtime can make on a criterion without a model.
+
+        Returns True/False when the criterion is decidable from state, None otherwise.
+        """
+        vm = (criterion.verification_method or "").lower() + " " + criterion.description.lower()
+        if "uncertaint" in vm or "unknowns" in vm:
+            open_unknowns = state.open_unknowns()
+            decision_changing = [u for u in open_unknowns if u.probability_changes_decision * u.decision_importance >= 0.5 and u.attempts == 0]
+            listed = set(map(str, state.synthesis.get("remaining_uncertainties", []))) if state.synthesis else set()
+            unbounded = [u for u in open_unknowns if u.probability_changes_decision * u.decision_importance >= 0.5 and u.question not in listed and u.attempts == 0]
+            if state.unresolved_contradictions() and any(c.severity >= 0.5 for c in state.unresolved_contradictions()):
+                return False
+            return not decision_changing or not unbounded
+        if ("decision" in vm or "conclusion" in vm) and ("evidence" in vm or "source" in vm):
+            if not state.synthesis or not state.synthesis.get("conclusion"):
+                return None
+            supported = [c for c in state.claims if c.status.value in ("supported", "established") and c.decision_relevance >= 0.5]
+            serious = [c for c in state.unresolved_contradictions() if c.severity >= 0.5]
+            if serious:
+                return False
+            return bool(supported) if supported else None
+        return None
 
     def _synthesize(self, state: MissionState, beliefs: BeliefGraph, assessment: Assessment) -> Optional[Synthesis]:
         tournament = beliefs.tournament().model_dump(mode="json") if len(state.hypotheses) >= 2 else {}
@@ -661,7 +759,9 @@ class Executive:
             interp = ObservationInterpretation(summary=f"verification {ver.status.value if ver else 'missing'}", progress_estimate=state.progress)
             if task is not None and ver is not None:
                 passed = ver.status == VerificationStatus.PASSED
-                interp.task_updates.append(TaskUpdateSpec(task_id=task.id, status="done" if passed else "failed", result_summary=ver.summary[:300], failure_reason="" if passed else ver.summary[:300], failure_kind="" if passed else "implementation"))
+                blocked = ver.status == VerificationStatus.INCONCLUSIVE and any(not b.resolved and b.task_id == task.id for b in state.blocked_operations)
+                status = "done" if passed else ("blocked" if blocked else "failed")
+                interp.task_updates.append(TaskUpdateSpec(task_id=task.id, status=status, result_summary=ver.summary[:300], failure_reason="" if passed else ver.summary[:300], failure_kind="" if passed else ("tool" if blocked else "implementation")))
                 if passed:
                     interp.new_evidence.append(EvidenceSpec(summary=f"Verification passed: {ver.summary[:200]}", source="tool:verification", kind="primary", reliability=0.95))
             return interp
@@ -847,7 +947,7 @@ class Executive:
         if task is not None and task.status == TaskStatus.FAILED:
             failed = [r for r in outcome.tool_results if not r.ok]
             err = task.failure_reason or (failed[0].error if failed else "; ".join(outcome.errors))
-            kind = failed[0].error_kind if failed else ("transient" if any("transient" in e for e in outcome.errors) else "structural")
+            kind = failed[0].error_kind if failed else ("transient" if any("(transient)" in e for e in outcome.errors) else "structural")
             rd = planner.retry_decision(task, err, kind)
             self.tracer.emit("retry" if rd.action == "retry" else "failure", f"{rd.action}: {rd.reason}", data={"task_id": task.id, "attempts": task.attempts, "failure_kind": kind, "signature": task.failure_signature})
             self.memory.remember(MemoryClass.FAILURE, f"Task '{task.title}' failed ({kind}): {err[:200]} -> {rd.action}", tags=["failure", task.operation_hint or "task"], mission_id=state.mission_id, confidence=0.8, importance=0.6)
@@ -858,9 +958,9 @@ class Executive:
                     self._sleep(min(rd.backoff_seconds, 5.0))
             elif rd.action == "replan":
                 if task.attempts < task.max_attempts:
-                    task.status = TaskStatus.PENDING
-                    task.priority = max(0.1, task.priority - 0.15)
-                    task.parameters["_strategy_note"] = f"previous approach failed structurally: {err[:160]}"
+                    self._replan_task(state, planner, task, err, kind)
+                else:
+                    self._cancel_dependents(state, task)
             elif rd.action == "abandon":
                 self._cancel_dependents(state, task)
             elif rd.action == "escalate":
@@ -880,8 +980,13 @@ class Executive:
             self.events.subscribe(state.mission_id, "human_input")
             return True, "awaiting human input"
         if outcome.waited_for:
-            state.status = MissionStatus.PAUSED
-            state.notes.append(f"waiting for event '{outcome.waited_for}'")
+            unresolved = [b for b in state.blocked_operations if not b.resolved]
+            if unresolved:
+                state.status = MissionStatus.BLOCKED_EXTERNAL
+                state.notes.append("blocked_external: " + "; ".join(f"{b.operation[:60]} -> unblock: {b.what_would_unblock[:120]}" for b in unresolved[:3]))
+            else:
+                state.status = MissionStatus.PAUSED
+                state.notes.append(f"waiting for event '{outcome.waited_for}'")
             return True, f"waiting for {outcome.waited_for}"
         if outcome.synthesis is not None and outcome.synthesis.mission_status == "blocked_external" and planner.is_plan_exhausted():
             state.status = MissionStatus.BLOCKED_EXTERNAL
@@ -969,8 +1074,70 @@ class Executive:
     def _cancel_dependents(self, state: MissionState, task: Task) -> None:
         for t in state.tasks:
             if task.id in t.depends_on and t.status in (TaskStatus.PENDING, TaskStatus.READY, TaskStatus.BLOCKED):
+                if t.operation_hint == "synthesize":
+                    # Synthesis must always be able to run so the honest final state is explained.
+                    t.depends_on = [d for d in t.depends_on if d != task.id]
+                    continue
                 t.status = TaskStatus.CANCELLED
                 t.failure_reason = f"prerequisite {task.id} abandoned"
+
+    def _replan_task(self, state: MissionState, planner: Planner, task: Task, error: str, kind: str) -> None:
+        """A structural failure needs a different strategy before the task is retried."""
+        metadata = {"failed_task": self._task_view(task), "error": error[:500], "failure_kind": kind, "criteria": [{"id": c.id, "description": c.description, "satisfied": c.satisfied} for c in state.success_criteria], "tests": [t.model_dump(mode="json") for t in state.tests[-3:]], "blocked": [b.model_dump(mode="json") for b in state.blocked_operations if not b.resolved]}
+        prompt = "MISSION: " + state.objective + "\n\nTASK FAILED STRUCTURALLY:\n" + json.dumps(metadata, default=str)[:12_000] + "\n\nPropose the minimal new tasks that change strategy (they will become prerequisites of the failed task, which is then retried), or explain what blocks it. Return the Replan JSON."
+        req = CognitionRequest(kind="replan", system_prompt=PROMPTS["replan"], prompt=prompt, schema_name="Replan", output_schema=schema_for(Replan), model=self.config.executive.model, timeout_seconds=self.config.executive.call_timeout_seconds, mission_id=state.mission_id, metadata=metadata)
+        plan: Optional[Replan] = None
+        try:
+            resp = self._cognition(state, req)
+            if resp.ok:
+                plan = Replan.model_validate(resp.parsed)
+        except ExecutiveUnavailable:
+            plan = None
+        except Exception:  # noqa: BLE001
+            plan = None
+        if plan is None or (not plan.new_tasks and not plan.blocked_by and not plan.give_up):
+            plan = self._heuristic_task_replan(state, task, error)
+        self.tracer.emit("decision", f"replan after failure of '{task.title[:60]}': {plan.rationale[:140]}", data={"task_id": task.id, "new_tasks": [t.title for t in plan.new_tasks], "give_up": plan.give_up, "blocked_by": plan.blocked_by})
+        if plan.new_tasks:
+            created = planner.add_tasks_from_specs(plan.new_tasks)
+            created_ids = [t.id for t in created if task.id not in t.depends_on]
+            if created_ids:
+                task.depends_on = sorted(set(task.depends_on + created_ids))
+                task.status = TaskStatus.PENDING
+                task.parameters["_strategy_note"] = f"strategy changed after: {error[:160]}"
+                planner.compute_ready()
+                return
+        if plan.blocked_by:
+            state.blocked_operations.append(BlockedOperation(operation=f"task {task.title[:80]}", action_class=ActionClass.REVERSIBLE_EXTERNAL, reason=plan.blocked_by[:300], what_would_unblock=(plan.what_would_unblock or plan.blocked_by)[:300], task_id=task.id))
+            task.status = TaskStatus.BLOCKED
+            return
+        if plan.give_up:
+            task.attempts = max(task.attempts, task.max_attempts)
+            self._cancel_dependents(state, task)
+            return
+        task.status = TaskStatus.PENDING
+        task.priority = max(0.1, task.priority - 0.15)
+
+    def _heuristic_task_replan(self, state: MissionState, task: Task, error: str) -> Replan:
+        low = error.lower()
+        p = task.parameters
+        n_prior = sum(1 for t in state.tasks if t.title.startswith(("Fix failing tests", "Strengthen evidence")))
+        if task.operation_hint == "verify" and (p.get("commands") or p.get("test_command") or p.get("verify_commands")):
+            if n_prior >= 2:
+                return Replan(rationale="fix attempts exhausted for failing tests", give_up=True)
+            return Replan(rationale="tests fail; a fix must precede re-verification", new_tasks=[TaskSpec(key="fix", title=f"Fix failing tests (attempt {n_prior + 1})", description=error[:300], operation_hint="instantiate_specialist", parameters_json=json.dumps({"role": "debugger", "objective": f"Diagnose and fix the failing tests without weakening them. Failure: {error[:300]}", "tools": ["read_file", "search_text", "write_file", "shell", "run_tests"], "max_turns": 40}), priority=0.95, parallel_safe=False)])
+        if task.operation_hint == "verify" and p.get("research"):
+            if n_prior >= 2:
+                return Replan(rationale="evidence strengthening exhausted", give_up=True)
+            weak = [c for c in state.claims if c.confidence >= 0.8 and c.source_independence < 2][:3]
+            contested = [c for c in state.unresolved_contradictions()][:2]
+            objective = "Find independent primary sources for: " + "; ".join(c.proposition[:120] for c in weak) if weak else "Resolve contradictions with primary sources: " + "; ".join(c.description[:120] for c in contested)
+            return Replan(rationale="research verification failed; strengthen evidence independence and resolve contradictions", new_tasks=[TaskSpec(key="strengthen", title=f"Strengthen evidence (attempt {n_prior + 1})", description=error[:300], operation_hint="instantiate_specialist", parameters_json=json.dumps({"role": "source_auditor", "objective": objective, "tools": ["web_search", "web_fetch", "read_file"], "max_turns": 15}), priority=0.95)])
+        if "no reasoning model" in low or "requires a model" in low:
+            return Replan(rationale="task needs a reasoning model that is unavailable", blocked_by="reasoning model unavailable for specialist work", what_would_unblock="configure an executive adapter with model access")
+        if task.attempts >= 2:
+            return Replan(rationale="repeated structural failure with no alternative strategy", give_up=True)
+        return Replan(rationale="retry with adjusted parameters", new_tasks=[])
 
     # ------------------------------------------------------------------------------
 

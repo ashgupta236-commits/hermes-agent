@@ -73,10 +73,14 @@ class StateStore:
     def save_mission(self, state: MissionState, event_kind: str = "state_saved", payload: Optional[dict[str, Any]] = None) -> MissionState:
         """Atomically persist ``state``; bumps ``version`` and appends an event."""
         with self._lock:
-            state.touch()
             row = self._conn.execute(
                 "SELECT version FROM missions WHERE mission_id=?", (state.mission_id,)
             ).fetchone()
+            if row is not None and int(row["version"]) != state.version:
+                raise StoreConflict(
+                    f"mission {state.mission_id}: stored version {row['version']} != in-memory {state.version}"
+                )
+            state.touch()
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if row is None:

@@ -34,7 +34,7 @@ def make_demo_workspace(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "REQUIREMENTS.md").write_text(REQUIREMENTS, encoding="utf-8")
     (root / "README.md").write_text("# demo project\n", encoding="utf-8")
-    (root / "pytest.ini").write_text("[pytest]\naddopts = -q\n", encoding="utf-8")
+    (root / "pytest.ini").write_text("[pytest]\ntestpaths = .\n", encoding="utf-8")
     return root
 
 

@@ -50,7 +50,10 @@ TASK: Compile the human objective into durable mission structure.
   synthesize. Put concrete tool arguments in parameters_json when known (e.g. {"tool":"read_file",
   "arguments":{"path":"REQUIREMENTS.md"}} or {"commands":["python -m pytest -q"]} or
   {"role":"researcher","objective":"..."} for specialists).
-- Only include human_requests for things you cannot discover or decide yourself."""
+- Only include human_requests for things you cannot discover or decide yourself. When an ambiguity can be
+  resolved by stating a reasonable assumption (e.g. an interpretation of a date or scope), record the
+  assumption and proceed rather than asking; missing private facts (the principal's own company data,
+  budgets, credentials) may be requested but must not block independent work."""
 
 SELECT = CONSTITUTION + """
 

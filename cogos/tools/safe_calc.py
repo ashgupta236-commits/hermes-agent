@@ -138,6 +138,8 @@ def _validate(tree: ast.AST) -> None:
     for node in ast.walk(tree):
         if not isinstance(node, _ALLOWED_NODES):
             raise UnsafeExpression(f"disallowed syntax: {type(node).__name__}")
+        if isinstance(node, ast.comprehension) and node.is_async:
+            raise UnsafeExpression("async comprehensions are not allowed")
         if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
             raise UnsafeExpression("dunder attribute access is not allowed")
         if isinstance(node, ast.Name) and node.id.startswith("__"):
@@ -148,8 +150,15 @@ def _validate(tree: ast.AST) -> None:
                 raise UnsafeExpression("unbounded while-loop is not allowed")
 
 
-def safe_eval(program: str, timeout_seconds: float = 5.0, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Evaluate ``program``; returns {"value": ..., "stdout": ..., "variables": {...}}."""
+def safe_eval(program: str, timeout_seconds: float = 5.0, variables: dict[str, Any] | None = None, isolate: bool = True) -> dict[str, Any]:
+    """Evaluate ``program``; returns {"value": ..., "stdout": ..., "variables": {...}}.
+
+    With ``isolate=True`` (default) the validated program runs in a child process so a
+    timeout terminates it for real (a Python thread cannot be killed). The child performs
+    the same AST validation; ``isolate=False`` runs in-process (used by the child itself).
+    """
+    if isolate:
+        return _run_isolated(program, timeout_seconds, variables)
     src = program.strip()
     tree = ast.parse(src, mode="exec")
     _validate(tree)
@@ -189,3 +198,60 @@ def safe_eval(program: str, timeout_seconds: float = 5.0, variables: dict[str, A
     result["stdout"] = "\n".join(out_lines)
     result["variables"] = {k: v for k, v in local_vars.items() if not callable(v)}
     return result
+
+
+def _run_isolated(program: str, timeout_seconds: float, variables: dict[str, Any] | None) -> dict[str, Any]:
+    import json
+    import subprocess
+    import sys
+
+    payload = json.dumps({"program": program, "variables": variables or {}})
+    # Validate in the parent first so syntax/safety errors surface as exceptions, not child failures.
+    _validate(ast.parse(program.strip(), mode="exec"))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", "import sys, json; from cogos.tools.safe_calc import _child; _child()"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"calculation exceeded {timeout_seconds}s") from exc
+    if proc.returncode != 0 or not proc.stdout.strip():
+        err = (proc.stderr or proc.stdout).strip().splitlines()
+        raise RuntimeError(err[-1] if err else f"calculation child exited {proc.returncode}")
+    data = json.loads(proc.stdout.strip().splitlines()[-1])
+    if data.get("error"):
+        exc_type = {"ZeroDivisionError": ZeroDivisionError, "ValueError": ValueError, "TypeError": TypeError, "NameError": NameError, "KeyError": KeyError, "IndexError": IndexError, "UnsafeExpression": UnsafeExpression}.get(str(data.get("error_type")), RuntimeError)
+        raise exc_type(str(data["error"]))
+    return {"value": data.get("value"), "stdout": data.get("stdout", ""), "variables": data.get("variables", {})}
+
+
+def _jsonable(value: Any) -> Any:
+    import json
+
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        if isinstance(value, (set, frozenset, tuple)):
+            return [_jsonable(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): _jsonable(v) for k, v in value.items()}
+        return repr(value)
+
+
+def _child() -> None:  # pragma: no cover - exercised via subprocess
+    import json
+    import sys
+
+    payload = json.loads(sys.stdin.read())
+    try:
+        res = safe_eval(payload["program"], timeout_seconds=10**6, variables=payload.get("variables") or {}, isolate=False)
+        out = {"value": _jsonable(res["value"]), "stdout": res["stdout"], "variables": {k: _jsonable(v) for k, v in res["variables"].items()}}
+    except BaseException as exc:  # noqa: BLE001
+        out = {"error": str(exc), "error_type": type(exc).__name__}
+    sys.stdout.write(json.dumps(out) + "\n")

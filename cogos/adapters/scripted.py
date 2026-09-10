@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 from cogos.adapters.base import CognitionRequest, CognitionResponse
 from cogos.schemas.cognition import (
     ClaimSpec,
+    CriterionAssessment,
     CriterionSpec,
     EvidenceSpec,
     GoalSpec,
@@ -39,7 +40,7 @@ from cogos.schemas.cognition import (
 )
 from cogos.schemas.common import EpistemicStatus, OperationKind
 
-Policy = Callable[[CognitionRequest], dict[str, Any]]
+Policy = Callable[[CognitionRequest], Optional[dict[str, Any]]]
 
 
 def _j(obj: Any) -> str:
@@ -57,7 +58,7 @@ _RESEARCH = re.compile(r"\b(research|investigate|whether|should|evaluate|assess|
 
 def detect_mission_kind(objective: str) -> str:
     o = objective.strip()
-    if _REPAIR.search(o) and not _IMPL.search(o):
+    if _REPAIR.search(o) and (not _IMPL.search(o) or re.search(r"\b(broken|failing|fails|not working|regression|bug)\b", o, re.I)):
         return "repair"
     if _IMPL.search(o) and not re.search(r"\b(whether|should)\b", o, re.I):
         return "implementation"
@@ -180,7 +181,7 @@ def default_compilation(objective: str, context: dict[str, Any]) -> MissionCompi
 class HeuristicExecutive:
     """Rule-based executive: general policies over structured request metadata."""
 
-    name = "heuristic"
+    name: str = "heuristic"
 
     def __init__(self, model: str = "heuristic", **_: Any):
         self.model = model
@@ -318,17 +319,21 @@ class HeuristicExecutive:
             conf = float(rep.get("confidence", 0.5))
             pieces.append(f"specialist {rep.get('role')} concluded ({conf:.2f})")
             for f in rep.get("findings") or []:
+                statement = str(f.get("statement", ""))
+                if statement:
+                    interp.new_claims.append(ClaimSpec(proposition=statement, epistemic_status=EpistemicStatus(f.get("epistemic_status", "inference")), confidence=float(f.get("confidence", 0.5)), decision_relevance=0.6))
                 for ev in f.get("evidence") or []:
-                    interp.new_evidence.append(EvidenceSpec(**{k: v for k, v in ev.items() if k in EvidenceSpec.model_fields}))
-                if f.get("statement"):
-                    interp.new_claims.append(ClaimSpec(proposition=str(f["statement"]), epistemic_status=EpistemicStatus(f.get("epistemic_status", "inference")), confidence=float(f.get("confidence", 0.5)), decision_relevance=0.6))
+                    spec = EvidenceSpec(**{k: v for k, v in ev.items() if k in EvidenceSpec.model_fields})
+                    if statement and not spec.supports_claims:
+                        spec.supports_claims = [statement]
+                    interp.new_evidence.append(spec)
             if rep.get("blocked"):
                 ok_all = False
                 if task_id:
                     interp.task_updates.append(TaskUpdateSpec(task_id=task_id, status="blocked", failure_reason=str(rep.get("blocked_reason", ""))[:300], failure_kind="tool"))
             for u in rep.get("unresolved") or []:
                 interp.new_unknowns.append(UnknownSpec(question=str(u)[:200], decision_importance=0.4, probability_changes_decision=0.3, expected_information_gain=0.4, estimated_cost=0.4))
-        if op == "direct_reasoning" and md.get("reasoning_output"):
+        if op == "direct_reasoning" and md.get("reasoning_output") and "proceeding with professional defaults" not in str(md["reasoning_output"]):
             interp.new_claims.append(ClaimSpec(proposition=str(md["reasoning_output"])[:300], epistemic_status=EpistemicStatus.INFERENCE, confidence=0.55, decision_relevance=0.5))
             pieces.append("reasoning recorded")
         if md.get("calculation_result") is not None:
@@ -345,6 +350,14 @@ class HeuristicExecutive:
                 ok_all = False
                 if task_id:
                     interp.task_updates.append(TaskUpdateSpec(task_id=task_id, status="failed", failure_reason=str(ver.get("summary", ""))[:300], failure_kind="implementation"))
+        errors = list(md.get("errors") or [])
+        if errors and not results and not reports and not md.get("reasoning_output") and md.get("calculation_result") is None and not md.get("simulation_result"):
+            ok_all = False
+            kind = "transient" if any("(transient)" in e for e in errors) else "structural"
+            if task_id:
+                interp.task_updates.append(TaskUpdateSpec(task_id=task_id, status="failed", failure_reason="; ".join(errors)[:300], failure_kind=kind))
+            interp.failure_lessons.append("; ".join(errors)[:200])
+            pieces.append("operation produced no result: " + "; ".join(errors)[:120])
         if ok_all and task_id and not any(t.task_id == task_id for t in interp.task_updates):
             interp.task_updates.append(TaskUpdateSpec(task_id=task_id, status="done", result_summary="; ".join(pieces)[:300]))
             for uid in md.get("task_resolves_unknowns") or []:
@@ -412,7 +425,7 @@ class HeuristicExecutive:
             conclusion=str(conclusion),
             decision=str(leading or ""),
             rationale="Grounded in the highest-confidence verified claims: " + "; ".join(str(t) for t in top) if top else "No verified claims available.",
-            criteria_assessment=[{"criterion_id": c["id"], "satisfied": bool(c.get("satisfied")), "evidence": c.get("evidence", "")} for c in criteria],
+            criteria_assessment=[CriterionAssessment(criterion_id=c["id"], satisfied=bool(c.get("satisfied")), evidence=str(c.get("evidence", ""))) for c in criteria],
             remaining_uncertainties=[u.get("question", "") for u in unknowns][:5] + [c.get("description", "") for c in contradictions][:3],
             what_would_change_the_conclusion=[f"Evidence refuting: {t}" for t in top[:2]],
             confidence=min(0.9, 0.3 + 0.6 * (sum(1 for c in criteria if c.get("satisfied")) / max(1, len(criteria)))),
@@ -428,7 +441,7 @@ def _tokens(s: str) -> set[str]:
 class ScriptedExecutive:
     """Executive with injectable responses/policies per cognition kind, falling back to heuristics."""
 
-    name = "scripted"
+    name: str = "scripted"
 
     def __init__(self, responses: Optional[dict[str, list[dict[str, Any]]]] = None, policies: Optional[dict[str, Policy]] = None, model: str = "scripted", fail_kinds: Optional[dict[str, str]] = None):
         self.responses = {k: list(v) for k, v in (responses or {}).items()}
@@ -447,6 +460,8 @@ class ScriptedExecutive:
             parsed = queue.pop(0)
             if callable(parsed):
                 parsed = parsed(req)
+            if isinstance(parsed, dict) and "__error__" in parsed:
+                return CognitionResponse(ok=False, model_requested=req.model, error=str(parsed.get("message", "scripted failure")), error_kind=str(parsed["__error__"]), models_used=[str(parsed.get("served_by", self.model))], residency_ok=not parsed.get("served_by"))
             return CognitionResponse(ok=True, parsed=parsed, model_requested=req.model, models_used=[self.model], turns=1)
         pol = self.policies.get(req.kind)
         if pol is not None:

@@ -95,13 +95,15 @@ class ToolFabric:
             self.call_log.append(res)
             return res
         try:
-            payload = self._handlers[call.tool](dict(call.arguments), self.context)
+            payload = self._handlers[call.tool](normalise_arguments(call.tool, dict(call.arguments)), self.context)
             ok = bool(payload.pop("ok", True))
             output = str(payload.pop("output", ""))
             error = str(payload.pop("error", ""))
             error_kind = str(payload.pop("error_kind", "" if ok else "structural"))
         except subprocess.TimeoutExpired as exc:
             ok, output, error, error_kind, payload = False, "", f"timeout after {exc.timeout}s", "timeout", {}
+        except MissingArgument as exc:
+            ok, output, error, error_kind, payload = False, "", str(exc), "structural", {"argument_error": True}
         except FileNotFoundError as exc:
             ok, output, error, error_kind, payload = False, "", str(exc), "structural", {}
         except PermissionError as exc:
@@ -143,8 +145,59 @@ def _params(**props: dict[str, Any]) -> dict[str, Any]:
     return {"type": "object", "properties": props}
 
 
+_ALIASES: dict[str, dict[str, str]] = {
+    "read_file": {"file": "path", "filename": "path", "file_path": "path", "filepath": "path"},
+    "read_document": {"file": "path", "filename": "path", "file_path": "path"},
+    "list_dir": {"directory": "path", "dir": "path", "pattern": "glob"},
+    "search_text": {"query": "pattern", "regex": "pattern", "directory": "path", "dir": "path"},
+    "write_file": {"file": "path", "filename": "path", "file_path": "path", "text": "content", "contents": "content"},
+    "delete_file": {"file": "path", "filename": "path"},
+    "shell": {"cmd": "command", "script": "command", "directory": "cwd"},
+    "run_tests": {"cmd": "command", "test_command": "command"},
+    "calculate": {"code": "program", "expr": "expression", "python": "program"},
+    "web_fetch": {"uri": "url", "link": "url"},
+    "memory_search": {"q": "query", "text": "query"},
+    "git": {"argv": "args", "command": "args"},
+}
+
+
+def normalise_arguments(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Accept common argument aliases so a model's reasonable guess still works."""
+    out = dict(args)
+    for alias, canonical in _ALIASES.get(tool, {}).items():
+        if alias in out and canonical not in out:
+            out[canonical] = out.pop(alias)
+    if tool in ("read_file", "read_document") and "path" not in out and isinstance(out.get("paths"), list) and out["paths"]:
+        out["path"] = out["paths"][0]
+        out["_extra_paths"] = list(out["paths"][1:])
+    if tool == "shell" and "command" not in out and isinstance(out.get("commands"), list):
+        out["command"] = " && ".join(str(c) for c in out["commands"])
+    if tool == "git" and isinstance(out.get("args"), str):
+        out["args"] = out["args"].replace("git ", "", 1).split()
+    return out
+
+
+class MissingArgument(ValueError):
+    pass
+
+
+def _require(args: dict[str, Any], key: str, tool: str) -> Any:
+    if key not in args or args[key] in (None, ""):
+        raise MissingArgument(f"{tool}: missing required argument '{key}' (got {sorted(args)})")
+    return args[key]
+
+
 def _read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    path = ctx.resolve(str(args["path"]))
+    path = ctx.resolve(str(_require(args, "path", "read_file")))
+    extra = [ctx.resolve(str(p)) for p in args.get("_extra_paths") or []]
+    if extra:
+        parts = []
+        for p in [path, *extra]:
+            if p.exists() and p.is_file():
+                parts.append(f"=== {p} ===\n" + p.read_text(encoding="utf-8", errors="replace"))
+            else:
+                parts.append(f"=== {p} === (missing)")
+        return {"output": "\n".join(parts), "paths": [str(p) for p in [path, *extra]]}
     if not path.exists():
         return {"ok": False, "error": f"no such file: {path}", "error_kind": "structural"}
     if path.is_dir():
@@ -171,7 +224,7 @@ def _list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def _search_text(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    pattern = str(args["pattern"])
+    pattern = str(_require(args, "pattern", "search_text"))
     path = ctx.resolve(str(args.get("path", ".")))
     limit = int(args.get("limit", 200))
     rg = shutil.which("rg")
@@ -197,7 +250,7 @@ def _search_text(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def _write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    path = ctx.resolve(str(args["path"]))
+    path = ctx.resolve(str(_require(args, "path", "write_file")))
     path.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))
     mode = "a" if args.get("append") else "w"
@@ -207,7 +260,7 @@ def _write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def _delete_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    path = ctx.resolve(str(args["path"]))
+    path = ctx.resolve(str(_require(args, "path", "delete_file")))
     if not path.exists():
         return {"ok": False, "error": f"no such file: {path}", "error_kind": "structural"}
     if path.is_dir():
@@ -217,7 +270,7 @@ def _delete_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def _shell(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    command = str(args["command"])
+    command = str(_require(args, "command", "shell"))
     cwd = ctx.resolve(str(args.get("cwd", "."))) if args.get("cwd") else ctx.workdir
     timeout = int(args.get("timeout", ctx.timeout))
     env = {**os.environ, "COGOS_TOOL": "1"}
@@ -236,7 +289,7 @@ def _git(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     return {"ok": ok, "output": proc.stdout + proc.stderr, "exit_code": proc.returncode, "error": "" if ok else f"git exited {proc.returncode}", "error_kind": "" if ok else "structural"}
 
 
-_PYTEST_SUMMARY = re.compile(r"=+ (?P<summary>.*?) in [\d.]+s")
+_PYTEST_SUMMARY = re.compile(r"(?:=+ )?(?P<summary>\d+ (?:passed|failed|error|errors|skipped|xfailed|xpassed|deselected)[^\n=]*?) in [\d.]+s")
 _PYTEST_COUNTS = re.compile(r"(\d+) (passed|failed|error|errors|skipped|xfailed|xpassed)")
 
 
@@ -271,7 +324,7 @@ def _calculate(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 def _web_fetch(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     import httpx  # local import: keep import cost off the hot path
 
-    url = str(args["url"])
+    url = str(_require(args, "url", "web_fetch"))
     method = str(args.get("method", "GET")).upper()
     timeout = float(args.get("timeout", 30))
     with httpx.Client(follow_redirects=True, timeout=timeout, headers={"User-Agent": "cogos/0.1 (+research agent)"}) as client:
@@ -304,7 +357,7 @@ def _memory_search(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
 
 def _read_document(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    path = ctx.resolve(str(args["path"]))
+    path = ctx.resolve(str(_require(args, "path", "read_document")))
     if not path.exists():
         return {"ok": False, "error": f"no such file: {path}", "error_kind": "structural"}
     suffix = path.suffix.lower()

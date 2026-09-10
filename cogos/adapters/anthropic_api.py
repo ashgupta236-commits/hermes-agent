@@ -17,7 +17,7 @@ from cogos.adapters.base import CognitionRequest, CognitionResponse, ExecutiveUn
 
 
 class AnthropicApiExecutive:
-    name = "anthropic_api"
+    name: str = "anthropic_api"
 
     def __init__(self, model: str, max_retries: int = 3, max_tokens: int = 8000, client: Optional[Any] = None):
         self.model = model
@@ -62,7 +62,7 @@ class AnthropicApiExecutive:
                     return CognitionResponse(ok=False, model_requested=req.model, error=last_err, error_kind=kind)
             text = "".join(getattr(b, "text", "") for b in getattr(msg, "content", []) if getattr(b, "type", "") == "text")
             usage = getattr(msg, "usage", None)
-            base = dict(
+            base: dict[str, Any] = dict(
                 model_requested=req.model,
                 models_used=[getattr(msg, "model", req.model)],
                 input_tokens=int(getattr(usage, "input_tokens", 0) or 0),

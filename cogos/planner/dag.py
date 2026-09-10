@@ -131,6 +131,8 @@ class Planner:
         ready: list[Task] = []
         for t in self.state.tasks:
             if t.status in (TaskStatus.PENDING, TaskStatus.READY, TaskStatus.BLOCKED):
+                if t.status == TaskStatus.BLOCKED and any(b.task_id == t.id and not b.resolved for b in self.state.blocked_operations):
+                    continue  # stays isolated until the blocking operation is resolved
                 deps = [by_id[d] for d in t.depends_on if d in by_id]
                 if any(d.status == TaskStatus.FAILED and d.attempts >= d.max_attempts for d in deps):
                     if t.status != TaskStatus.BLOCKED:

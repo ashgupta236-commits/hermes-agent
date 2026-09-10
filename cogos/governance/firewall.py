@@ -80,7 +80,9 @@ class CapabilityFirewall:
     # -- classification ------------------------------------------------------------
 
     def classify(self, call: ToolCall, spec: ToolSpec) -> ActionClass:
-        args = call.arguments
+        from cogos.tools.fabric import normalise_arguments
+
+        args = normalise_arguments(call.tool, dict(call.arguments))
         if spec.substrate == "shell":
             return classify_shell_command(str(args.get("command", "")))
         if spec.substrate == "git":

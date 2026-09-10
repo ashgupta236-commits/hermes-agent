@@ -145,6 +145,7 @@ class MissionCompiler:
         planner = Planner(state)
         planner.instantiate_from_specs(comp.goals, comp.tasks)
         planner.break_cycles()
+        planner.compute_ready()
         state.confidence = _clamp(comp.confidence_in_interpretation) * 0.5
         state.progress = 0.0
         return state

@@ -426,7 +426,7 @@ class VerificationEngine:
             else:
                 checks.append(VerificationCheck(name="artifact", status=FAILED, detail="no verified artifact mentions the criterion"))
 
-        if re.search(r"\b(evidence|sources?)\b", method):
+        if evidence_ok is None and re.search(r"\b(evidence|sources?)\b", method):
             related = [c for c in self.state.claims if token_overlap(criterion.description, c.proposition) >= TOKEN_OVERLAP_THRESHOLD]
             good = [c for c in related if c.status in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED) and not self._unresolved_contradictions_for(c.id)]
             if good:
@@ -439,7 +439,11 @@ class VerificationEngine:
                 checks.append(VerificationCheck(name="evidence", status=FAILED, detail="no claim relates to the criterion"))
 
         if evidence_ok is not None:
-            checks.append(VerificationCheck(name="explicit_evidence", status=PASSED if evidence_ok else FAILED, detail="explicit evidence flag supplied by caller"))
+            related = [c for c in self.state.claims if token_overlap(criterion.description, c.proposition) >= TOKEN_OVERLAP_THRESHOLD]
+            for c in related:
+                if c.status in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED):
+                    evidence_ids.extend(c.evidence_for)
+            checks.append(VerificationCheck(name="explicit_evidence", status=PASSED if evidence_ok else FAILED, detail="deterministic runtime judgement of the evidence state supplied by the executive"))
         if not checks:
             checks.append(VerificationCheck(name="method", status=INCONCLUSIVE, detail=f"verification method '{criterion.verification_method}' is not machine-checkable and no evidence_ok was supplied"))
 
@@ -558,7 +562,11 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
     else:
         checks.append(VerificationCheck(name="success_criteria", status=PASSED, detail=f"all {len(state.success_criteria)} criteria satisfied and verified"))
 
-    failing_tests = [t for t in state.tests if t.status == FAILED]
+    # Only the latest record per test command counts: a fixed failure is not a failure.
+    latest: dict[str, Any] = {}
+    for rec in state.tests:
+        latest[rec.name] = rec
+    failing_tests = [t for t in latest.values() if t.status == FAILED]
     if failing_tests:
         names = ", ".join(t.name for t in failing_tests[:5])
         checks.append(VerificationCheck(name="tests", status=FAILED, detail=f"{len(failing_tests)} failing test record(s): {names}"))
