@@ -1,6 +1,6 @@
 # Cognitive OS (cogos) — Implementation Plan
 
-Status: IN PROGRESS (PR #10 open as draft). This file is the durable plan for the persistent autonomous
+Status: COMPLETE (PR #10, draft). 323 tests, 19/19 evaluation scenarios, ruff and ty clean. This file is the durable plan for the persistent autonomous
 cognitive runtime built around Claude in this repository. Update it as decisions
 change; a fresh session should read this first, then `.cogos/` state (if present).
 
@@ -56,4 +56,23 @@ change; a fresh session should read this first, then `.cogos/` state (if present
 - [ ] Docs: ARCHITECTURE, AUTONOMY, MODEL_POLICY, STATE, MEMORY, EVALS, SECURITY, OPERATIONS
 - [x] Makefile targets: test/lint/typecheck/eval/demo
 - [x] Run evals (19/19), commit, push, draft PR #10
-- [ ] Docs, real-model validation of select prompt (safeguards flag), final results table
+- [x] Docs (8 documents + worked example), results table filled from a real run
+- [x] Real-model validation with `--adapter claude_code` (claude-fable-5-1): compilation,
+      selection, interpretation, replanning, independent challenge, specialists
+- [x] Provider safety classifications given their own error kind and handled without
+      working around the safeguard (one byte-identical retry, then deterministic fallback)
+- [x] Adversarial review of the executive loop; eight confirmed defects fixed with
+      regression tests (see docs/cogos/EVALS.md)
+
+## Findings from running it (the reason several designs changed)
+
+1. **Verification records were not durable**, so every completion gate that claimed to require
+   one was really testing that a list of ids was non-empty. Fixed at the root: records are
+   mission state, criteria cite only passing ones, the gate resolves ids.
+2. **Real-model runs stall differently than scripted ones.** A criterion whose verification
+   method names no test, artifact or claim looped six cycles. Inconclusive criteria now get a
+   bounded executive judgement and are retired as undecidable if that fails twice.
+3. **The provider safety classifier is non-deterministic on identical input.** Treated as its
+   own error kind with a single identical retry; never reshaped to evade.
+4. **Frontier models guess tool argument shapes.** The fabric accepts common aliases and returns
+   a structured missing-argument error instead of a KeyError.
