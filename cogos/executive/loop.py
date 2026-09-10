@@ -212,7 +212,16 @@ class Executive:
         ran = 0
         while state.status == MissionStatus.ACTIVE and ran < limit:
             t0 = time.monotonic()
-            result = self.cycle(state)
+            try:
+                result = self.cycle(state)
+            except BudgetExhausted as exc:
+                # Any cognition call, anywhere in the cycle, may be refused admission. Whichever
+                # phase it came from, running out of budget pauses the mission — it is never a
+                # completion and never a failure, and the work already done stands.
+                state.usage.wall_clock_seconds += time.monotonic() - t0
+                result = self._pause_on_budget(state, self.controller.assess(state), str(exc), state.usage.cycles)
+                self._persist(state, result)
+                break
             state.usage.wall_clock_seconds += time.monotonic() - t0
             self._persist(state, result)
             ran += 1

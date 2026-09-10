@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cogos.evaluation.support import Sandbox
 from cogos.executive.escalation import (
     Tier,
@@ -239,3 +241,52 @@ def test_substantive_work_done_is_about_progress_not_correctness():
     assert substantive_work_done(state) is False
     state.tasks[0].status = TaskStatus.DONE
     assert substantive_work_done(state) is True
+
+
+# == the control that matters: closure must never manufacture a completion =====================
+
+
+def test_no_false_completion_when_the_work_was_never_done():
+    """The counterpart to the closure fix: pressure to close must not become a reason to pass.
+
+    Same mission as the live pattern, but nothing ever produces the deliverables. Closure applies
+    all its ordering pressure and the gate still refuses, because closure moves the queue and
+    verification moves the evidence — and only evidence satisfies a criterion.
+    """
+    sb = Sandbox("no-false-completion", with_demo_project=True)
+    try:
+        # Deliberately no engineer policy: the deliverables are never written.
+        state = sb.runtime.new_mission("Build the feature described in REQUIREMENTS.md.", context=sb.context())
+        state = sb.runtime.run(state.mission_id, max_cycles=40)
+
+        gate = mission_completion_check(state)
+        assert state.status.value != "complete", "a mission that did no work must never complete"
+        assert gate.status.value == "failed"
+        assert not any(c.satisfied for c in state.success_criteria)
+        assert all(
+            not state.passing_verifications(c.verification_ids, target_type="criterion", target_id=c.id)
+            for c in state.success_criteria
+        )
+        assert not [p for p in sb.root.iterdir() if p.suffix == ".py"]
+    finally:
+        sb.cleanup()
+
+
+def test_budget_exhaustion_anywhere_in_the_cycle_pauses_rather_than_escaping():
+    """Admission refusal can arrive from any cognition call, including interpretation."""
+    from cogos.adapters.base import BudgetExhausted
+
+    sb = Sandbox("budget-anywhere", with_demo_project=True)
+    try:
+        state = sb.runtime.new_mission("Build the feature described in REQUIREMENTS.md.", context=sb.context())
+        state.budget.max_subagents = 1
+        sb.runtime.store.save_mission(state, "tight")
+        try:
+            state = sb.runtime.run(state.mission_id, max_cycles=40)
+        except BudgetExhausted:  # pragma: no cover - the whole point is that this does not escape
+            pytest.fail("budget exhaustion escaped the cycle instead of pausing the mission")
+        assert state.status.value in ("paused", "complete", "blocked_external")
+        if state.status.value == "paused":
+            assert any("budget" in n for n in state.notes)
+    finally:
+        sb.cleanup()
