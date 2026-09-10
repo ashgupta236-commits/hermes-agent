@@ -13,6 +13,7 @@ Claude executive model. It lives in `cogos/` at the repository root, ships its o
 | [MEMORY.md](MEMORY.md) | Nine memory classes, selective writes, dedupe, contradiction detection, versioning, retrieval scoring, consolidation, quarantine. |
 | [EVALS.md](EVALS.md) | The twelve metrics, acceptance scenarios A-J, adversarial scenarios, how to run, measured results. |
 | [SECURITY.md](SECURITY.md) | Capability firewall, injection defence, trust levels, false-consensus guard, specialist tool surface, non-goals. |
+| [EXAMPLE_MISSION.md](EXAMPLE_MISSION.md) | A research mission walked end to end: what the human supplies, what the system decides, how completion is earned. |
 | [OPERATIONS.md](OPERATIONS.md) | Setup, every CLI command, `cogos.yaml`, environment variables, human answer/authorize flow, snapshots, troubleshooting. |
 
 ## Quickstart

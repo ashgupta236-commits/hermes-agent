@@ -1,0 +1,53 @@
+# cogos — persistent cognitive operating system configuration.
+#
+# Copy to `cogos.yaml` (or point COGOS_CONFIG at it). Behavioural settings only:
+# secrets stay in the environment, never in this file.
+# Every key below is optional; the defaults shown are what the runtime uses.
+
+executive:
+  # The resident executive model. Specialists inherit it unless cheaper routing
+  # is explicitly authorised below. A restriction never changes this value.
+  model: claude-fable-5-1
+  # claude_code (headless `claude -p`) | anthropic_api (ANTHROPIC_API_KEY) | scripted (offline)
+  adapter: claude_code
+  effort: high                          # low | medium | high | xhigh | max
+  allow_cheaper_specialist_models: false
+  specialist_model: null                # only used when the flag above is true
+  call_timeout_seconds: 900
+  max_retries: 3
+  claude_binary: claude
+  extra_cli_args: []
+
+governance:
+  # Maximum autonomy for reversible local work; bounded blast radius elsewhere.
+  allow_network: true
+  allowed_domains: []                   # empty = any domain the sandbox permits
+  denied_domains: []
+  allow_shell: true
+  shell_timeout_seconds: 120
+  writable_roots: []                    # empty = repository root only
+  # Action classes that always need explicit human authorization.
+  always_require_human:
+    - destructive
+    - financial
+    - legally_significant
+    - credential_sensitive
+  denied_action_classes: []             # e.g. [financial] to refuse outright
+  max_output_chars: 20000
+
+budget:
+  max_cycles: 200
+  max_model_calls: 400
+  max_subagents: 20
+  max_cost_usd: null
+  max_wall_clock_seconds: null
+
+memory:
+  max_retrieval_items: 12
+  min_importance_to_store: 0.35
+  default_ttl_days: null
+  consolidation_interval_cycles: 10
+
+checkpoint_every_cycles: 1
+workspace_max_chars: 12000
+trace_to_stdout: false

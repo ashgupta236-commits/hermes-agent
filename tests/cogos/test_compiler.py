@@ -226,3 +226,25 @@ def test_materialise_breaks_cycles_from_model_output(repo):
     # the next planner pass (as the executive loop does every cycle) surfaces the freed task
     assert any(t.status is TaskStatus.READY for t in state.tasks)
     assert len(Planner(state).compute_ready()) == 1
+
+
+def test_shipped_config_example_matches_the_real_schema_and_defaults() -> None:
+    """`cogos.yaml.example` must stay loadable and must not drift from CogosConfig defaults."""
+    import pathlib
+
+    import yaml
+
+    from cogos.config import DEFAULT_EXECUTIVE_MODEL, CogosConfig
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    raw = yaml.safe_load((root / "cogos.yaml.example").read_text(encoding="utf-8"))
+    raw["repo_root"] = str(root)
+    cfg = CogosConfig.model_validate(raw)  # unknown keys or wrong types fail here
+    defaults = CogosConfig(repo_root=root)
+
+    assert cfg.executive.model == DEFAULT_EXECUTIVE_MODEL
+    assert cfg.executive.allow_cheaper_specialist_models is False
+    assert cfg.governance.always_require_human == defaults.governance.always_require_human
+    assert cfg.budget.model_dump() == defaults.budget.model_dump()
+    assert cfg.memory.model_dump() == defaults.memory.model_dump()
+    assert cfg.workspace_max_chars == defaults.workspace_max_chars
