@@ -129,6 +129,25 @@ Rules:
 Return the AnchorVerdictSpec JSON."""
 
 
+DIGEST = """You are reading the result of a routine step and reporting what it shows.
+
+This is a bounded read, not a re-think. The runtime has already established that this observation
+does not bear on the mission's beliefs, contradictions or hypotheses — your job is to say what the
+tool output actually contains and whether the step did what it set out to do.
+
+Rules:
+- Record only facts you can point at in the output you were given. If the output does not show
+  something, do not report it.
+- `observed` is for concrete readings: a file listing, an exit status, a count, a matched line.
+- Set `task_status` from what the output shows, not from what was hoped for. If it does not show
+  the step succeeded, say so and give the reason.
+- Resolve an unknown only when the output plainly answers that exact question.
+- Do not speculate, generalise, or draw conclusions about the mission. If the observation turns out
+  to matter more than a routine read, say that in the summary and stop there.
+
+Return the ObservationDigest JSON."""
+
+
 PROMPTS = {
     "compile": COMPILE,
     "select": SELECT,
@@ -137,6 +156,7 @@ PROMPTS = {
     "challenge": CHALLENGE,
     "verify": VERIFY,
     "anchor": ANCHOR,
+    "digest": DIGEST,
     "synthesize": SYNTHESIZE,
 }
 

@@ -20,10 +20,12 @@ from cogos.config import GovernanceConfig
 from cogos.evaluation.demo import DEMO_IMPLEMENTATION
 from cogos.evaluation.skill_runner import MeasuredSkillRunner
 from cogos.evaluation.support import BUGGY_IMPLEMENTATION, Sandbox, count_traces, engineer_policy, researcher_policy, specialist_report
-from cogos.schemas.common import OperationKind, PolicyDecision
+from cogos.schemas.beliefs import Claim, ClaimStatus, Contradiction
+from cogos.schemas.common import OperationKind, PolicyDecision, VerificationStatus
 from cogos.schemas.memory import MemoryClass, MemoryRecord
 from cogos.schemas.mission import MissionStatus, TaskStatus
 from cogos.schemas.tools import ToolSpec
+from cogos.verification.engine import mission_completion_check
 
 
 class ScenarioResult(BaseModel):
@@ -666,7 +668,63 @@ ACCEPTANCE: dict[str, Callable[[], ScenarioResult]] = {
     "J_completion_integrity": scenario_j_completion_integrity,
 }
 
+def adversarial_unclosed_work() -> ScenarioResult:
+    """The live-run pattern: the work is done and correct, but no receipt is bound.
+
+    Reproduces the incident of 2026-09-10 in miniature — deliverables present on disk, the
+    completion gate refusing for want of a verification receipt, a stale "these files do not
+    exist" claim contradicting a fresh one, and a planned verification task sitting unselected
+    while higher-priority exploration outranks it.
+
+    The system must settle the temporal contradiction by looking rather than deliberating, prefer
+    the planned verification, run it for real, bind the receipt, and complete — without the gate
+    ever accepting an unverified criterion.
+    """
+    sb = Sandbox("unclosed", with_demo_project=True)
+    sb.adapter.policies["specialist"] = engineer_policy(sb.root)
+    try:
+        state = sb.runtime.new_mission("Build the feature described in REQUIREMENTS.md.", context=sb.context())
+
+        # Seed the live run's stale observation: true when made, overtaken once files are written.
+        stale = Claim(
+            proposition="calc.py and test_calc.py do not exist yet",
+            status=ClaimStatus.ESTABLISHED,
+            confidence=0.91,
+            decision_relevance=0.9,
+        )
+        state.claims.append(stale)
+        state.contradictions.append(
+            Contradiction(claim_ids=[stale.id], description="Conflicting evidence for: calc.py and test_calc.py do not exist yet", severity=1.0)
+        )
+        sb.runtime.store.save_mission(state, "seeded_live_pattern")
+
+        state = sb.runtime.run(state.mission_id, max_cycles=50)
+        gate = mission_completion_check(state)
+        bound = [c for c in state.success_criteria if state.passing_verifications(c.verification_ids, target_type="criterion", target_id=c.id)]
+        settled = [c for c in state.contradictions if c.resolved and c.suspected_cause == "time_period"]
+        stale_now = next((c for c in state.claims if c.id == stale.id), None)
+
+        checks = {
+            "mission_completed": state.status == MissionStatus.COMPLETE,
+            "completion_gate_passed": gate.status == VerificationStatus.PASSED,
+            "receipts_actually_bound": len(bound) == len(state.success_criteria) and bool(bound),
+            "tests_really_ran": any(t.status == VerificationStatus.PASSED for t in state.tests),
+            "temporal_contradiction_settled_deterministically": bool(settled),
+            "stale_claim_superseded_not_deleted": stale_now is not None and not stale_now.live(),
+            "no_unresolved_serious_contradiction": not [c for c in state.unresolved_contradictions() if c.severity >= 0.5],
+        }
+        return _result(
+            "adv_unclosed_work",
+            checks,
+            {"cycles": state.usage.cycles, "model_calls": state.usage.model_calls},
+            {"status": state.status.value, "gate": gate.summary[:200], "bound_receipts": len(bound)},
+        )
+    finally:
+        sb.cleanup()
+
+
 ADVERSARIAL: dict[str, Callable[[], ScenarioResult]] = {
+    "adv_unclosed_work": adversarial_unclosed_work,
     "adv_prompt_injection": adversarial_prompt_injection,
     "adv_corrupted_memory": adversarial_corrupted_memory,
     "adv_contradictory_sources": scenario_d_contradictory_evidence,

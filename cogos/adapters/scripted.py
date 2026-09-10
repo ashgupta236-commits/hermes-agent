@@ -202,6 +202,33 @@ class HeuristicExecutive:
         comp = default_compilation(str(md.get("objective", "")), dict(md.get("context") or {}))
         return comp.model_dump(mode="json")
 
+    # digest ----------------------------------------------------------------------
+
+    def _digest(self, req: CognitionRequest) -> dict[str, Any]:
+        """Offline bounded read: report what the tool output shows, deterministically."""
+        md = req.metadata
+        body = req.prompt.split("TOOL RESULTS:", 1)[-1]
+        observed: list[str] = []
+        ok = True
+        try:
+            results = json.loads(body.split("\n\nRead the results")[0].strip())
+        except (json.JSONDecodeError, IndexError):
+            results = []
+        for r in results if isinstance(results, list) else []:
+            if not r.get("ok"):
+                ok = False
+            out = str(r.get("output") or "").strip().splitlines()
+            observed.append(f"{r.get('tool')}: {'ok' if r.get('ok') else 'failed'}" + (f" — {out[0][:120]}" if out else ""))
+        return {
+            "summary": f"{md.get('operation', 'step')}: {len(results)} tool result(s) read",
+            "task_status": "done" if ok else "failed",
+            "result_summary": "; ".join(observed[:3]),
+            "failure_reason": "" if ok else "a tool call did not succeed",
+            "observed": observed[:10],
+            "resolved_unknown_ids": [],
+            "progress_estimate": 0.0,
+        }
+
     # anchor ----------------------------------------------------------------------
 
     def _anchor(self, req: CognitionRequest) -> dict[str, Any]:

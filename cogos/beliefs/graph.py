@@ -351,7 +351,10 @@ class BeliefGraph:
 
     def detect_contradictions(self) -> list[Contradiction]:
         # (a) claims with substantial evidence on both sides
-        for claim in self.state.claims:
+        # A superseded claim describes an earlier moment, not a competing account of this one, so
+        # it cannot contradict anything. Skipping it here is what stops ABSENT(t0) vs PRESENT(t2)
+        # from being re-litigated as a live dispute every cycle.
+        for claim in self.live_claims():
             side_for, side_against = self._sides(claim)
             if side_for.weight >= CONTEST_WEIGHT and side_against.weight >= CONTEST_WEIGHT:
                 severity = min(1.0, claim.decision_relevance + 0.5 * min(side_for.weight, side_against.weight))
@@ -372,6 +375,8 @@ class BeliefGraph:
             a, b = self.state.claim(ids[0]), self.state.claim(ids[1])
             if a is None or b is None or a.confidence < 0.6 or b.confidence < 0.6:
                 continue
+            if not a.live() or not b.live():
+                continue  # one of them has been overtaken; that is history, not a dispute
             for_a, _ = self._sides(a)
             for_b, _ = self._sides(b)
             severity = min(1.0, (a.decision_relevance + b.decision_relevance) / 2 + 0.5 * min(for_a.weight, for_b.weight))
@@ -385,7 +390,7 @@ class BeliefGraph:
                 )
             )
         # (c) evidence against established claims
-        for claim in self.state.claims:
+        for claim in self.live_claims():
             if claim.status != ClaimStatus.ESTABLISHED or not claim.evidence_against:
                 continue
             side_for, side_against = self._sides(claim)
@@ -512,6 +517,14 @@ class BeliefGraph:
 
     # --- falsification & summaries ---------------------------------------------
 
+    def live_claims(self) -> list[Claim]:
+        """Claims that still describe the world as currently believed.
+
+        Superseded claims remain in mission state and stay queryable — this filters the *working*
+        view, it does not delete history.
+        """
+        return [c for c in self.state.claims if c.live()]
+
     def falsification_targets(self, limit: int = 3) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []
         for h in self.state.hypotheses:
@@ -531,7 +544,7 @@ class BeliefGraph:
                     "priority": round(relevance * h.confidence, 4),
                 }
             )
-        for claim in self.state.claims:
+        for claim in self.live_claims():
             if claim.confidence >= 0.7 and claim.decision_relevance >= 0.6:
                 targets.append(
                     {

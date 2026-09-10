@@ -306,6 +306,15 @@ class MissionState(BaseModel):
                 return t
         return None
 
+    def live_claims(self) -> list[Claim]:
+        """Claims that still describe the world as currently believed.
+
+        Superseded claims stay in `claims` and remain queryable — this is the *working* view sent
+        to cognition, so the mission never reasons from, or concludes with, an observation the
+        world has already moved past.
+        """
+        return [c for c in self.claims if c.live()]
+
     def claim(self, claim_id: str) -> Optional[Claim]:
         for c in self.claims:
             if c.id == claim_id:

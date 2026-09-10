@@ -21,9 +21,11 @@ from cogos.adapters.continuity import detect as detect_continuity, handoff
 from cogos.adapters.schema_utils import schema_for
 from cogos.agent_foundry import AgentFoundry
 from cogos.beliefs import BeliefGraph
+from cogos.beliefs.temporal import TemporalSettler, classify_claim, supersede_overtaken
 from cogos.config import CogosConfig
 from cogos.events import EventBus
 from cogos.executive.controller import Assessment, MetaCognitiveController
+from cogos.executive.escalation import ObservationDigest, Tier, classify, deterministic_interpretation, digest_to_interpretation
 from cogos.prompts import PROMPTS
 from cogos.governance.immune import scan_for_injection, wrap_untrusted
 from cogos.ids import iso_now, new_id
@@ -37,7 +39,7 @@ from cogos.planner import Planner
 from cogos.executive.anchor_service import AnchorService
 from cogos.schemas.anchor import HoldStatus
 from cogos.schemas.beliefs import Claim, ClaimStatus, Contradiction, Evidence, EvidenceKind
-from cogos.verification.reality_anchor import MAX_RESOLUTION_ROUNDS
+from cogos.verification.reality_anchor import MAX_RESOLUTION_ROUNDS, BlindnessViolation
 from cogos.schemas.cognition import (
     EvidenceSpec,
     ObservationInterpretation,
@@ -68,8 +70,15 @@ from cogos.simulation import simulate
 from cogos.tools import ToolFabric
 from cogos.schemas.verification import VerificationCheck, cite
 from cogos.verification import VerificationEngine, VerificationResult
+from cogos.verification.engine import mission_completion_check
 from cogos.workspace import GlobalWorkspace
 from cogos.world_model import WorldModelManager
+
+#: Only contradictions the controller would actually escalate are worth a settlement probe.
+CONTRADICTION_SETTLE_FLOOR = 0.5
+
+#: How many times one belief may be attacked before the attack itself is the problem.
+MAX_FALSIFICATION_ATTEMPTS = 2
 
 EXECUTIVE_KINDS = {"compile", "select", "interpret", "synthesize", "replan", "challenge", "verify"}
 
@@ -186,6 +195,16 @@ class Executive:
         # 3. assess ------------------------------------------------------------------
         over = ledger.over_budget(state.budget)
         verification_pending = self._verification_pending(state)
+        # Before any contradiction can drive expensive falsification, try to settle it by
+        # *looking*. If the dispute is about directly observable current state, the filesystem
+        # is authoritative and costs a millisecond; the live run spent 48% of its budget
+        # deliberating over a question a `list_dir` answers.
+        self._settle_temporal_contradictions(state)
+        # Closure (area E): read the completion gate now, so a mission that has done its work and
+        # is only missing evidence prefers the already-planned step that would bind it. The gate is
+        # unchanged; only task ordering and what the executive is told about it change.
+        closure = self._assess_closure(state)
+        planner._closure = closure
         falsify_target = self._falsification_target(state, beliefs)
         assessment = self.controller.assess(
             state,
@@ -355,15 +374,86 @@ class Executive:
                     out.append(t.id)
         return out
 
+    def _assess_closure(self, state: MissionState) -> Any:
+        """What, if anything, stands between this mission and an honest completion."""
+        from cogos.verification.closure import assess
+
+        try:
+            gate = mission_completion_check(state)
+        except Exception as exc:  # noqa: BLE001 - closure is advisory; never break the cycle
+            self.tracer.emit("error", f"closure assessment failed: {exc}")
+            return None
+        closure = assess(state, gate)
+        if closure.blocked and closure.candidate_task_ids:
+            self.tracer.emit(
+                "closure",
+                f"{closure.summary()[:180]} — {len(closure.candidate_task_ids)} planned task(s) would bind it",
+                data={
+                    "needs": [n.model_dump(mode="json") for n in closure.needs],
+                    "candidate_task_ids": closure.candidate_task_ids,
+                    "substantive_work_done": closure.substantive_work_done,
+                },
+            )
+        return closure
+
+    def _settle_temporal_contradictions(self, state: MissionState) -> list[str]:
+        """Deterministically close contradictions that current state already answers.
+
+        Runs before the controller sees the contradiction set, so a dispute the world has already
+        settled never becomes a `must_falsify` directive. Genuine disputes — where current state
+        does not overtake either claim — are left untouched and escalate exactly as before.
+        """
+        settler = TemporalSettler(self.fabric, self.tracer)
+        roots = [str(self.config.repo_root)]
+        extra = state.resources.get("root")
+        if extra and str(extra) not in roots:
+            roots.append(str(extra))
+        settled: list[str] = []
+        for contradiction in list(state.unresolved_contradictions()):
+            if contradiction.severity < CONTRADICTION_SETTLE_FLOOR:
+                continue
+            try:
+                result = settler.settle(contradiction, state, roots=roots)
+            except Exception as exc:  # noqa: BLE001 - settlement is an optimisation, never load-bearing
+                self.tracer.emit("error", f"temporal settlement failed for {contradiction.id}: {exc}")
+                continue
+            if result.settled:
+                settled.append(contradiction.id)
+        return settled
+
     def _falsification_target(self, state: MissionState, beliefs: BeliefGraph) -> Optional[dict[str, Any]]:
         targets = beliefs.falsification_targets(limit=1)
         if not targets:
             return None
         tgt = dict(targets[0])
         key = tgt.get("claim_id") or tgt.get("hypothesis_id") or ""
-        attempted = key in set(state.resources.get("controller", {}).get("falsified", []))
+        controller = state.resources.setdefault("controller", {})
+        falsified = list(controller.get("falsified", []))
+        attempts = falsified.count(key) if key else 0
+        attempted = key in set(falsified)
         tgt["attempted"] = attempted
+        tgt["attempts"] = attempts
         tgt["conditions"] = tgt.get("falsification_conditions") or tgt.get("disconfirming_observations") or []
+        # Falsification is bounded per target. Without this, an unresolved contradiction re-issues
+        # `must_falsify` on the same belief every single cycle — which is exactly what happened
+        # live: 21 offline cycles and four live ones spent re-attacking one belief, while the
+        # deliverables the mission existed to produce were never written. A belief that has
+        # survived repeated falsification is not settled by attacking it again; it is recorded as
+        # resistant and the mission moves on.
+        if attempts >= MAX_FALSIFICATION_ATTEMPTS:
+            exhausted: list[str] = controller.setdefault("falsification_exhausted", [])
+            if key and key not in exhausted:
+                exhausted.append(key)
+                state.notes.append(
+                    f"falsification exhausted for {key} after {attempts} attempts; recorded as resistant to falsification "
+                    "rather than re-attacked"
+                )
+                self.tracer.emit(
+                    "verify",
+                    f"falsification bound reached for {key} after {attempts} attempts",
+                    data={"target": key, "attempts": attempts},
+                )
+            return None
         return None if attempted and not state.unresolved_contradictions() else tgt
 
     # ------------------------------------------------------------------------------
@@ -424,6 +514,18 @@ class Executive:
             "unknowns": [{"id": u.id, "question": u.question, "priority": u.priority(), "attempts": u.attempts} for u in sorted(state.open_unknowns(), key=lambda u: -u.priority())[:8]],
             "contradictions": [c.model_dump(mode="json") for c in state.unresolved_contradictions()[:5]],
             "directives": assessment.directives,
+            "closure": (
+                {
+                    "completion_blocked_on": [{"check": n.check, "missing": n.detail[:200], "criterion_ids": n.criterion_ids} for n in planner._closure.needs],
+                    "tasks_that_would_bind_the_missing_evidence": planner._closure.candidate_task_ids,
+                    "substantive_work_done": planner._closure.substantive_work_done,
+                    "guidance": "These predicates are what the completion gate is refusing on. A planned task that binds "
+                    "evidence to them is worth more than further deliberation. Verification still has to actually run — "
+                    "nothing is satisfied by asserting it.",
+                }
+                if getattr(planner, "_closure", None) is not None and planner._closure.blocked
+                else None
+            ),
             "verification_pending": verification_pending,
             "criteria_verification_pending": self._criteria_pass_useful(state, planner, verification_pending),
             "synthesis_exists": bool(state.synthesis),
@@ -637,7 +739,9 @@ class Executive:
         leading = [h for h in state.hypotheses if h.status == "leading"] or sorted(state.hypotheses, key=lambda h: -h.confidence)
         if leading:
             return leading[0].statement
-        top = sorted(state.claims, key=lambda c: -(c.confidence * c.decision_relevance))
+        # Never speak for the mission with a claim the world has moved past: a superseded
+        # observation was true of an earlier moment and is not this mission's position now.
+        top = sorted((c for c in state.claims if c.live()), key=lambda c: -(c.confidence * c.decision_relevance))
         return top[0].proposition if top else ""
 
     def _extract_disagreements(self, state: MissionState, run: Any, out: OperationOutcome, planner: Planner) -> None:
@@ -723,13 +827,26 @@ class Executive:
         if state.resources.get("anchor", {}).get("completion_assessment_id"):
             return ""  # already anchored for this completion attempt and cleared
         proposition = self._executive_position(state)
-        outcome = self.anchors.run(
-            state,
-            question=f"From the observations alone, what do they establish about this mission's objective: {state.objective}",
-            proposition=proposition,
-            branch="mission",
-            propositions=[c.description for c in state.success_criteria],
-        )
+        try:
+            outcome = self.anchors.run(
+                state,
+                question=f"From the observations alone, what do they establish about this mission's objective: {state.objective}",
+                proposition=proposition,
+                branch="mission",
+                propositions=[c.description for c in state.success_criteria],
+            )
+        except BlindnessViolation as exc:
+            # The packet could not be made blind — the executive's own conclusion is present in
+            # the raw material. Failing closed is the only honest option: an anchor that cannot be
+            # run independently has not agreed with anything, so completion is held rather than
+            # granted, and the mission is told exactly why.
+            self.tracer.emit(
+                "anchor",
+                f"HOLD — blind packet could not be constructed: {exc}",
+                data={"reason": "blindness_violation", "detail": str(exc)[:400]},
+            )
+            state.notes.append(f"completion held: the reality anchor could not be run blindly ({exc})")
+            return f"completion held: the reality anchor could not be run blindly — {exc}"
         if out is not None:
             out.anchor = outcome
         if outcome.held:
@@ -812,7 +929,7 @@ class Executive:
                         rec.expected_failure = True
                         rec.summary = "(reproduction) " + rec.summary
             elif p.get("research"):
-                relevant = [c.id for c in state.claims if c.decision_relevance >= 0.5]
+                relevant = [c.id for c in state.live_claims() if c.decision_relevance >= 0.5]
                 result = engine.verify_research(relevant or None, task_id=task.id)
             elif task.artifact_ids:
                 result = engine.verify_task(task)
@@ -901,7 +1018,7 @@ class Executive:
         extra = {
             "artifacts": [{"name": a.name, "path": a.path, "verified": a.verified, "summary": a.summary[:160]} for a in state.artifacts[-10:]],
             "tests": [{"name": t.name, "status": t.status.value, "summary": t.summary[:160]} for t in state.tests[-6:]],
-            "claims": [{"proposition": c.proposition[:200], "status": c.status.value, "confidence": c.confidence, "independent_roots": c.source_independence} for c in sorted(state.claims, key=lambda c: -c.decision_relevance)[:10]],
+            "claims": [{"proposition": c.proposition[:200], "status": c.status.value, "confidence": c.confidence, "independent_roots": c.source_independence} for c in sorted(state.live_claims(), key=lambda c: -c.decision_relevance)[:10]],
             "unresolved_contradictions": [c.description[:160] for c in state.unresolved_contradictions()],
             "completed_tasks": [t.title for t in state.completed_tasks()[-10:]],
         }
@@ -1008,7 +1125,7 @@ class Executive:
         if ("decision" in vm or "conclusion" in vm) and ("evidence" in vm or "source" in vm):
             if not state.synthesis or not state.synthesis.get("conclusion"):
                 return None
-            supported = [c for c in state.claims if c.status.value in ("supported", "established") and c.decision_relevance >= 0.5]
+            supported = [c for c in state.live_claims() if c.status.value in ("supported", "established") and c.decision_relevance >= 0.5]
             serious = [c for c in state.unresolved_contradictions() if c.severity >= 0.5]
             if serious:
                 return False
@@ -1021,7 +1138,7 @@ class Executive:
             for h in state.hypotheses:
                 if h.id == tournament["leading_id"]:
                     tournament["leading_statement"] = h.statement
-        claims = sorted(state.claims, key=lambda c: -(c.confidence * c.decision_relevance))[:15]
+        claims = sorted(state.live_claims(), key=lambda c: -(c.confidence * c.decision_relevance))[:15]
         metadata = {
             "criteria": [{"id": c.id, "description": c.description, "satisfied": c.satisfied, "evidence": ", ".join(c.verification_ids)} for c in state.success_criteria],
             "claims": [{"id": c.id, "proposition": c.proposition, "confidence": c.confidence, "status": c.status.value, "decision_relevance": c.decision_relevance, "independence": c.source_independence} for c in claims],
@@ -1082,6 +1199,23 @@ class Executive:
                 if passed:
                     interp.new_evidence.append(EvidenceSpec(summary=f"Verification passed: {ver.summary[:200]}", source="tool:verification", kind="primary", reliability=0.95))
             return interp
+        # Cognitive escalation (live-run area C): pick the cheapest mechanism that can honestly
+        # handle this observation. Anything carrying judgment escalates; the mechanical residue
+        # does not need a frontier deliberation to read it.
+        escalation = classify(op, outcome, task, state)
+        self.tracer.emit(
+            "escalation",
+            f"{op.value} -> {escalation.describe()[:200]}",
+            data={"tier": escalation.tier.name, "reasons": escalation.reasons, "operation": op.value},
+        )
+        if escalation.tier is Tier.L0_DETERMINISTIC:
+            return deterministic_interpretation(op, outcome, task, state)
+        if escalation.tier is Tier.L1_DIGEST:
+            digest = self._digest_observation(state, decision, outcome, task, assessment)
+            if digest is not None:
+                return digest_to_interpretation(digest, task, state)
+            # Fall through to full interpretation rather than losing the observation.
+
         metadata = {
             "operation": op.value,
             "task_id": task.id if task else "",
@@ -1094,7 +1228,7 @@ class Executive:
             "calculation_error": outcome.calculation_error,
             "simulation_result": outcome.simulation_result,
             "errors": outcome.errors,
-            "claims": [{"id": c.id, "proposition": c.proposition, "confidence": c.confidence} for c in state.claims[:30]],
+            "claims": [{"id": c.id, "proposition": c.proposition, "confidence": c.confidence} for c in state.live_claims()[:30]],
             "unknowns": [{"id": u.id, "question": u.question} for u in state.open_unknowns()[:10]],
             "hypotheses": [{"id": h.id, "statement": h.statement, "confidence": h.confidence} for h in state.hypotheses[:10]],
             "progress": state.progress,
@@ -1123,6 +1257,46 @@ class Executive:
         from cogos.adapters.scripted import HeuristicExecutive
 
         return ObservationInterpretation.model_validate(HeuristicExecutive()._interpret(req))
+
+    def _digest_observation(self, state: MissionState, decision: StepDecision, outcome: OperationOutcome, task: Optional[Task], assessment: Assessment) -> Optional[Any]:
+        """A bounded read of a routine observation (L1).
+
+        The reduced schema is the mechanism: a digest structurally cannot revise beliefs, so an
+        observation classified as not bearing on them cannot change them by accident, and cannot
+        run up a 40k-token belief essay either.
+        """
+        results = [{"tool": r.tool, "ok": r.ok, "output": (r.output or "")[:3000], "trust": r.trust.value} for r in outcome.tool_results]
+        prompt = (
+            f"MISSION: {state.objective}\n\nSTEP: {decision.rationale[:400]}\n\n"
+            f"TASK: {task.title if task else '(none)'}\n\n"
+            f"OPEN UNKNOWNS: {json.dumps([{'id': u.id, 'question': u.question} for u in state.open_unknowns()[:5]], default=str)}\n\n"
+            f"TOOL RESULTS:\n{json.dumps(results, default=str)[:12000]}\n\n"
+            "Read the results and report what they show. Record only facts you can point at in the "
+            "output above. Return the ObservationDigest JSON."
+        )
+        req = CognitionRequest(
+            kind="digest",
+            system_prompt=PROMPTS["digest"],
+            prompt=prompt,
+            schema_name="ObservationDigest",
+            output_schema=schema_for(ObservationDigest),
+            model=self.config.executive.model,
+            untrusted=list(outcome.untrusted),
+            effort="low",
+            timeout_seconds=min(180, self.config.executive.call_timeout_seconds),
+            mission_id=state.mission_id,
+            metadata={"operation": decision.operation.value, "task_id": task.id if task else ""},
+        )
+        try:
+            resp = self._cognition(state, req)
+        except ExecutiveUnavailable:
+            return None
+        if not resp.ok:
+            return None
+        try:
+            return ObservationDigest.model_validate(resp.parsed)
+        except Exception:  # noqa: BLE001 - fall back to full interpretation
+            return None
 
     def _apply_interpretation(self, state: MissionState, interp: ObservationInterpretation, outcome: OperationOutcome, task: Optional[Task], beliefs: BeliefGraph, world: WorldModelManager, planner: Planner) -> None:
         if interp.injection_detected or any(r.injection_flags for r in outcome.tool_results) or any(rep.get("_injection_flags") for rep in outcome.specialist_reports):

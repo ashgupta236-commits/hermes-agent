@@ -34,6 +34,10 @@ def _held(state: Any, task_id: str) -> tuple[bool, str]:
 
 
 class Planner:
+    #: Set by the executive each cycle from the completion gate. None means "not assessed", which
+    #: yields no ordering change at all.
+    _closure: Any = None
+
     def __init__(self, state: MissionState):
         self.state = state
 
@@ -186,6 +190,13 @@ class Planner:
                     s += 0.2
         if task.operation_hint in ("verify", "falsify"):
             s += 0.15
+        # Closure (live-run area E): once the completion gate is blocked on missing evidence, a
+        # task that would bind that evidence outranks further exploration. This changes ordering
+        # only — it never makes a criterion satisfied, and the boost vanishes when the gate clears.
+        if self._closure is not None and self._closure.blocked:
+            from cogos.verification.closure import closure_bonus
+
+            s += closure_bonus(task, self._closure, self._closure.needs)
         # Unblock the most downstream work first.
         dependents = sum(1 for t in self.state.tasks if task.id in t.depends_on and t.status not in _TERMINAL)
         s += 0.05 * min(dependents, 4)

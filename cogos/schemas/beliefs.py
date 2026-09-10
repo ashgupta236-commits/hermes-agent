@@ -68,6 +68,30 @@ class Claim(BaseModel):
     created_at: str = Field(default_factory=iso_now)
     updated_at: str = Field(default_factory=iso_now)
     provenance: Optional[Provenance] = None
+    # --- temporal scope -------------------------------------------------------------
+    # A claim about mutable state ("the file does not exist") is true *of a moment*, not
+    # forever. When a later observation of the same subject disagrees, the earlier claim is
+    # superseded rather than contradicted: both were accurate when made. History is kept —
+    # the claim stays in state, queryable, pointing forward to what replaced it.
+    observes_current_state: bool = Field(
+        default=False,
+        description="True when the proposition asserts the present state of something mutable, so a "
+        "later observation of the same subject supersedes it instead of contradicting it",
+    )
+    subjects: list[str] = Field(
+        default_factory=list,
+        description="Normalised identifiers of what this claim asserts the current state of (e.g. file paths)",
+    )
+    observed_at: Optional[str] = Field(default=None, description="When the underlying state was actually observed")
+    superseded_by: Optional[str] = Field(default=None, description="Claim id that replaced this one")
+    superseded_at: Optional[str] = None
+
+    def is_superseded(self) -> bool:
+        return bool(self.superseded_by)
+
+    def live(self) -> bool:
+        """Whether this claim still describes the world as currently believed."""
+        return not self.is_superseded() and self.status != ClaimStatus.STALE
 
 
 class Hypothesis(BaseModel):
