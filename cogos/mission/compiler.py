@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-from cogos.adapters.base import CognitionRequest, ExecutiveModel
+from cogos.adapters.base import CognitionRequest, ExecutiveModel, ExecutiveUnavailable
 from cogos.adapters.schema_utils import schema_for
 from cogos.adapters.scripted import default_compilation
 from cogos.config import CogosConfig
@@ -92,6 +92,11 @@ class MissionCompiler:
         )
         resp = self.adapter.call(req)
         used_fallback = False
+        if resp.ok and not resp.residency_ok:
+            # Never accept a compile produced by a different model than the resident executive.
+            resp = resp.model_copy(update={"ok": False, "error": f"model residency violation: requested {resp.model_requested}, served by {resp.models_used}", "error_kind": "unavailable"})
+        if not resp.ok and resp.error_kind == "unavailable":
+            raise ExecutiveUnavailable(resp.error)
         if resp.ok:
             try:
                 comp = MissionCompilation.model_validate(resp.parsed)

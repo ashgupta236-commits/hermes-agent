@@ -207,6 +207,8 @@ class ClaudeCodeExecutive:
     def _residency_ok(self, requested: str, used: list[str]) -> bool:
         if not used:
             return True  # nothing recorded (e.g. cached); cannot prove a violation
+        # Auxiliary models (title generation, summarisation) do not serve cognition; ignore them.
+        used = [m for m in used if not any(m.lower().startswith(a) for a in self.auxiliary_models_ok)] or used
         req_key = requested.lower()
         for m in used:
             ml = m.lower()

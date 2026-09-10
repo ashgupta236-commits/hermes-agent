@@ -671,7 +671,33 @@ class Executive:
                 for c in state.success_criteria:
                     if c.id == cid and not c.satisfied:
                         engine.verify_criterion(c)
+        if result.status == VerificationStatus.INCONCLUSIVE and result.checks and task is not None:
+            result = self._judge_verification(state, task, result)
         self.tracer.emit("verify", f"{result.target_type}:{result.target_id} {result.status.value} — {result.summary[:160]}", data=result.model_dump(mode="json"))
+        return result
+
+    def _judge_verification(self, state: MissionState, task: Task, result: VerificationResult) -> VerificationResult:
+        """Independent executive judgement over inconclusive deterministic checks (never over failed ones)."""
+        from cogos.schemas.cognition import VerificationJudgment
+
+        checks = [c.model_dump(mode="json") for c in result.checks]
+        req = CognitionRequest(kind="verify", system_prompt=PROMPTS["verify"], prompt=f"MISSION: {state.objective}\n\nTARGET: task '{task.title}' — {task.description}\nRESULT SUMMARY: {task.result_summary[:500]}\n\nDETERMINISTIC CHECKS:\n{json.dumps(checks, default=str)[:8000]}\n\nJudge whether the target meets its requirement. Return the VerificationJudgment JSON.", schema_name="VerificationJudgment", output_schema=schema_for(VerificationJudgment), model=self.config.executive.model, mission_id=state.mission_id, metadata={"checks": checks, "task": self._task_view(task)})
+        try:
+            resp = self._cognition(state, req)
+        except ExecutiveUnavailable:
+            return result
+        if not resp.ok:
+            return result
+        try:
+            judgment = VerificationJudgment.model_validate(resp.parsed)
+        except Exception:  # noqa: BLE001
+            return result
+        if judgment.status == "passed" and judgment.confidence >= 0.7 and judgment.checked:
+            result.status = VerificationStatus.PASSED
+            result.summary = f"executive judgement passed ({judgment.confidence:.2f}): {judgment.summary[:160]}; checked: {', '.join(judgment.checked[:5])}"
+        elif judgment.status == "failed":
+            result.status = VerificationStatus.FAILED
+            result.summary = f"executive judgement failed: {judgment.summary[:160]}; issues: {'; '.join(judgment.issues[:3])}"
         return result
 
     def _runtime_criterion_evidence(self, state: MissionState, criterion: Any) -> Optional[bool]:
@@ -1159,8 +1185,22 @@ class Executive:
             for d in state.decisions:
                 if d.outcome_success is None and d.consequential:
                     DecisionJournal(self.store, state).resolve(d.decision_id, "mission completed with this decision in force", True)
+        # Working memory: the active task state of this mission (scoped; dropped on completion).
+        active = [t for t in state.tasks if t.status == TaskStatus.ACTIVE] or ([task] if task else [])
+        if active:
+            self.memory.remember(MemoryClass.WORKING, f"[{state.mission_id}] active: {'; '.join(t.title for t in active[:3])} (cycle {state.usage.cycles})", tags=["working"], mission_id=state.mission_id, confidence=1.0, importance=0.4)
+        for rel in state.world_model.relations[-5:]:
+            if rel.confidence >= 0.7:
+                src = next((e.name for e in state.world_model.entities if e.id == rel.source_id), rel.source_id)
+                dst = next((e.name for e in state.world_model.entities if e.id == rel.target_id), rel.target_id)
+                self.memory.remember(MemoryClass.RELATIONAL, f"{src} --{rel.kind}--> {dst}", tags=["relation", rel.kind], mission_id=state.mission_id, confidence=rel.confidence, importance=0.5)
+        for ev in state.evidence[-5:]:
+            if ev.freshness:
+                self.memory.remember(MemoryClass.TEMPORAL, f"{ev.summary[:160]} (valid as of {ev.freshness}; scope {ev.scope or 'unspecified'})", tags=["temporal"], mission_id=state.mission_id, confidence=ev.provenance.reliability, importance=0.45, valid_from=ev.freshness, provenance=ev.provenance)
+                self.memory.remember(MemoryClass.META, f"source {ev.provenance.source}: reliability {ev.provenance.reliability:.2f}, kind {ev.kind.value}, roots {sorted(ev.root_sources())[:3]}", tags=["meta", "provenance"], mission_id=state.mission_id, confidence=0.8, importance=0.4)
         if state.usage.cycles % max(1, cfg.consolidation_interval_cycles) == 0:
             try:
+                self.memory.expire()
                 res = self.memory.consolidate(mission_id=state.mission_id)
                 self.tracer.emit("learn", f"memory consolidation: {res}", data=res)
             except Exception as exc:  # noqa: BLE001
@@ -1238,7 +1278,8 @@ class Executive:
     def _persist(self, state: MissionState, result: CycleResult) -> None:
         payload = {"cycle": result.cycle, "operation": result.decision.operation.value if result.decision else None, "stop": result.stop, "reason": result.stop_reason, "status": state.status.value}
         self.store.save_mission(state, "cycle", payload)
-        if state.usage.cycles % 5 == 0 or result.stop:
+        every = max(1, self.config.checkpoint_every_cycles)
+        if state.usage.cycles % every == 0 or result.stop:
             self._checkpoint(state)
 
     def _checkpoint(self, state: MissionState, final: bool = False) -> None:

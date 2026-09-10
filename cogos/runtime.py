@@ -86,7 +86,9 @@ class Runtime:
     def new_mission(self, objective: str, *, human_context: str = "", budget: Optional[Budget] = None, permissions: Optional[dict[str, Any]] = None, context: Optional[dict[str, Any]] = None) -> MissionState:
         memory_lines = []
         try:
-            memory_lines = [f"[{m.memory_class.value} {m.confidence:.2f}] {m.content[:200]}" for m in self.memory.retrieve(objective, limit=8)]
+            from cogos.governance.immune import scan_for_injection
+
+            memory_lines = [f"[{m.memory_class.value} {m.confidence:.2f}] {m.content[:200]}" for m in self.memory.retrieve(objective, limit=8) if not scan_for_injection(m.content)]
         except Exception:  # noqa: BLE001
             memory_lines = []
         skills_text = ""

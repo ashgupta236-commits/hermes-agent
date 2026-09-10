@@ -137,9 +137,6 @@ class CapabilityFirewall:
                 action_class=action_class,
                 reason=f"action class '{action_class.value}' requires explicit human authorization",
             )
-        if action_class in (ActionClass.CONSEQUENTIAL_SHARED, ActionClass.SECURITY_SENSITIVE, ActionClass.PRIVACY_SENSITIVE):
-            if action_class.value not in self.human_grants and action_class.value in cfg.always_require_human:
-                return FirewallVerdict(decision=PolicyDecision.REQUIRE_HUMAN, action_class=action_class, reason=f"'{action_class.value}' requires authorization")
         # Filesystem writes outside writable roots are consequential/shared: deny unless granted.
         if spec.substrate == "filesystem" and action_class == ActionClass.CONSEQUENTIAL_SHARED and "consequential_shared" not in self.human_grants:
             return FirewallVerdict(decision=PolicyDecision.DENY, action_class=action_class, reason="write outside writable roots")
