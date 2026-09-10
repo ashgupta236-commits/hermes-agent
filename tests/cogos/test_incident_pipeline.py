@@ -575,6 +575,12 @@ def test_evidence_identity_traversal_is_machine_readable_in_both_directions(tmp_
     engine = VerificationEngine(_fabric(tmp_path), state)
     crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
     state.success_criteria.append(crit)
+    # A real mission registers its deliverables as it writes them; that is what gives the receipt
+    # something to bind to.
+    for n in ("calc.py", "test_calc.py"):
+        a = Artifact(name=n, kind="code", path=str(tmp_path / n))
+        state.artifacts.append(a)
+        engine.verify_artifact(a)
     task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
     state.tasks.append(task)
 
@@ -583,9 +589,20 @@ def test_evidence_identity_traversal_is_machine_readable_in_both_directions(tmp_
     res = engine.verify_criterion(crit)
     assert res.status == PASSED, res.summary
 
-    # forward: criterion -> receipt
+    # forward: criterion -> receipt -> verification -> evidence -> action, by id alone
     receipts = state.passing_verifications(crit.verification_ids, target_type="criterion", target_id=crit.id)
     assert receipts, "criterion must resolve to a bound passing receipt by id"
+    receipt = receipts[0]
+    assert receipt.input_versions, "the receipt must name the input versions it rests on"
+    assert receipt.produced_by_action_ids, "the receipt must name the actions it rests on"
+
+    # backward: action -> every receipt that used it -> every criterion that rests on those
+    action = code.produced_by_action_ids[0]
+    using = {v.id for v in state.verifications if action in (v.produced_by_action_ids or [])}
+    assert using, "an action must be traceable forward to the receipts that used it"
+    reached = [c.id for c in state.success_criteria if using & set(c.verification_ids)]
+    assert crit.id in reached, "an action must be traceable to every criterion that relied on it"
+
     # backward: test record -> the criterion it was offered for
     rec = state.tests[-1]
     assert crit.id in rec.criterion_ids, "a test record must name every criterion it is evidence for"
@@ -1063,3 +1080,68 @@ def test_every_persisted_schema_field_has_a_default_so_stored_missions_stay_load
     # Newly added persistence fields must never appear here.
     for added in ("origin", "versions", "mission_id", "size_bytes", "observed_at", "criterion_ids", "counts", "executed", "input_versions", "authoritative", "produced_by_action_ids"):
         assert not any(o.endswith("." + added) for o in offenders), f"{added} must have a default: {offenders}"
+
+
+def test_scope_frozen_on_the_record_cannot_be_retro_claimed_by_editing_the_task(tmp_path):
+    """A record that carries its own scope is the whole answer. Re-resolving through the task
+    would let a criterion be claimed by editing the task after the outcome was known."""
+    _write(tmp_path, "test_unrelated.py", "def test_u():\n    assert True\n")
+    state = MissionState(objective="retro-claim")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    target = SuccessCriterion(description="the payments module rounds correctly", verification_method="pytest tests pass")
+    declared = SuccessCriterion(description="the linter passes", verification_method="pytest tests pass")
+    state.success_criteria += [target, declared]
+    task = Task(title="unrelated run", status=TaskStatus.DONE, addresses_criterion_ids=[declared.id])
+    state.tasks.append(task)
+    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    assert state.tests[-1].criterion_ids == [declared.id], "scope is frozen onto the record when it runs"
+
+    task.addresses_criterion_ids.append(target.id)  # retro-claim, after the outcome is known
+
+    assert engine.verify_criterion(target).status != PASSED, "a criterion cannot be claimed after the fact"
+    assert not target.satisfied
+    assert engine.verify_criterion(declared).status == PASSED, "the legitimately declared scope still works"
+
+
+def test_an_authorized_expected_zero_run_cannot_be_chained_into_completion(tmp_path):
+    """expect_zero_tests comes from a model-authored task, so the layered defence matters: the run
+    may pass its own contract, but a zero-execution record still proves no criterion."""
+    state = MissionState(objective="expect zero chain")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    task = Task(title="cheap", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+
+    assert engine.verify_code([f'{sys.executable} -c "print(1)"'], cwd=str(tmp_path), task_id=task.id, expect_zero_tests=True).status == PASSED
+    engine.verify_criterion(crit)
+
+    assert not crit.satisfied
+    assert mission_completion_check(state).status != PASSED
+
+
+def test_a_symlink_repointed_after_verification_is_detected(tmp_path):
+    import os
+
+    _write(tmp_path, "real.py", CALC)
+    _write(tmp_path, "evil.py", "def add_percent(v, p):\n    return 999.0\n")
+    os.symlink(tmp_path / "real.py", tmp_path / "calc.py")
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    state = MissionState(objective="symlink")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    for n in ("calc.py", "test_calc.py"):
+        a = Artifact(name=n, kind="code", path=str(tmp_path / n))
+        state.artifacts.append(a)
+        engine.verify_artifact(a)
+    task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    engine.verify_criterion(crit)
+    assert mission_completion_check(state).status == PASSED
+
+    os.remove(tmp_path / "calc.py")
+    os.symlink(tmp_path / "evil.py", tmp_path / "calc.py")
+
+    assert mission_completion_check(state).status != PASSED, "repointing a symlink must not preserve the proof"

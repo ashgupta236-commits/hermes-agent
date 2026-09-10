@@ -645,9 +645,14 @@ class VerificationEngine:
         criterion in ``addresses_criterion_ids``. Both are machine-readable links recorded before
         the outcome was known, so neither can be attached after the fact to fit a result.
         """
-        if criterion_id in (record.criterion_ids or []):
-            return True
+        if record.criterion_ids:
+            # Scope frozen onto the record when it ran. Once a record carries its own scope that
+            # is the whole answer: re-resolving through the task would let a criterion be claimed
+            # by editing the task *after* the outcome was known.
+            return criterion_id in record.criterion_ids
         if record.task_id:
+            # No frozen scope: a record written before scope was captured. Fall back to the task's
+            # declaration, which is the weaker guarantee those records were made under.
             task = self.state.task(record.task_id)
             if task is not None and criterion_id in (task.addresses_criterion_ids or []):
                 return True
