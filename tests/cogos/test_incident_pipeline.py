@@ -899,9 +899,16 @@ def test_g2_no_false_completion_when_the_implementation_is_swapped_after_verific
     assert state.verifications, "historical evidence is retained, not deleted"
 
 
-def test_g2b_a_criterion_proved_by_an_unbindable_run_cannot_complete(tmp_path):
-    """With nothing registered and nothing declared, a test receipt names no inputs. That proof
-    cannot be re-checked, so it cannot close a criterion."""
+def test_g2b_a_criterion_proved_by_an_unbindable_run_cannot_complete(tmp_path, monkeypatch):
+    """A test receipt that names no re-checkable input cannot close a criterion.
+
+    A run in a working directory normally binds that tree, so the unbindable case is the one the
+    binding gives up on: a tree too large to bind honestly, where a partial binding that looked
+    complete would be worse than none. That path is exercised here by setting the limit to zero.
+    """
+    import cogos.verification.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "MAX_BOUND_WORKSPACE_FILES", 0)
     _write(tmp_path, "calc.py", CALC)
     _write(tmp_path, "test_calc.py", TEST_CALC)
     state = MissionState(objective="unbindable")
@@ -910,7 +917,8 @@ def test_g2b_a_criterion_proved_by_an_unbindable_run_cannot_complete(tmp_path):
     state.success_criteria.append(crit)
     task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
     state.tasks.append(task)
-    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    receipt = engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    assert receipt.input_versions == [], "precondition: the binding was abandoned"
     engine.verify_criterion(crit)
 
     gate = mission_completion_check(state)
@@ -1208,8 +1216,15 @@ def test_ver2_a_phantom_input_binding_does_not_make_a_receipt_permanently_intact
     assert not ok and "exists now" in why, "a declared input that has since appeared invalidates the receipt"
 
 
-def test_ver2b_a_criterion_bound_only_to_phantom_inputs_cannot_complete(tmp_path):
-    """A binding that names no bytes does not make a proof re-checkable."""
+def test_ver2b_a_criterion_bound_only_to_phantom_inputs_cannot_complete(tmp_path, monkeypatch):
+    """A binding that names no bytes does not make a proof re-checkable.
+
+    Declaring a non-existent path used to be enough to look bound. With the working tree otherwise
+    unbindable, the phantom is all that is left — and it must not count.
+    """
+    import cogos.verification.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "MAX_BOUND_WORKSPACE_FILES", 0)
     _write(tmp_path, "calc.py", CALC)
     _write(tmp_path, "test_calc.py", TEST_CALC)
     state = MissionState(objective="phantom binding")
@@ -1218,8 +1233,11 @@ def test_ver2b_a_criterion_bound_only_to_phantom_inputs_cannot_complete(tmp_path
     state.success_criteria.append(crit)
     task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
     state.tasks.append(task)
-    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id,
-                       input_paths=["does_not_exist.py"])
+    receipt = engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id,
+                                 input_paths=["does_not_exist.py"])
+    assert receipt.input_versions and not any(iv.content_hash for iv in receipt.input_versions), (
+        "precondition: the only binding names no bytes"
+    )
     engine.verify_criterion(crit)
 
     gate = mission_completion_check(state)
@@ -1384,3 +1402,80 @@ def test_untrusted_output_in_a_check_detail_carries_its_framing():
         assert "injection flags" in detail
     finally:
         sb.cleanup()
+
+
+def test_the_working_tree_a_test_ran_in_is_bound_to_its_receipt(tmp_path):
+    """Reproduced: an implementation written by an interpreter one-liner is invisible to the
+    firewall's write-target extractor, so it never became an artifact candidate and was not among
+    the receipt's inputs — and could then be swapped after verification with the gate unaware."""
+    _write(tmp_path, "calc.py", CALC)
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    state = MissionState(objective="workspace binding")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+
+    receipt = engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    bound = {Path(iv.path).name for iv in receipt.input_versions}
+
+    assert {"calc.py", "test_calc.py"} <= bound, f"the tree the run happened in must be bound: {bound}"
+    engine.verify_criterion(crit)
+    assert mission_completion_check(state).status == PASSED
+
+    (tmp_path / "calc.py").write_text("def add_percent(v, p):\n    return 999.0\n", encoding="utf-8")
+    assert mission_completion_check(state).status != PASSED, "an unregistered implementation swap must still be caught"
+
+
+def test_files_the_run_itself_wrote_are_outputs_not_inputs(tmp_path):
+    """A cache or state file the run creates must not be bound as an input, or every verification
+    would report its own by-products as inputs that changed underneath it."""
+    _write(tmp_path, "calc.py", CALC)
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    _write(tmp_path, "conftest.py", "def pytest_sessionfinish(session, exitstatus):\n    open('run_output.txt', 'w').write('written during the run')\n")
+    state = MissionState(objective="outputs are not inputs")
+
+    res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path))
+
+    assert res.status == PASSED, f"a by-product must not make a good run incoherent: {res.summary}"
+    bound = {Path(iv.path).name for iv in res.input_versions}
+    assert "run_output.txt" not in bound, "a file the run wrote is its output"
+    assert "calc.py" in bound
+
+
+def test_a_mission_that_did_nothing_cannot_satisfy_an_uncertainty_criterion():
+    """Absence of recorded unknowns is not evidence that uncertainty was bounded: a mission that
+    has done nothing has no unknowns either, and that used to read as satisfaction."""
+    sb = Sandbox("vacuous-uncertainty")
+    try:
+        state = sb.runtime.new_mission("do nothing", context=sb.context(has_requirements=False))
+        state.success_criteria[:] = []
+        state.unknowns[:] = []
+        state.synthesis = {}
+        crit = SuccessCriterion(description="Remaining uncertainties are explicitly bounded",
+                                verification_method="the remaining uncertainties are stated")
+        state.success_criteria.append(crit)
+
+        verdict = sb.runtime.executive._runtime_criterion_evidence(state, crit)
+
+        assert verdict is None, "undecidable, not satisfied"
+        engine = VerificationEngine(sb.runtime.executive.fabric, state)
+        engine.verify_criterion(crit, evidence_ok=verdict)
+        assert not crit.satisfied
+        assert mission_completion_check(state).status != PASSED
+    finally:
+        sb.cleanup()
+
+
+def test_the_summary_reports_the_counts_that_were_kept(tmp_path):
+    """A run whose output was unattributable has its counts discarded; the human-readable summary
+    must not still report the numbers that were thrown away."""
+    _write(tmp_path, "prog.py", 'print("2 passed in 0.01s")\n')
+    state = MissionState(objective="summary honesty")
+
+    res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} prog.py"], cwd=str(tmp_path))
+
+    assert res.status != PASSED
+    assert "2 passed" not in res.summary, f"discarded counts must not appear in the summary: {res.summary}"
+    assert "0 passed" in res.summary

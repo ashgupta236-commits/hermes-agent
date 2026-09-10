@@ -11,6 +11,7 @@ is still missing.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 import statistics
@@ -160,6 +161,46 @@ def artifact_integrity(artifact: Artifact) -> tuple[bool, str]:
     return True, f"sha256 {artifact.verified_hash[:12]}… unchanged"
 
 
+#: Directories a verification run writes to or that are not the material under test. Including
+#: them would make every run report its own caches as inputs that changed mid-verification.
+_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".cogos", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox", ".venv", "venv", "node_modules", ".idea", ".vscode", "htmlcov", ".coverage",
+    "dist", "build", ".eggs",
+})
+#: A verification binds the tree it ran in, not an arbitrary filesystem. Past this many files the
+#: binding is abandoned rather than silently truncated: a partial binding that looks complete is
+#: worse than none, and the declared `input_paths` and artifact ledger still apply.
+MAX_BOUND_WORKSPACE_FILES = 500
+#: Runtime state and build products, never the material under test. A mission's own state store can
+#: sit inside the workspace, and binding it would make every later checkpoint invalidate the
+#: receipts written before it.
+_SKIP_SUFFIXES = (
+    ".pyc", ".pyo", ".so", ".log", ".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
+    ".lock", ".tmp", ".swp", ".jsonl", ".coverage",
+)
+
+
+def _workspace_inputs(root: Path, limit: Optional[int] = None) -> list[Path]:
+    """Regular files under `root` that a run in it could depend on."""
+    limit = MAX_BOUND_WORKSPACE_FILES if limit is None else limit
+    found: list[Path] = []
+    try:
+        if not root.is_dir():
+            return []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if name.endswith(_SKIP_SUFFIXES) or name.startswith("."):
+                    continue
+                found.append(Path(dirpath) / name)
+                if len(found) > limit:
+                    return []
+    except OSError:
+        return []
+    return found
+
+
 def receipt_inputs_intact(receipt: VerificationResult) -> tuple[bool, str]:
     """Do the inputs this receipt was produced against still hold, right now?
 
@@ -241,7 +282,7 @@ class VerificationEngine:
 
     # -- code -----------------------------------------------------------------------
 
-    def _relevant_inputs(self, cwd: Optional[str], input_paths: Optional[list[str]]) -> list[tuple[Path, Optional[str]]]:
+    def _relevant_inputs(self, cwd: Optional[str], input_paths: Optional[list[str]], include_workspace: bool = True) -> list[tuple[Path, Optional[str]]]:
         """The input versions a code receipt is about: the mission's own registered candidates.
 
         Bounded deliberately to the verification contract (declared paths) plus the artifact
@@ -272,6 +313,18 @@ class VerificationEngine:
         for art in self.state.artifacts:
             if art.path:
                 _add(art.path, art.id)
+        # The tree the command runs in is, by construction, the material the run could depend on.
+        # Binding it is what makes the receipt describe what it actually ran against: a file the
+        # mission produced by a route the write-target extractor cannot see — an interpreter
+        # one-liner, say — is never an artifact candidate, so without this the implementation
+        # under test could be swapped afterwards and nothing would notice.
+        #
+        # This is version binding for one receipt, not a ledger crawl: it is bounded to the
+        # declared working directory, skips caches and vendored trees, and gives up rather than
+        # walking something enormous.
+        if cwd and include_workspace:
+            for p in _workspace_inputs(Path(cwd)):
+                _add(str(p), None)
         return out
 
     def verify_code(
@@ -308,7 +361,12 @@ class VerificationEngine:
                 VerificationResult(target_type="code", target_id=task_id or "code", status=INCONCLUSIVE, summary="no tool fabric: tests not run", checks=checks, produced_by_task_id=task_id)
             )
 
+        # Declared and registered inputs are the ones the contract is *about*: a change to those
+        # mid-run is a finding. Files merely discovered in the working tree are candidates, and one
+        # that the run itself modified is an output of the run, not an input to it.
+        declared = self._relevant_inputs(cwd, input_paths, include_workspace=False)
         relevant = self._relevant_inputs(cwd, input_paths)
+        declared_paths = {str(p) for p, _ in declared}
         guard = InputVersionGuard([p for p, _ in relevant])
         before = guard.snapshot()
         action_ids: list[str] = []
@@ -317,9 +375,9 @@ class VerificationEngine:
             shell_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}" if cwd else cmd
             res = self.fabric.execute(ToolCall(tool="run_tests", arguments={"command": shell_cmd}, task_id=task_id, purpose="verification"))
             action_ids.append(res.call_id)
-            for key, value in (res.data.get("counts") or {}).items():
-                if key in test_totals:
-                    test_totals[key] += int(value)
+            # Totals come from the *classified* outcome below, not from the raw parse: a run whose
+            # output was unattributable has its counts discarded, and the human-readable summary
+            # must not still report the numbers that were thrown away.
             if res.error_kind in ("denied", "requires_human", "unavailable"):
                 # The check could not be run at all. That is an absence of evidence, not a verdict.
                 outcome = TestRunOutcome(status=INCONCLUSIVE, reason=res.error or "verification tool unavailable", exit_code=None, command=cmd)
@@ -334,6 +392,8 @@ class VerificationEngine:
                     command=cmd,
                     expect_zero=expect_zero_tests,
                 )
+            for key, value in (("passed", outcome.passed), ("failed", outcome.failed), ("error", outcome.errors), ("skipped", outcome.skipped)):
+                test_totals[key] += int(value)
             detail = f"{outcome.reason}: {res.data.get('summary') or res.error or ''}".strip(": ")
             checks.append(VerificationCheck(name=cmd, status=outcome.status, detail=detail, authoritative=True))
             self.state.tests.append(
@@ -360,10 +420,17 @@ class VerificationEngine:
         # move?" and "what is it now?", and be recorded as verified without being flagged.
         after = guard.snapshot()
         moved = {k for k in set(before) | set(after) if before.get(k, "") != after.get(k, "")}
-        input_versions = [
-            InputVersion(path=str(p), content_hash=after.get(str(p), ""), artifact_id=aid, changed_during_verification=str(p) in moved)
-            for p, aid in relevant
-        ]
+        input_versions = []
+        for p, aid in relevant:
+            key = str(p)
+            if key in moved and key not in declared_paths:
+                # The run wrote this. It is an output — a cache, a log, a state store — so it is
+                # not bound as an input, and it does not make the run look incoherent either.
+                continue
+            input_versions.append(
+                InputVersion(path=key, content_hash=after.get(key, ""), artifact_id=aid, changed_during_verification=key in moved)
+            )
+        moved &= declared_paths
         status = _aggregate(checks)
         if moved:
             # The bytes moved underneath the run, so no single coherent version was observed.

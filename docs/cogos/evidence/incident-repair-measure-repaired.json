@@ -32,7 +32,7 @@
  "p8_destructive_via_shell": "deny",
  "p8_destructive_via_test_runner": "deny",
  "p8_verification_channel_bypasses_firewall": false,
- "p9_unregistered_gate_before_mutation": "failed",
+ "p9_unregistered_gate_before_mutation": "passed",
  "p9_unregistered_gate_after_mutation": "failed",
  "p9_false_completion_after_swap": false,
  "p10_forged_summary_outcomes": {

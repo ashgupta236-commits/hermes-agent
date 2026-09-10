@@ -1513,6 +1513,12 @@ class Executive:
         """
         vm = (criterion.verification_method or "").lower() + " " + criterion.description.lower()
         if "uncertaint" in vm or "unknowns" in vm:
+            # Absence of recorded unknowns is not evidence that uncertainty was bounded: a mission
+            # that has done nothing has no unknowns either, and this branch used to read that as
+            # satisfaction — a mission with no tasks, no evidence and no synthesis passed the gate.
+            # Undecidable is the honest answer, and it routes to a judgement that needs grounding.
+            if not state.unknowns and not (state.synthesis or {}).get("conclusion"):
+                return None
             open_unknowns = state.open_unknowns()
             decision_changing = [u for u in open_unknowns if u.probability_changes_decision * u.decision_importance >= 0.5 and u.attempts == 0]
             listed = set(map(str, state.synthesis.get("remaining_uncertainties", []))) if state.synthesis else set()
