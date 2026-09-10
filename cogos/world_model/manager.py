@@ -337,6 +337,7 @@ class WorldModelManager:
         pred = Prediction(
             statement=statement,
             probability=probability,
+            stated_probability=probability,
             horizon=horizon,
             based_on_claim_ids=list(based_on_claim_ids or []),
         )
@@ -347,7 +348,11 @@ class WorldModelManager:
     def resolve_prediction(self, prediction_id: str, outcome: bool, note: str = "") -> Optional[Prediction]:
         for pred in self.world.predictions:
             if pred.id == prediction_id:
+                # The stated probability is left exactly as recorded. A wrong prediction is
+                # evidence about the model; editing it to match the outcome destroys that
+                # evidence and makes the model look calibrated when it was not.
                 pred.resolved = outcome
+                pred.resolved_at = iso_now()
                 pred.outcome = note or ("confirmed" if outcome else "refuted")
                 self._log("prediction_resolved", prediction=pred.id, outcome=outcome, probability=pred.probability)
                 return pred

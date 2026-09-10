@@ -66,8 +66,13 @@ class Prediction(BaseModel):
     horizon: str = ""
     probability: float = Field(default=0.5, ge=0.0, le=1.0)
     based_on_claim_ids: list[str] = Field(default_factory=list)
+    made_at: str = Field(default_factory=iso_now, description="Recorded before the outcome is known, which is what makes it a prediction")
     resolved: Optional[bool] = None
+    resolved_at: Optional[str] = None
     outcome: str = ""
+    #: The probability stated up front is never edited when the outcome arrives — a wrong
+    #: prediction is evidence about the model, and rewriting it would destroy that evidence.
+    stated_probability: Optional[float] = None
 
 
 class WorldModel(BaseModel):
