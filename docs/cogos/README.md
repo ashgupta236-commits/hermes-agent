@@ -1,0 +1,34 @@
+# cogos documentation
+
+`cogos` is a persistent, high-autonomy cognitive operating system built around a resident
+Claude executive model. It lives in `cogos/` at the repository root, ships its own CLI
+(`python -m cogos`) and tests (`tests/cogos/`), and touches no Hermes core file.
+
+| Document | What it covers |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | The Python-owned executive cycle, module map, cognition call sites and their structured-output contracts, adapters, deterministic boundaries, deviations from the plan. |
+| [AUTONOMY.md](AUTONOMY.md) | What the runtime decides itself, the few cases that require a human, `BLOCKED_EXTERNAL` semantics, retry/replan policy, the completion gate. |
+| [MODEL_POLICY.md](MODEL_POLICY.md) | Resident model (`claude-fable-5-1`), residency verification, no-downgrade rule, specialist model inheritance, Claude Code CLI flags. |
+| [STATE.md](STATE.md) | SQLite schema, migrations, optimistic concurrency, event log, snapshots, checkpoint cadence, boot/resume protocol, what survives a restart. |
+| [MEMORY.md](MEMORY.md) | Nine memory classes, selective writes, dedupe, contradiction detection, versioning, retrieval scoring, consolidation, quarantine. |
+| [EVALS.md](EVALS.md) | The twelve metrics, acceptance scenarios A-J, adversarial scenarios, how to run, measured results. |
+| [SECURITY.md](SECURITY.md) | Capability firewall, injection defence, trust levels, false-consensus guard, specialist tool surface, non-goals. |
+| [OPERATIONS.md](OPERATIONS.md) | Setup, every CLI command, `cogos.yaml`, environment variables, human answer/authorize flow, snapshots, troubleshooting. |
+
+## Quickstart
+
+```bash
+cd /home/user/hermes-agent
+uv sync --extra dev                                   # Python >=3.11; installs pytest
+.venv/bin/python -m cogos demo                        # offline end-to-end run (~5 s, scripted adapter)
+.venv/bin/python -m cogos init                        # writes cogos.yaml, creates .cogos/cogos.db
+.venv/bin/python -m cogos mission new "Build the feature described in REQUIREMENTS.md." --run
+.venv/bin/python -m cogos status                      # last mission: progress, criteria, blocked ops, human requests
+.venv/bin/python -m cogos boot                        # after a restart: reconstruct state, pick the resume target
+.venv/bin/python -m cogos resume                      # continue the highest-priority unfinished mission
+.venv/bin/python -m cogos eval --suite all --json     # acceptance + adversarial scenarios, offline
+.venv/bin/python -m pytest -q tests/cogos             # unit tests
+```
+
+The default adapter is `claude_code` (headless `claude -p`, model pinned to `claude-fable-5-1`).
+`demo` and `eval` always use the deterministic `scripted` adapter and need no network or API key.
