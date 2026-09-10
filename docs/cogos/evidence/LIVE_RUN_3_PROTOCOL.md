@@ -45,12 +45,13 @@ The run proceeds only if **all** of these pass on the frozen commit:
 
 | check | floor |
 | --- | --- |
-| `make cogos-test` (`tests/cogos`) | ≥ 528 passed, 0 failed |
+| `make cogos-test` (`tests/cogos`) | ≥ 562 passed, 0 failed |
 | `make cogos-lint` (ruff) | clean |
 | `make cogos-typecheck` (ty) | clean |
 | `make cogos-eval` | 20/20, all twelve metrics at target |
 | `make cogos-demo` | reaches `complete` |
 | incident regressions | `tests/cogos/test_incident_pipeline.py` and `test_incident_persistence.py` fully green |
+| mutation audit | `evidence/incident-repair-mutation-audit.sh` — every guard fails its named test when reverted, and no mutation reports `MUTATION DID NOT APPLY` |
 
 Do not weaken or alter tests to get green. **If the pre-run gate fails, stop.**
 
@@ -115,7 +116,8 @@ and final snapshot, extract:
 * **Execution:** for every VERIFY/FALSIFY operation — did a tool plan execute, how many
   `ToolResult`s reached the verifier, and the `produced_by_action_ids` on each receipt.
 * **Test evidence:** every `TestRecord` with `exit_code`, `counts`, `executed`, `framework`, `cwd`,
-  `criterion_ids`, `expected_zero`, `outcome_reason`. Count runs classified INCONCLUSIVE and why.
+  `criterion_ids`, `expected_zero`, `outcome_reason` and `report_backed`. Count runs classified
+  INCONCLUSIVE and why, and confirm every criterion-closing run was report-backed.
 * **Artifacts:** every `Artifact` with `origin`, `content_hash`, `size_bytes`, `versions`,
   `produced_by_task_id`, `produced_by_action_id`, `verified`, `verified_hash`.
 * **Receipts:** every `VerificationResult` with `input_versions`, and whether each was still intact
