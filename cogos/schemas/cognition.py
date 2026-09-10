@@ -184,6 +184,18 @@ class ContradictionSpec(BaseModel):
     description: str
     severity: float = 0.5
     suspected_cause: str = "unknown"
+    resolves_contradiction_ids: list[str] = Field(
+        default_factory=list,
+        description="Ids of previously reported contradictions this observation settles. Reporting a "
+        "resolution is a distinct act from reporting a new contradiction: without this the only way to "
+        "say 'that one is no longer live' was to append yet another record, leaving the original open.",
+    )
+    resolution: str = Field(
+        default="",
+        description="How those contradictions are settled — the scope, definition or time period under "
+        "which both statements are true, or the check that decided between them. Required for a "
+        "resolution to be accepted; a bare assertion that it is resolved is not one.",
+    )
 
 
 class TaskUpdateSpec(BaseModel):

@@ -14,11 +14,14 @@ from typing import Any
 from cogos.adapters.scripted import HeuristicExecutive, ScriptedExecutive
 from cogos.evaluation.support import Sandbox, engineer_policy
 from cogos.governance.firewall import CapabilityFirewall
+from cogos.beliefs import BeliefGraph
+from cogos.executive.loop import OperationOutcome
 from cogos.planner import Planner
 from cogos.schemas.cognition import TaskSpec
-from cogos.schemas.common import VerificationStatus
+from cogos.schemas.common import OperationKind, VerificationStatus
 from cogos.schemas.mission import MissionStatus, TaskStatus
 from cogos.verification import VerificationEngine, mission_completion_check
+from cogos.world_model import WorldModelManager
 
 
 # --- 1. denied authorization must not reactivate the task forever ---------------------------
@@ -303,3 +306,69 @@ def test_firewall_has_no_unreachable_duplicate_branch() -> None:
     assert verdict.decision is PolicyDecision.REQUIRE_HUMAN
     fw.grant("consequential_shared")
     assert fw.check(ToolCall(tool="shell", arguments={"command": "git push origin main"}), spec).decision is PolicyDecision.ALLOW
+
+
+def test_a_contradiction_settled_by_scope_is_resolved_not_merely_re_reported():
+    """Found in a live run: the executive correctly reasoned that "the files do not exist" and
+    "the files exist" were each true of their own period — but the only channel available
+    appended a new severity-0 record while the original severity-1.0 contradiction stayed open,
+    so the controller re-issued must_falsify every cycle against a settled dispute."""
+    from cogos.schemas.beliefs import Contradiction
+    from cogos.schemas.cognition import ContradictionSpec, ObservationInterpretation
+
+    sb = Sandbox("contradiction-resolution")
+    try:
+        state = sb.runtime.new_mission("Build the thing", context=sb.context(has_requirements=False))
+        stale = Contradiction(claim_ids=["clm_a"], description="files do not exist vs files exist", severity=1.0)
+        state.contradictions.append(stale)
+        assert [c.id for c in state.unresolved_contradictions()] == [stale.id]
+
+        interp = ObservationInterpretation(
+            summary="settled by period",
+            contradictions=[
+                ContradictionSpec(
+                    claim_ids=[],
+                    description="",
+                    severity=0.0,
+                    suspected_cause="time_period",
+                    resolves_contradiction_ids=[stale.id],
+                    resolution="the baseline claim describes the pre-write state; the existence claim the post-write state; both true within their periods",
+                )
+            ],
+        )
+        sb.runtime.executive._apply_interpretation(
+            state, interp, OperationOutcome(operation=OperationKind.DIRECT_REASONING), None,
+            BeliefGraph(state), WorldModelManager(state.world_model), Planner(state),
+        )
+
+        assert stale.resolved is True
+        assert "both true within their periods" in stale.resolution
+        assert state.unresolved_contradictions() == []
+        assert len(state.contradictions) == 1, "a resolution resolves; it does not append another record"
+    finally:
+        sb.cleanup()
+
+
+def test_a_resolution_without_a_stated_reason_is_refused():
+    """A bare assertion that a contradiction is resolved is not a resolution."""
+    from cogos.schemas.beliefs import Contradiction
+    from cogos.schemas.cognition import ContradictionSpec, ObservationInterpretation
+
+    sb = Sandbox("contradiction-bare")
+    try:
+        state = sb.runtime.new_mission("Build the thing", context=sb.context(has_requirements=False))
+        stale = Contradiction(claim_ids=["clm_a"], description="a vs b", severity=1.0)
+        state.contradictions.append(stale)
+
+        interp = ObservationInterpretation(
+            summary="no reason given",
+            contradictions=[ContradictionSpec(claim_ids=[], description="", severity=0.0, resolves_contradiction_ids=[stale.id], resolution="   ")],
+        )
+        sb.runtime.executive._apply_interpretation(
+            state, interp, OperationOutcome(operation=OperationKind.DIRECT_REASONING), None,
+            BeliefGraph(state), WorldModelManager(state.world_model), Planner(state),
+        )
+        assert stale.resolved is False
+        assert state.unresolved_contradictions() == [stale]
+    finally:
+        sb.cleanup()

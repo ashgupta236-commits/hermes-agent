@@ -1155,6 +1155,25 @@ class Executive:
                     pass
             c.updated_at = iso_now()
         for cs in interp.contradictions:
+            # A contradiction settled by scope, definition or period is *resolved*, not replaced
+            # by another record. Found live: the executive correctly reasoned that a "files do
+            # not exist" claim and a "files exist" claim were each true of their own period, but
+            # the only channel available appended a fresh severity-0 record while the original
+            # severity-1.0 contradiction stayed open — so the controller re-issued must_falsify
+            # every cycle against a dispute that had already been settled.
+            if cs.resolves_contradiction_ids and cs.resolution.strip():
+                for ctr_id in cs.resolves_contradiction_ids:
+                    for existing_ctr in state.contradictions:
+                        if existing_ctr.id == ctr_id and not existing_ctr.resolved:
+                            existing_ctr.resolved = True
+                            existing_ctr.resolution = cs.resolution[:600]
+                            self.tracer.emit(
+                                "verify",
+                                f"contradiction {ctr_id} resolved ({cs.suspected_cause}): {cs.resolution[:160]}",
+                                data={"contradiction_id": ctr_id, "cause": cs.suspected_cause, "resolution": cs.resolution[:400]},
+                            )
+                if not cs.claim_ids and not cs.description.strip():
+                    continue
             ids = [cid for cid in cs.claim_ids if state.claim(cid)]
             unresolved_ids = [cid for cid in cs.claim_ids if not state.claim(cid)]
             description = cs.description
