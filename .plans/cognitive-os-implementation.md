@@ -1,6 +1,6 @@
 # Cognitive OS (cogos) — Implementation Plan
 
-Status: IN PROGRESS. This file is the durable plan for the persistent autonomous
+Status: IN PROGRESS (PR #10 open as draft). This file is the durable plan for the persistent autonomous
 cognitive runtime built around Claude in this repository. Update it as decisions
 change; a fresh session should read this first, then `.cogos/` state (if present).
 
@@ -36,23 +36,24 @@ change; a fresh session should read this first, then `.cogos/` state (if present
 ## Build order (smallest end-to-end first)
 
 - [x] Environment inspection (Claude Code 2.1.267, Python 3.11, uv venv)
-- [ ] `cogos/schemas` — typed pydantic models for all state
-- [ ] `cogos/persistence` — SQLite store + migrations + snapshots
-- [ ] `cogos/adapters` — executive model protocol, scripted + claude_code
-- [ ] `cogos/mission` — mission compiler
-- [ ] `cogos/tools`, `cogos/governance` — tool fabric + capability firewall + immune system
-- [ ] `cogos/executive` — loop + metacognitive controller
-- [ ] `cogos/beliefs`, `cogos/world_model`, `cogos/memory`, `cogos/workspace`
-- [ ] `cogos/planner` — goal hierarchy + task DAG + priority
-- [ ] `cogos/verification` — verifiers
-- [ ] `cogos/agent_foundry` — specialists + independent cognition
-- [ ] `cogos/simulation` — counterfactual engine
-- [ ] `cogos/observability` — traces, decision journal, calibration, resource ledger
-- [ ] `cogos/events` — event bus + wake mapping
-- [ ] `cogos/skills` — skill compiler
-- [ ] `cogos/evaluation` — eval harness + acceptance scenarios A–J
-- [ ] `cogos/cli.py` — init/mission/run/status/boot/resume/trace/eval/demo
-- [ ] CLAUDE.md, `.claude/skills`, `.claude/agents`, `.claude/settings.json`
+- [x] `cogos/schemas` — typed pydantic models for all state
+- [x] `cogos/persistence` — SQLite store + migrations + snapshots
+- [x] `cogos/adapters` — executive model protocol, scripted + claude_code
+- [x] `cogos/mission` — mission compiler
+- [x] `cogos/tools`, `cogos/governance` — tool fabric + capability firewall + immune system
+- [x] `cogos/executive` — loop + metacognitive controller
+- [x] `cogos/beliefs`, `cogos/world_model`, `cogos/memory`, `cogos/workspace`
+- [x] `cogos/planner` — goal hierarchy + task DAG + priority
+- [x] `cogos/verification` — verifiers
+- [x] `cogos/agent_foundry` — specialists + independent cognition
+- [x] `cogos/simulation` — counterfactual engine
+- [x] `cogos/observability` — traces, decision journal, calibration, resource ledger
+- [x] `cogos/events` — event bus + wake mapping
+- [x] `cogos/skills` — skill compiler
+- [x] `cogos/evaluation` — eval harness + acceptance scenarios A–J
+- [x] `cogos/cli.py` — init/mission/run/status/boot/resume/trace/eval/demo
+- [x] CLAUDE.md, `.claude/skills`, `.claude/agents`, `.claude/settings.json`
 - [ ] Docs: ARCHITECTURE, AUTONOMY, MODEL_POLICY, STATE, MEMORY, EVALS, SECURITY, OPERATIONS
-- [ ] Makefile targets: test/lint/typecheck/eval/demo
-- [ ] Run evals, fix failures, commit, push, draft PR
+- [x] Makefile targets: test/lint/typecheck/eval/demo
+- [x] Run evals (19/19), commit, push, draft PR #10
+- [ ] Docs, real-model validation of select prompt (safeguards flag), final results table
