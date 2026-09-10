@@ -683,3 +683,143 @@ def test_end_to_end_missing_implementation_is_refused():
         assert not any(c.satisfied for c in state.success_criteria)
     finally:
         sb.cleanup()
+
+
+# ======================================================================================
+# Defects found by the investigation of this repair (not in the original F1-F3 report)
+# ======================================================================================
+
+
+def test_f2b_program_output_cannot_forge_test_counts(tmp_path):
+    """Found while repairing F2: the count parser scanned raw stdout, so a process could report
+    its own test results. A one-line script printing "Report: 5 passed, 0 failed" produced a
+    PASSED verification with five fabricated executed tests."""
+    _write(tmp_path, "prog.py", 'print("Report: 5 passed, 0 failed")\n')
+    state = MissionState(objective="forgery")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+
+    res = engine.verify_code([f"{sys.executable} prog.py"], cwd=str(tmp_path))
+
+    assert res.status != PASSED, f"program output must not be readable as test evidence: {res.summary}"
+    rec = state.tests[-1]
+    assert rec.executed == 0, f"no test executed; counts must not be scraped from program output: {rec.counts}"
+
+
+def test_f2b_framework_is_identified_from_the_command_not_the_output():
+    from cogos.verification.test_outcome import detect_framework
+
+    assert detect_framework(f"{sys.executable} -m pytest -q") == "pytest"
+    assert detect_framework("pytest -q tests/") == "pytest"
+    assert detect_framework(f"{sys.executable} -m unittest discover") == "unittest"
+    # The output is written by the process under test and can claim anything.
+    assert detect_framework(f"{sys.executable} prog.py") == "unknown"
+
+
+def test_f2b_parser_is_isolated_and_anchored_on_the_summary_line():
+    from cogos.verification.test_outcome import parse_test_output
+
+    assert parse_test_output("=========== 3 passed in 0.01s ===========")["passed"] == 3
+    assert parse_test_output("2 failed, 1 passed in 0.10s") == {"passed": 1, "failed": 2, "error": 0, "skipped": 0}
+    # A stray mention in a log body is not a result line.
+    assert parse_test_output("our suite has 5 passed cases historically\n")["passed"] == 0
+    assert parse_test_output("")["passed"] == 0
+
+
+def test_f2b_an_authorized_expected_zero_run_still_does_not_prove_a_criterion(tmp_path):
+    """An expected-zero contract resolves the run; it never demonstrates that required tests ran."""
+    state = MissionState(objective="expected zero is not proof")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    task = Task(title="expected zero", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+
+    code = engine.verify_code([f'{sys.executable} -c "print(1)"'], cwd=str(tmp_path), task_id=task.id, expect_zero_tests=True)
+    assert code.status == PASSED, "the contract authorized a zero-execution run"
+
+    res = engine.verify_criterion(crit)
+    assert res.status != PASSED, "a run that executed nothing cannot prove the suite passes"
+    assert not crit.satisfied
+
+
+def test_f3b_required_artifacts_declared_by_path_are_matched(tmp_path):
+    """Found while repairing F3: required_artifacts compared only ids and names, but the live
+    mission declared absolute paths, so even a verified intact artifact could never match."""
+    state = MissionState(objective="required by path")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    p = _write(tmp_path, "calc.py", CALC)
+    art = Artifact(name="calc.py", kind="code", path=str(p))
+    state.artifacts.append(art)
+    engine.verify_artifact(art)
+    state.resources["required_artifacts"] = [str(p)]
+
+    gate = mission_completion_check(state)
+    check = next(c for c in gate.checks if c.name == "required_artifacts")
+
+    assert check.status == PASSED, f"a verified intact artifact at the declared path must satisfy it: {check.detail}"
+
+
+def test_f3b_required_artifact_still_fails_when_the_file_is_unverified(tmp_path):
+    """Path matching must not become a way to pass on registration alone."""
+    state = MissionState(objective="unverified required artifact")
+    p = _write(tmp_path, "calc.py", CALC)
+    state.artifacts.append(Artifact(name="calc.py", kind="code", path=str(p)))  # registered, not verified
+    state.resources["required_artifacts"] = [str(p)]
+
+    gate = mission_completion_check(state)
+    check = next(c for c in gate.checks if c.name == "required_artifacts")
+
+    assert check.status == FAILED, "an unverified candidate must not satisfy a required artifact"
+
+
+def test_judgement_may_not_upgrade_a_deterministic_negative_observation():
+    """Found while repairing F1: a firewall DENIAL produced INCONCLUSIVE, which executive
+    judgement then upgraded to PASSED. Model reasoning must not outrank execution evidence."""
+    from cogos.schemas.verification import VerificationCheck as _Check
+    from cogos.verification import VerificationResult as _Result
+
+    sb = Sandbox("judgement-guard")
+    try:
+        state = sb.runtime.new_mission("judgement guard", context=sb.context(has_requirements=False))
+        task = Task(title="denied thing", status=TaskStatus.ACTIVE)
+        state.tasks.append(task)
+        result = _Result(
+            target_type="task",
+            target_id=task.id,
+            status=INCONCLUSIVE,
+            summary="denied",
+            checks=[_Check(name="write_file:abc", status=INCONCLUSIVE, detail="denied by policy", authoritative=True)],
+        )
+
+        judged = sb.runtime.executive._judge_verification(state, task, result)
+
+        assert judged.status == INCONCLUSIVE, "an authoritative non-passing observation must stand"
+        assert "not judgeable" in judged.summary
+    finally:
+        sb.cleanup()
+
+
+def test_judgement_still_resolves_a_genuine_method_gap():
+    """The guard must not disable judgement where it is legitimate: a non-machine-checkable
+    method is a gap the executive may reason about."""
+    from cogos.schemas.verification import VerificationCheck as _Check
+    from cogos.verification import VerificationResult as _Result
+
+    sb = Sandbox("judgement-allowed")
+    try:
+        state = sb.runtime.new_mission("judgement allowed", context=sb.context(has_requirements=False))
+        task = Task(title="prose thing", status=TaskStatus.ACTIVE)
+        state.tasks.append(task)
+        result = _Result(
+            target_type="task",
+            target_id=task.id,
+            status=INCONCLUSIVE,
+            summary="method not machine-checkable",
+            checks=[_Check(name="method", status=INCONCLUSIVE, detail="not machine-checkable", authoritative=False)],
+        )
+
+        judged = sb.runtime.executive._judge_verification(state, task, result)
+
+        assert "not judgeable" not in judged.summary, "judgement must still run where no observation contradicts it"
+    finally:
+        sb.cleanup()

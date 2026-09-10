@@ -26,8 +26,9 @@ from cogos.schemas.common import VerificationStatus
 from cogos.schemas.decisions import Decision
 from cogos.schemas.mission import Artifact, MissionState, SuccessCriterion, Task, TaskStatus, TestRecord
 from cogos.schemas.tools import ToolCall
-from cogos.schemas.verification import VerificationCheck, VerificationResult, cite
+from cogos.schemas.verification import InputVersion, VerificationCheck, VerificationResult, cite
 from cogos.tools.fabric import ToolFabric
+from cogos.verification.test_outcome import InputVersionGuard, TestRunOutcome, classify_test_run
 
 PASSED = VerificationStatus.PASSED
 FAILED = VerificationStatus.FAILED
@@ -211,39 +212,141 @@ class VerificationEngine:
 
     # -- code -----------------------------------------------------------------------
 
-    def verify_code(self, commands: Optional[list[str]] = None, cwd: Optional[str] = None, task_id: Optional[str] = None) -> VerificationResult:
+    def _relevant_inputs(self, cwd: Optional[str], input_paths: Optional[list[str]]) -> list[tuple[Path, Optional[str]]]:
+        """The input versions a code receipt is about: the mission's own registered candidates.
+
+        Bounded deliberately to the verification contract (declared paths) plus the artifact
+        ledger. This is version binding, not a general dependency graph: a receipt should name the
+        implementation and test files whose bytes determine what it proves, and nothing else.
+        """
+        out: list[tuple[Path, Optional[str]]] = []
+        seen: set[str] = set()
+        for raw in input_paths or []:
+            p = Path(raw)
+            if not p.is_absolute() and cwd:
+                p = Path(cwd) / p
+            if str(p) not in seen:
+                seen.add(str(p))
+                out.append((p, None))
+        for art in self.state.artifacts:
+            if not art.path:
+                continue
+            p = Path(art.path)
+            if str(p) in seen:
+                continue
+            seen.add(str(p))
+            out.append((p, art.id))
+        return out
+
+    def verify_code(
+        self,
+        commands: Optional[list[str]] = None,
+        cwd: Optional[str] = None,
+        task_id: Optional[str] = None,
+        *,
+        expect_zero_tests: bool = False,
+        criterion_ids: Optional[list[str]] = None,
+        input_paths: Optional[list[str]] = None,
+    ) -> VerificationResult:
+        """Run test commands and record what they actually demonstrated.
+
+        ``expect_zero_tests`` comes from the verification contract as declared *before* the run.
+        It is the only way a zero-execution run can pass, and it cannot be supplied afterwards to
+        reinterpret an empty result.
+        """
         commands = list(commands) if commands else list(DEFAULT_TEST_COMMANDS)
+        criterion_ids = list(criterion_ids or [])
+        if not criterion_ids and task_id:
+            # Make the record self-describing: scope comes from what the task declared it was for,
+            # which was fixed before the run and cannot be attached afterwards to fit the outcome.
+            producing = self.state.task(task_id)
+            if producing is not None:
+                criterion_ids = list(producing.addresses_criterion_ids or [])
         checks: list[VerificationCheck] = []
         test_totals = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
         if self.fabric is None:
             for cmd in commands:
-                checks.append(VerificationCheck(name=cmd, status=INCONCLUSIVE, detail="no tool fabric"))
-                self.state.tests.append(TestRecord(name=cmd, command=cmd, status=SKIPPED, summary="no tool fabric", ran_at=iso_now(), task_id=task_id))
+                checks.append(VerificationCheck(name=cmd, status=INCONCLUSIVE, detail="no tool fabric", authoritative=True))
+                self.state.tests.append(TestRecord(name=cmd, command=cmd, status=SKIPPED, summary="no tool fabric", ran_at=iso_now(), task_id=task_id, criterion_ids=criterion_ids, cwd=str(cwd or "")))
             return self.record(
-                VerificationResult(target_type="code", target_id=task_id or "code", status=INCONCLUSIVE, summary="no tool fabric: tests not run", checks=checks)
+                VerificationResult(target_type="code", target_id=task_id or "code", status=INCONCLUSIVE, summary="no tool fabric: tests not run", checks=checks, produced_by_task_id=task_id)
             )
+
+        relevant = self._relevant_inputs(cwd, input_paths)
+        guard = InputVersionGuard([p for p, _ in relevant])
+        before = guard.snapshot()
+        action_ids: list[str] = []
+
         for cmd in commands:
             shell_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}" if cwd else cmd
             res = self.fabric.execute(ToolCall(tool="run_tests", arguments={"command": shell_cmd}, task_id=task_id, purpose="verification"))
+            action_ids.append(res.call_id)
             for key, value in (res.data.get("counts") or {}).items():
                 if key in test_totals:
                     test_totals[key] += int(value)
-            if res.ok:
-                status = PASSED
-            elif res.error_kind in ("denied", "requires_human", "unavailable"):
-                status = INCONCLUSIVE
+            if res.error_kind in ("denied", "requires_human", "unavailable"):
+                # The check could not be run at all. That is an absence of evidence, not a verdict.
+                outcome = TestRunOutcome(status=INCONCLUSIVE, reason=res.error or "verification tool unavailable", exit_code=None, command=cmd)
             else:
-                status = FAILED
-            tail = res.output.strip().splitlines()
-            detail = str(res.data.get("summary") or res.error or (tail[-1] if tail else ""))
-            checks.append(VerificationCheck(name=cmd, status=status, detail=detail))
-            self.state.tests.append(TestRecord(name=cmd, command=shell_cmd, status=status, summary=detail, ran_at=iso_now(), task_id=task_id))
+                outcome = classify_test_run(
+                    exit_code=res.data.get("exit_code"),
+                    counts=res.data.get("counts") or {},
+                    output=res.output or "",
+                    command=shell_cmd,
+                    expect_zero=expect_zero_tests,
+                )
+            detail = f"{outcome.reason}: {res.data.get('summary') or res.error or ''}".strip(": ")
+            checks.append(VerificationCheck(name=cmd, status=outcome.status, detail=detail, authoritative=True))
+            self.state.tests.append(
+                TestRecord(
+                    name=cmd,
+                    command=shell_cmd,
+                    status=outcome.status,
+                    summary=detail,
+                    ran_at=iso_now(),
+                    task_id=task_id,
+                    criterion_ids=criterion_ids,
+                    cwd=str(cwd or ""),
+                    framework=outcome.framework,
+                    exit_code=outcome.exit_code,
+                    counts={"passed": outcome.passed, "failed": outcome.failed, "error": outcome.errors, "skipped": outcome.skipped},
+                    executed=outcome.executed,
+                    outcome_reason=outcome.reason,
+                    expected_zero=outcome.expected_zero,
+                )
+            )
+
+        moved = set(guard.changed_since(before))
+        after = guard.snapshot()
+        input_versions = [
+            InputVersion(path=str(p), content_hash=after.get(str(p), ""), artifact_id=aid, changed_during_verification=str(p) in moved)
+            for p, aid in relevant
+        ]
         status = _aggregate(checks)
+        if moved:
+            # The bytes moved underneath the run, so no single coherent version was observed.
+            status = INCONCLUSIVE
+            checks.append(VerificationCheck(name="input_stability", status=INCONCLUSIVE, detail="inputs changed during verification: " + ", ".join(sorted(moved)[:3]), authoritative=True))
         n_pass = sum(1 for c in checks if c.status == PASSED)
         n_fail = sum(1 for c in checks if c.status == FAILED)
         n_inc = len(checks) - n_pass - n_fail
-        summary = f"{n_pass}/{len(checks)} commands passed, {n_fail} failed, {n_inc} inconclusive; tests: {test_totals['passed']} passed, {test_totals['failed']} failed, {test_totals['error']} errors"
-        return self.record(VerificationResult(target_type="code", target_id=task_id or "code", status=status, summary=summary, checks=checks))
+        summary = (
+            f"{n_pass}/{len(checks)} commands passed, {n_fail} failed, {n_inc} inconclusive; "
+            f"tests: {test_totals['passed']} passed, {test_totals['failed']} failed, {test_totals['error']} errors, "
+            f"{test_totals['skipped']} skipped"
+        )
+        return self.record(
+            VerificationResult(
+                target_type="code",
+                target_id=task_id or "code",
+                status=status,
+                summary=summary,
+                checks=checks,
+                input_versions=input_versions,
+                produced_by_task_id=task_id,
+                produced_by_action_ids=action_ids,
+            )
+        )
 
     # -- research -------------------------------------------------------------------
 
@@ -414,16 +517,16 @@ class VerificationEngine:
         checks: list[VerificationCheck] = []
         path = Path(artifact.path).expanduser() if artifact.path else None
         if path is None:
-            checks.append(VerificationCheck(name="path", status=FAILED, detail="artifact declares no path"))
+            checks.append(VerificationCheck(name="path", status=FAILED, detail="artifact declares no path", authoritative=True))
         elif not path.exists():
-            checks.append(VerificationCheck(name="path", status=FAILED, detail=f"{path} does not exist"))
+            checks.append(VerificationCheck(name="path", status=FAILED, detail=f"{path} does not exist", authoritative=True))
         elif not path.is_file():
-            checks.append(VerificationCheck(name="path", status=FAILED, detail=f"{path} is not a regular file"))
+            checks.append(VerificationCheck(name="path", status=FAILED, detail=f"{path} is not a regular file", authoritative=True))
         else:
             checks.append(VerificationCheck(name="path", status=PASSED, detail=str(path)))
             size = path.stat().st_size
             if size == 0:
-                checks.append(VerificationCheck(name="non_empty", status=FAILED, detail="file is empty"))
+                checks.append(VerificationCheck(name="non_empty", status=FAILED, detail="file is empty", authoritative=True))
             else:
                 checks.append(VerificationCheck(name="non_empty", status=PASSED, detail=f"{size} bytes"))
             content_hash = file_sha256(path) or ""
@@ -454,6 +557,34 @@ class VerificationEngine:
 
     # -- criteria -------------------------------------------------------------------
 
+    @staticmethod
+    def _test_executed_something(record: TestRecord) -> bool:
+        """Did this record observe a required test actually run?
+
+        Records the engine produces carry structured counts, so ``executed`` is authoritative:
+        a zero-execution run (all skipped, or an authorized expected-zero) is a legitimate
+        outcome but never proof that the required tests ran. Records with no counts at all
+        predate structured capture; for those the recorded status is all there is.
+        """
+        if not record.counts:
+            return True
+        return record.executed > 0
+
+    def _test_addresses(self, record: TestRecord, criterion_id: str) -> bool:
+        """Is this test record offered as evidence for *this* criterion?
+
+        Either the record names the criterion directly, or the task that produced it declared the
+        criterion in ``addresses_criterion_ids``. Both are machine-readable links recorded before
+        the outcome was known, so neither can be attached after the fact to fit a result.
+        """
+        if criterion_id in (record.criterion_ids or []):
+            return True
+        if record.task_id:
+            task = self.state.task(record.task_id)
+            if task is not None and criterion_id in (task.addresses_criterion_ids or []):
+                return True
+        return False
+
     def verify_criterion(self, criterion: SuccessCriterion, evidence_ok: Optional[bool] = None) -> VerificationResult:
         method = (criterion.verification_method or "").lower()
         checks: list[VerificationCheck] = []
@@ -461,9 +592,27 @@ class VerificationEngine:
         created_ms = _id_timestamp_ms(criterion.id) or 0
 
         if re.search(r"\b(tests?|pytest|unit\s*tests?)\b", method):
-            fresh = [t for t in self.state.tests if t.status == PASSED and not t.expected_failure and (_iso_to_ms(t.ran_at) or -1) >= created_ms]
+            # Scope binds the proof to the claim. A passing suite demonstrates something about the
+            # criteria it was *run for*; without that link any unrelated green run would satisfy
+            # any criterion whose method happens to mention tests.
+            fresh = [
+                t
+                for t in self.state.tests
+                if t.status == PASSED
+                and not t.expected_failure
+                and (_iso_to_ms(t.ran_at) or -1) >= created_ms
+                and self._test_addresses(t, criterion.id)
+                and self._test_executed_something(t)
+            ]
+            unbound = [
+                t
+                for t in self.state.tests
+                if t.status == PASSED and not t.expected_failure and (_iso_to_ms(t.ran_at) or -1) >= created_ms and not self._test_addresses(t, criterion.id)
+            ]
             if fresh:
-                checks.append(VerificationCheck(name="tests", status=PASSED, detail=f"{len(fresh)} passed test record(s) newer than criterion: " + ", ".join(t.name for t in fresh[:3])))
+                checks.append(VerificationCheck(name="tests", status=PASSED, detail=f"{len(fresh)} passed test record(s) bound to this criterion and newer than it: " + ", ".join(t.name for t in fresh[:3])))
+            elif unbound:
+                checks.append(VerificationCheck(name="tests", status=FAILED, detail=f"{len(unbound)} passing test record(s) exist but none is scoped to this criterion; an unrelated suite is not proof of it"))
             else:
                 checks.append(VerificationCheck(name="tests", status=FAILED, detail="no passed (non-reproduction) test record newer than the criterion"))
 
@@ -688,8 +837,29 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
 
     required = list(state.resources.get("required_artifacts", []) or [])
     if required:
+        # A required artifact may be declared by id, by name, or by path — the live mission
+        # declared absolute paths, which matched nothing, so even a verified intact artifact at
+        # exactly that path could not satisfy the check. Compare all three, resolving paths so an
+        # equivalent spelling of the same file is recognised as the same file.
         verified_keys = set(intact) | {a.name for a in intact.values()}
-        absent = [r for r in required if str(r) not in verified_keys]
+        verified_paths: set[str] = set()
+        for a in intact.values():
+            if a.path:
+                verified_paths.add(str(a.path))
+                try:
+                    verified_paths.add(str(Path(a.path).resolve()))
+                except OSError:
+                    pass
+
+        def _declared_present(ref: str) -> bool:
+            if ref in verified_keys or ref in verified_paths:
+                return True
+            try:
+                return str(Path(ref).resolve()) in verified_paths
+            except OSError:
+                return False
+
+        absent = [r for r in required if not _declared_present(str(r))]
         if absent:
             checks.append(VerificationCheck(name="required_artifacts", status=FAILED, detail="missing or unverified: " + ", ".join(map(str, absent))))
             missing.append("required artifacts missing or unverified: " + ", ".join(map(str, absent)))
@@ -697,6 +867,33 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
             checks.append(VerificationCheck(name="required_artifacts", status=PASSED, detail=f"all {len(required)} required artifacts verified and intact"))
     else:
         checks.append(VerificationCheck(name="required_artifacts", status=SKIPPED, detail="no required artifacts declared"))
+
+    # A receipt proves something about the bytes it was produced against. Before accepting one at
+    # completion, re-read those inputs: if they have moved, the receipt still describes what it
+    # saw (history is kept) but it no longer describes what is there, so it cannot close a
+    # criterion. Records written before version binding carry no input_versions at all; that is
+    # "unknown", and unknown is not re-interpreted as "unchanged".
+    stale: list[str] = []
+    for c in state.success_criteria:
+        for receipt in receipts(c):
+            for iv in receipt.input_versions:
+                if iv.changed_during_verification:
+                    stale.append(f"'{c.description[:60]}' receipt {receipt.id}: inputs changed while it ran ({Path(iv.path).name})")
+                    continue
+                if not iv.content_hash:
+                    continue
+                current = file_sha256(Path(iv.path)) if Path(iv.path).is_file() else None
+                if current != iv.content_hash:
+                    stale.append(
+                        f"'{c.description[:60]}' receipt {receipt.id}: {Path(iv.path).name} is now "
+                        + (f"sha256 {current[:12]}…" if current else "missing")
+                        + f", not the {iv.content_hash[:12]}… it was verified against"
+                    )
+    if stale:
+        checks.append(VerificationCheck(name="receipt_input_versions", status=FAILED, detail="; ".join(stale[:5])))
+        missing.append(f"{len(stale)} receipt(s) no longer describe the current inputs: " + "; ".join(stale[:3]))
+    else:
+        checks.append(VerificationCheck(name="receipt_input_versions", status=PASSED, detail="every accepted receipt still matches the inputs it was produced against"))
 
     status = _aggregate(checks)
     if status == PASSED:

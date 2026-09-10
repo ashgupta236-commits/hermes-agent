@@ -156,6 +156,28 @@ class BlockedOperation(BaseModel):
     resolved: bool = False
 
 
+class ArtifactVersion(BaseModel):
+    """One observed version of an artifact's bytes.
+
+    Kept as history: an update creates a new version identity, and the record of what the earlier
+    version was (and what was verified against it) is never erased.
+    """
+
+    content_hash: str
+    size_bytes: int = 0
+    observed_at: str = Field(default_factory=iso_now)
+    task_id: Optional[str] = None
+    action_id: Optional[str] = None
+
+
+class ArtifactOrigin(str, Enum):
+    """How this path entered the ledger. Only an observed mission write is MISSION_WRITE."""
+
+    MISSION_WRITE = "mission_write"
+    SPECIALIST_REPORT = "specialist_report"
+    DECLARED = "declared"
+
+
 class Artifact(BaseModel):
     id: str = Field(default_factory=lambda: new_id("art"))
     name: str
@@ -164,6 +186,15 @@ class Artifact(BaseModel):
     content_hash: Optional[str] = None
     summary: str = ""
     produced_by_task_id: Optional[str] = None
+    #: Provenance of the *candidate*. Registration is an observation that a write happened; it is
+    #: never a claim that the contents are correct, and never satisfies a criterion on its own.
+    origin: ArtifactOrigin = ArtifactOrigin.DECLARED
+    mission_id: Optional[str] = None
+    produced_by_action_id: Optional[str] = None
+    producer: str = Field(default="", description="The tool that produced it, e.g. write_file")
+    size_bytes: int = 0
+    observed_at: Optional[str] = None
+    versions: list[ArtifactVersion] = Field(default_factory=list)
     verified: bool = False
     verified_hash: Optional[str] = Field(
         default=None,
@@ -185,6 +216,19 @@ class TestRecord(BaseModel):
     expected_failure: bool = Field(
         default=False,
         description="A reproduction run: a FAILED status here is the desired observation, so this record is never evidence that tests pass.",
+    )
+    #: Scope. A passing run proves something about the criteria it was run *for*; without this a
+    #: differently scoped criterion could be satisfied by any unrelated suite that happened to pass.
+    criterion_ids: list[str] = Field(default_factory=list)
+    cwd: str = ""
+    framework: str = ""
+    exit_code: Optional[int] = None
+    counts: dict[str, int] = Field(default_factory=dict)
+    executed: int = Field(default=0, description="Tests that ran a body. Skipped tests are collected, not executed.")
+    outcome_reason: str = Field(default="", description="Why the run was classified the way it was")
+    expected_zero: bool = Field(
+        default=False,
+        description="The verification contract authorized a zero-execution run before it ran.",
     )
 
 

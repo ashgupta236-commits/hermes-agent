@@ -20,6 +20,31 @@ class VerificationCheck(BaseModel):
     name: str
     status: VerificationStatus
     detail: str = ""
+    authoritative: bool = Field(
+        default=False,
+        description="This check is a direct runtime observation — a tool result, a test-run "
+        "classification, a file hash — rather than a gap the executive may reason about. "
+        "Executive judgement may not upgrade a non-passing authoritative check: model reasoning "
+        "is supplemental to execution evidence, never a substitute for it.",
+    )
+
+
+class InputVersion(BaseModel):
+    """The exact version of one input a verification was produced against.
+
+    A receipt that does not say *which* bytes it checked cannot distinguish proving version A
+    from proving version B. The completion gate re-reads these before accepting the receipt.
+    """
+
+    path: str
+    content_hash: str = ""
+    artifact_id: Optional[str] = None
+    observed_at: str = Field(default_factory=iso_now)
+    changed_during_verification: bool = Field(
+        default=False,
+        description="The bytes moved between the pre-run snapshot and the post-run read, so this "
+        "run never observed a single coherent version of the input.",
+    )
 
 
 class VerificationResult(BaseModel):
@@ -31,6 +56,17 @@ class VerificationResult(BaseModel):
     checks: list[VerificationCheck] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     ran_at: str = Field(default_factory=iso_now)
+    input_versions: list[InputVersion] = Field(
+        default_factory=list,
+        description="Relevant input versions this receipt was produced against. Empty on records "
+        "written before version binding existed, which the gate treats as 'unknown', never as 'unchanged'.",
+    )
+    produced_by_task_id: Optional[str] = None
+    produced_by_action_ids: list[str] = Field(
+        default_factory=list,
+        description="Tool call ids whose results this verification read, so an action can be "
+        "traversed forward to every criterion that relied on it.",
+    )
 
     def failed_checks(self) -> list[VerificationCheck]:
         return [c for c in self.checks if c.status == VerificationStatus.FAILED]

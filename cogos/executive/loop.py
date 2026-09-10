@@ -57,6 +57,8 @@ from cogos.schemas.events import Event
 from cogos.schemas.memory import MemoryClass
 from cogos.schemas.mission import (
     Artifact,
+    ArtifactOrigin,
+    ArtifactVersion,
     BlockedOperation,
     HumanRequest,
     Lesson,
@@ -71,7 +73,8 @@ from cogos.simulation import simulate
 from cogos.tools import ToolFabric
 from cogos.schemas.verification import VerificationCheck, cite
 from cogos.verification import VerificationEngine, VerificationResult
-from cogos.verification.engine import mission_completion_check
+from cogos.verification.engine import _aggregate as _aggregate_status, file_sha256, mission_completion_check
+from cogos.governance.firewall import _path_within
 from cogos.workspace import GlobalWorkspace
 from cogos.world_model import WorldModelManager
 
@@ -727,6 +730,13 @@ class Executive:
             out.reasoning_output = decision.reasoning_output or decision.rationale
             self.tracer.emit("operation", f"reasoning: {out.reasoning_output[:160]}")
         elif op in (OperationKind.INSTANTIATE_SPECIALIST, OperationKind.PARALLEL_WORKSTREAMS, OperationKind.FALSIFY):
+            # A falsification with a deterministic plan is run, not delegated. Executing the
+            # authorized tool plan is both cheaper and stronger evidence than a specialist's
+            # opinion, and it is what the task actually asked for.
+            if op == OperationKind.FALSIFY and self._execute_task_plan(state, task, out, ledger):
+                if task is not None:
+                    out.verification = self._verification_from_observations(task, out.tool_results)
+                return out
             specs = decision.specialists or (self._specs_from_task(task) if task else [])
             if op == OperationKind.FALSIFY:
                 key = ""
@@ -768,7 +778,11 @@ class Executive:
                     if run.response.error_kind == "transient":
                         ledger.add_retry()
         elif op == OperationKind.VERIFY:
-            out.verification = self._verify(state, task, decision)
+            # Purpose and mechanism are separate: a VERIFY task that carries an authorized tool
+            # plan runs it through the ordinary path first, so the verifier sees a real observation
+            # instead of an empty result.
+            self._execute_task_plan(state, task, out, ledger)
+            out.verification = self._verify(state, task, decision, out)
         elif op == OperationKind.SYNTHESIZE:
             out.synthesis = self._synthesize(state, beliefs, assessment)
         elif op == OperationKind.REQUEST_HUMAN_AUTHORIZATION:
@@ -859,7 +873,9 @@ class Executive:
         return specs
 
     def _tool(self, state: MissionState, call: ToolCall, ledger: ResourceLedger, task: Optional[Task]) -> ToolResult:
+        before = self._write_target_snapshot(call)
         res = self.fabric.execute(call)
+        self._register_written_artifacts(state, call, res, task, before)
         ledger.add_tool_call(res)
         self._tool_history.append(res.ok)
         del self._tool_history[:-20]
@@ -872,6 +888,170 @@ class Executive:
             if res.verdict.decision == PolicyDecision.REQUIRE_HUMAN:
                 state.human_requests.append(HumanRequest(kind="authorization", question=f"Authorize {res.verdict.action_class.value} operation: {blocked.operation}", why_not_inferable="the action class requires explicit human authorization by policy", options=["authorize", "deny"], independent_work_remaining=True))
         return res
+
+    # -- artifact candidate registration (F3) -----------------------------------------
+    #
+    # ARTIFACT CANDIDATE != VERIFIED ARTIFACT != SATISFIED CRITERION.
+    # Registration records an *observation*: the mission performed an authorized write and these
+    # are the bytes that resulted. It never asserts the contents are right, and the completion
+    # gate still requires a passing verification bound to the criterion.
+    #
+    # Covered write mechanisms: `write_file` (the tool reports the exact path it wrote) and shell
+    # writes whose targets the firewall's own extractor already identifies. Not covered, and
+    # deliberately so: writes by a spawned process the extractor cannot see, writes through the
+    # `git` tool, and anything requiring a filesystem crawl. An unregistered file is simply not a
+    # candidate; it never becomes a silent pass.
+
+    def _candidate_write_paths(self, call: ToolCall) -> list[Path]:
+        """Paths this call could write, from the tool contract or the firewall's own extractor."""
+        paths: list[Path] = []
+        if call.tool in ("write_file", "append_file"):
+            raw = str(call.arguments.get("path") or "")
+            if raw:
+                paths.append(Path(raw))
+        elif call.tool == "shell":
+            from cogos.governance.firewall import shell_write_targets
+
+            for raw in shell_write_targets(str(call.arguments.get("command") or "")):
+                paths.append(Path(raw))
+        resolved: list[Path] = []
+        for p in paths:
+            if not p.is_absolute():
+                p = self.fabric.context.resolve(str(p))
+            resolved.append(p)
+        return resolved
+
+    def _write_target_snapshot(self, call: ToolCall) -> dict[str, str]:
+        """Hash the candidate targets *before* the call.
+
+        Without this, a shell command that merely mentions an existing path would look like it
+        created it. Comparing before and after is what distinguishes "the mission wrote this" from
+        "this was already here".
+        """
+        if call.tool not in ("write_file", "append_file", "shell"):
+            return {}
+        snap: dict[str, str] = {}
+        for p in self._candidate_write_paths(call):
+            try:
+                snap[str(p)] = (file_sha256(p) or "") if p.is_file() else ""
+            except OSError:
+                snap[str(p)] = ""
+        return snap
+
+    def _register_written_artifacts(self, state: MissionState, call: ToolCall, res: ToolResult, task: Optional[Task], before: dict[str, str]) -> None:
+        if not res.ok or call.tool not in ("write_file", "append_file", "shell"):
+            return
+        writable = getattr(self.fabric.firewall, "writable_roots", None) or []
+        for p in self._candidate_write_paths(call):
+            try:
+                if not p.is_file():
+                    continue
+                digest = file_sha256(p) or ""
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if not digest or digest == before.get(str(p), None):
+                # Unchanged bytes: the call did not produce this version, so it is not a
+                # candidate this action created.
+                continue
+            if writable and not _path_within(p, list(writable)):
+                # Boundary parity with the firewall: a destination the write rules would not treat
+                # as local workspace never enters the ledger, whatever the tool returned.
+                continue
+            existing = next((a for a in state.artifacts if a.path and Path(a.path) == p), None)
+            version = ArtifactVersion(content_hash=digest, size_bytes=size, task_id=task.id if task else None, action_id=res.call_id)
+            if existing is None:
+                art = Artifact(
+                    name=p.name,
+                    kind="code" if p.suffix in (".py", ".ts", ".js", ".go", ".rs", ".java") else "file",
+                    path=str(p),
+                    content_hash=digest,
+                    summary=f"written by {call.tool} during this mission",
+                    produced_by_task_id=task.id if task else None,
+                    origin=ArtifactOrigin.MISSION_WRITE,
+                    mission_id=state.mission_id,
+                    produced_by_action_id=res.call_id,
+                    producer=call.tool,
+                    size_bytes=size,
+                    observed_at=iso_now(),
+                    versions=[version],
+                )
+                state.artifacts.append(art)
+                if task is not None and art.id not in task.artifact_ids:
+                    task.artifact_ids.append(art.id)
+                self.tracer.emit("artifact", f"candidate registered: {p.name} ({size} bytes, sha256 {digest[:12]}…)", data={"artifact_id": art.id, "path": str(p), "content_hash": digest, "origin": art.origin.value, "task_id": art.produced_by_task_id, "action_id": res.call_id, "verified": False})
+            else:
+                # A rewrite is a new version identity. History is appended, never replaced, and a
+                # verified status earned by the previous bytes does not carry over to these.
+                existing.versions.append(version)
+                existing.content_hash = digest
+                existing.size_bytes = size
+                existing.observed_at = iso_now()
+                existing.produced_by_action_id = res.call_id
+                if task is not None:
+                    existing.produced_by_task_id = task.id
+                    if existing.id not in task.artifact_ids:
+                        task.artifact_ids.append(existing.id)
+                existing.verified = False
+                existing.verified_hash = None
+                existing.verified_at = None
+                self.tracer.emit("artifact", f"candidate updated: {p.name} -> sha256 {digest[:12]}… (verification cleared)", data={"artifact_id": existing.id, "path": str(p), "content_hash": digest, "versions": len(existing.versions), "task_id": existing.produced_by_task_id, "action_id": res.call_id, "verified": False})
+
+    # -- tool-backed verification and falsification (F1) -------------------------------
+
+    def _execute_task_plan(self, state: MissionState, task: Optional[Task], out: OperationOutcome, ledger: ResourceLedger) -> bool:
+        """Run a task's declared tool plan through the ordinary tool + firewall path.
+
+        A task carries two separable things: its *purpose* (verify, falsify) and its *execution
+        mechanism* (an authorized tool plan). Live Run #2 lost the second: `_verify` recognised
+        only `commands`, so a task whose plan was ``{"tool": "shell", "arguments": {...}}`` never
+        ran and was then failed for producing no evidence.
+
+        Purpose grants no authority here. This is the same `_tool` funnel every other operation
+        uses, so classification, denial and human-authorization routing are unchanged.
+        """
+        if task is None:
+            return False
+        calls = self._calls_from_task(task)
+        if not calls:
+            return False
+        for spec in calls:
+            res = self._tool(state, ToolCall(tool=spec.tool, arguments=spec.arguments(), task_id=task.id, purpose=spec.purpose), ledger, task)
+            out.tool_results.append(res)
+            if res.trust == TrustLevel.UNTRUSTED_EXTERNAL and res.ok:
+                out.untrusted.append(wrap_untrusted(f"{res.tool}:{spec.purpose[:40]}", str(spec.arguments().get("path") or spec.arguments().get("command") or res.tool), res.output))
+        return True
+
+    def _verification_from_observations(self, task: Task, results: list[ToolResult]) -> VerificationResult:
+        """Turn observed tool results into a verification record.
+
+        The verdict comes from runtime facts only — whether each authorized call succeeded and how
+        it failed. Tool *output* is untrusted content: it is recorded as detail so the observation
+        is auditable, and it never decides the status. That keeps a file's contents from being able
+        to talk the verifier into a verdict.
+        """
+        checks: list[VerificationCheck] = []
+        for res in results:
+            if res.error_kind in ("denied", "requires_human", "unavailable"):
+                status = VerificationStatus.INCONCLUSIVE
+                detail = f"{res.tool} could not run: {res.error[:180]}"
+            elif res.ok:
+                status = VerificationStatus.PASSED
+                detail = f"{res.tool} produced {len(res.output)} chars of output: " + (res.output.strip().replace("\n", " ")[:180] or "(empty)")
+            else:
+                status = VerificationStatus.FAILED
+                detail = f"{res.tool} failed ({res.error_kind or 'structural'}): {res.error[:180]}"
+            checks.append(VerificationCheck(name=f"{res.tool}:{res.call_id[-8:]}", status=status, detail=detail, authoritative=True))
+        status = _aggregate_status(checks)
+        return VerificationResult(
+            target_type="task",
+            target_id=task.id,
+            status=status,
+            summary=f"observed {len(results)} authorized tool call(s) for '{task.title[:60]}': {status.value}",
+            checks=checks,
+            produced_by_task_id=task.id,
+            produced_by_action_ids=[r.call_id for r in results],
+        )
 
     def _anchor_before_completion(self, state: MissionState, out: Optional[OperationOutcome] = None) -> str:
         """Run (or honour) the reality anchor on the mission's headline position.
@@ -969,7 +1149,7 @@ class Executive:
                 data={"criterion_id": c.id, "artifact_id": artifact.id},
             )
 
-    def _verify(self, state: MissionState, task: Optional[Task], decision: StepDecision) -> VerificationResult:
+    def _verify(self, state: MissionState, task: Optional[Task], decision: StepDecision, out: Optional[OperationOutcome] = None) -> VerificationResult:
         engine = VerificationEngine(self.fabric, state)
         self._refresh_changed_artifacts(state, engine)
         result: Optional[VerificationResult] = None
@@ -980,7 +1160,15 @@ class Executive:
                 cmds: list[str] = [str(raw_cmds)] if isinstance(raw_cmds, str) else [str(c) for c in raw_cmds if c]
                 before = len(self.fabric.call_log)
                 tests_before = len(state.tests)
-                result = engine.verify_code(cmds, cwd=p.get("cwd"), task_id=task.id)
+                result = engine.verify_code(
+                    cmds,
+                    cwd=p.get("cwd"),
+                    task_id=task.id,
+                    # Declared in the task's verification contract, before the command runs.
+                    expect_zero_tests=bool(p.get("expect_zero_tests")),
+                    criterion_ids=list(task.addresses_criterion_ids or []),
+                    input_paths=[str(x) for x in (p.get("input_paths") or []) if x],
+                )
                 for res in self.fabric.call_log[before:]:
                     if res.error_kind in ("denied", "requires_human", "unavailable") and not any(b.operation.startswith(f"{res.tool} ") and not b.resolved for b in state.blocked_operations):
                         state.blocked_operations.append(BlockedOperation(operation=f"{res.tool} {json.dumps({'command': cmds}, default=str)[:160]}", action_class=res.verdict.action_class if res.verdict else ActionClass.REVERSIBLE_LOCAL, reason=res.error, what_would_unblock="enable the verification tool (shell/tests) in governance policy or provide an allowed alternative", task_id=task.id))
@@ -996,6 +1184,10 @@ class Executive:
                     for rec in state.tests[tests_before:]:
                         rec.expected_failure = True
                         rec.summary = "(reproduction) " + rec.summary
+            elif out is not None and out.tool_results:
+                # The task's own plan already ran through the tool fabric this cycle. That
+                # observation *is* the evidence; judging it as if nothing happened is the bug.
+                result = engine.record(self._verification_from_observations(task, out.tool_results))
             elif p.get("research"):
                 relevant = [c.id for c in state.live_claims() if c.decision_relevance >= 0.5]
                 result = engine.verify_research(relevant or None, task_id=task.id)
@@ -1063,7 +1255,20 @@ class Executive:
             return None
 
     def _judge_verification(self, state: MissionState, task: Task, result: VerificationResult) -> VerificationResult:
-        """Independent executive judgement over inconclusive deterministic checks (never over failed ones)."""
+        """Independent executive judgement over inconclusive deterministic checks (never over failed ones).
+
+        Judgement resolves *absence of a machine-checkable method*. It may not resolve a
+        deterministic negative: a denied capability, a failed call, a run that executed no tests
+        and inputs that moved mid-run are all observations, and an opinion does not outrank them.
+        """
+        blocking = [c for c in result.checks if c.authoritative and c.status != VerificationStatus.PASSED]
+        if blocking:
+            result.summary = (
+                f"not judgeable: {len(blocking)} authoritative check(s) did not pass — "
+                + "; ".join(f"{c.name}: {c.detail[:80]}" for c in blocking[:3])
+            )
+            self.tracer.emit("verify", f"judgement declined for task {task.id}: authoritative observation stands", data={"checks": [c.name for c in blocking]})
+            return result
         judgment = self._judge(state, f"task '{task.title}' — {task.description}", f"RESULT SUMMARY: {task.result_summary[:500]}", result)
         if judgment is None:
             return result

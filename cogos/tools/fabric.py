@@ -305,13 +305,13 @@ def _run_tests(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     timeout = int(args.get("timeout", max(ctx.timeout, 600)))
     proc = subprocess.run(command, shell=True, cwd=str(ctx.workdir), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)  # noqa: S602
     out = proc.stdout + proc.stderr
-    counts = {k: 0 for k in ("passed", "failed", "error", "skipped")}
-    for num, kind in _PYTEST_COUNTS.findall(out):
-        key = "error" if kind.startswith("error") else kind
-        if key in counts:
-            counts[key] += int(num)
-    m = _PYTEST_SUMMARY.search(out)
-    summary = m.group("summary").strip("= ") if m else (out.strip().splitlines()[-1] if out.strip() else f"exit {proc.returncode}")
+    # Parsing lives in cogos.verification.test_outcome so it is unit-testable and anchored on the
+    # runner's summary line: an unanchored scan of program output lets a process forge its own
+    # test counts.
+    from cogos.verification.test_outcome import parse_test_output, summarise_test_output
+
+    counts = parse_test_output(out)
+    summary = summarise_test_output(out, f"exit {proc.returncode}")
     ok = proc.returncode == 0
     return {"ok": ok, "output": out, "exit_code": proc.returncode, "summary": summary, "counts": counts, "command": command, "error": "" if ok else f"tests failed (exit {proc.returncode})", "error_kind": "" if ok else "structural"}
 

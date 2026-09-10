@@ -211,15 +211,21 @@ def test_verify_criterion_test_gating():
     assert criterion.verification_ids == []
     assert state.verification(result.id) is not None
 
-    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now()))
+    # Incident F2 (scope binding): a passing run proves something about the criteria it was run
+    # *for*. An unbound record — however green, however fresh — is not proof of this criterion.
+    state.tests.append(_TestRecord(name="some other suite", status=PASSED, ran_at=iso_now()))
+    unbound = engine.verify_criterion(criterion)
+    assert unbound.status == FAILED and criterion.satisfied is False
+
+    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id]))
     again = engine.verify_criterion(criterion)
     assert again.status == PASSED
     assert criterion.satisfied is True
     assert criterion.verification_ids == [again.id]
     assert state.passing_verifications(criterion.verification_ids) == [again]
 
-    # a stale record (older than the criterion) does not count
-    state.tests = [_TestRecord(name="old", status=PASSED, ran_at="2000-01-01T00:00:00+00:00")]
+    # a stale record (older than the criterion) does not count, bound or not
+    state.tests = [_TestRecord(name="old", status=PASSED, ran_at="2000-01-01T00:00:00+00:00", criterion_ids=[criterion.id])]
     stale = engine.verify_criterion(criterion)
     assert stale.status == FAILED and criterion.satisfied is False
 
@@ -343,7 +349,8 @@ def test_mission_completion_gate_refuses_until_verified(tmp_path):
     criterion.satisfied = True
     assert _check(mission_completion_check(state), "success_criteria").status == FAILED
 
-    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now()))
+    # Bound to the criterion it is offered as proof of (incident F2: scope binding).
+    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id]))
     engine.verify_criterion(criterion)
     assert mission_completion_check(state).status == PASSED
 
