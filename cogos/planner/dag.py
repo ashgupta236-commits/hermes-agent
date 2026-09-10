@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from cogos.ids import iso_now
 from cogos.schemas.cognition import GoalSpec, TaskSpec, parse_json_object
@@ -24,6 +24,13 @@ class RetryDecision:
     action: str  # retry|replan|abandon|escalate
     reason: str
     backoff_seconds: float = 0.0
+
+
+def _held(state: Any, task_id: str) -> tuple[bool, str]:
+    from cogos.verification.reality_anchor import dispatch_allowed
+
+    allowed, why = dispatch_allowed(state.open_holds(), task_id)
+    return (not allowed), why
 
 
 class Planner:
@@ -126,6 +133,15 @@ class Planner:
 
     # -- readiness / ordering ------------------------------------------------------------
 
+    def held_tasks(self) -> dict[str, str]:
+        """Ready-but-held tasks and why, so the loop can report a hold instead of stalling silently."""
+        out: dict[str, str] = {}
+        for t in self.state.tasks:
+            held, why = _held(self.state, t.id)
+            if held and t.status in (TaskStatus.PENDING, TaskStatus.READY, TaskStatus.BLOCKED):
+                out[t.id] = why
+        return out
+
     def compute_ready(self) -> list[Task]:
         by_id = {t.id: t for t in self.state.tasks}
         ready: list[Task] = []
@@ -143,6 +159,12 @@ class Planner:
                     t.status = TaskStatus.CANCELLED
                     continue
                 if all(d.status == TaskStatus.DONE for d in deps):
+                    # R1: a hold is checked here, at dispatch, not at queue time — a task that
+                    # became ready before the hold existed is still held. Unrelated authorized
+                    # work is untouched.
+                    held, _why = _held(self.state, t.id)
+                    if held:
+                        continue
                     if t.status != TaskStatus.READY:
                         t.status = TaskStatus.READY
                         t.updated_at = iso_now()

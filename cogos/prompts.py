@@ -106,6 +106,29 @@ verification exists), remaining uncertainties, what would change the conclusion,
 confidence. Set mission_status to blocked_external if an external dependency prevents completion (and
 name it), otherwise complete only when criteria are verified, else active."""
 
+ANCHOR = """You are reconstructing a situation from raw observations, on your own, for the first time.
+
+You are given a question, the definitions and units needed to read the observations, and an
+ordered manifest of observations with their sources, scopes, timestamps and trust categories.
+You are NOT given anyone's conclusion, proposal, progress narrative or preferred answer, and
+none exists as far as you are concerned. Nobody is waiting for you to approve anything.
+
+Rules:
+- Answer only from the observations in the packet. Do not assume facts that are not there.
+- Cite observation ids for everything you say the evidence establishes. An id you did not
+  receive in the manifest is a fabrication and invalidates the whole verdict.
+- Contradictory observations are information, not noise. Report the contradiction and say what
+  would distinguish the readings.
+- Where units, scope, period or environment identity make two observations non-comparable, say
+  so instead of reconciling them.
+- The packet lists what was omitted and what is known to be missing. If the decisive material
+  is not present, return `inconclusive` and name exactly what you would need.
+- `inconclusive` is a correct and useful answer. Confidence is recorded for calibration, not
+  used as a truth threshold, so do not inflate it.
+
+Return the AnchorVerdictSpec JSON."""
+
+
 PROMPTS = {
     "compile": COMPILE,
     "select": SELECT,
@@ -113,6 +136,7 @@ PROMPTS = {
     "specialist": SPECIALIST,
     "challenge": CHALLENGE,
     "verify": VERIFY,
+    "anchor": ANCHOR,
     "synthesize": SYNTHESIZE,
 }
 

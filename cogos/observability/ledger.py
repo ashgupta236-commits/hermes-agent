@@ -40,7 +40,7 @@ class ResourceLedger:
             self.usage.output_tokens += int(resp.output_tokens or 0)
             self.usage.estimated_cost_usd += float(resp.cost_usd or 0.0)
             self.usage.wall_clock_seconds += float(resp.duration_ms or 0) / 1000.0
-        self.release()
+        self.release(calls=attempts)
 
     def add_tool_call(self, res: ToolResult) -> None:
         self.usage.tool_calls += 1
@@ -68,10 +68,20 @@ class ResourceLedger:
         self.reserved_calls += max(0, int(calls))
         self.reserved_cost_usd += max(0.0, float(cost_usd))
 
-    def release(self) -> None:
-        """Drop any outstanding reservation; the real usage has now been recorded."""
-        self.reserved_calls = 0
-        self.reserved_cost_usd = 0.0
+    def release(self, calls: Optional[int] = None, cost_usd: Optional[float] = None) -> None:
+        """Drop part or all of an outstanding reservation.
+
+        Called with no arguments the whole reservation is dropped (the work was abandoned);
+        with amounts, only the part that has now been really accounted for.
+        """
+        if calls is None and cost_usd is None:
+            self.reserved_calls = 0
+            self.reserved_cost_usd = 0.0
+            return
+        if calls is not None:
+            self.reserved_calls = max(0, self.reserved_calls - int(calls))
+        if cost_usd is not None:
+            self.reserved_cost_usd = max(0.0, self.reserved_cost_usd - float(cost_usd))
 
     def add_wall_clock(self, seconds: float) -> None:
         self.usage.wall_clock_seconds += float(seconds)

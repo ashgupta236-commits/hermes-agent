@@ -279,6 +279,24 @@ class VerificationJudgment(BaseModel):
     checked: list[str] = Field(default_factory=list, description="Which properties were actually checked")
 
 
+class AnchorVerdictSpec(BaseModel):
+    """The blind anchor's structured verdict (R1 Stage A).
+
+    It answers the packet's question from the observations alone. It never sees, and so cannot
+    agree or disagree with, the executive's own position — the comparison is made afterwards by
+    kernel code.
+    """
+
+    verdict: str = Field(description="supported|refuted|inconclusive")
+    supported: list[str] = Field(default_factory=list, description="Propositions the observations establish")
+    refuted: list[str] = Field(default_factory=list, description="Propositions the observations contradict")
+    unknown: list[str] = Field(default_factory=list, description="Propositions the observations cannot settle either way")
+    evidence_refs: list[str] = Field(default_factory=list, description="Observation ids from the packet manifest; ids not in the packet are rejected")
+    alternatives: list[str] = Field(default_factory=list, description="Other readings the same observations permit")
+    missing_information: list[str] = Field(default_factory=list, description="What would be needed to settle the question")
+    uncertainty: float = Field(default=0.5, description="0 = certain, 1 = no information")
+
+
 class CriterionAssessment(BaseModel):
     criterion_id: str
     satisfied: bool

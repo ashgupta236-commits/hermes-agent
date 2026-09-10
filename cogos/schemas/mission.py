@@ -8,6 +8,16 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from cogos.ids import iso_now, new_id
+from cogos.schemas.anchor import (
+    AnchorAssessment,
+    BeliefSnapshot,
+    BranchHold,
+    EvidenceSnapshot,
+    HoldStatus,
+    Observation,
+    RealityDisagreement,
+    ResolutionReceipt,
+)
 from cogos.schemas.beliefs import Claim, Contradiction, Evidence, Hypothesis
 from cogos.schemas.common import ActionClass, EpistemicStatus, Provenance, VerificationStatus
 from cogos.schemas.decisions import Decision
@@ -265,6 +275,13 @@ class MissionState(BaseModel):
     artifacts: list[Artifact] = Field(default_factory=list)
     tests: list[TestRecord] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
+    observations: list[Observation] = Field(default_factory=list, description="Raw material captured by the kernel collector (R1)")
+    evidence_snapshots: list[EvidenceSnapshot] = Field(default_factory=list)
+    belief_snapshots: list[BeliefSnapshot] = Field(default_factory=list)
+    anchor_assessments: list[AnchorAssessment] = Field(default_factory=list)
+    disagreements: list[RealityDisagreement] = Field(default_factory=list)
+    holds: list[BranchHold] = Field(default_factory=list)
+    resolution_receipts: list[ResolutionReceipt] = Field(default_factory=list)
     learned_lessons: list[Lesson] = Field(default_factory=list)
     candidate_skills: list[CandidateSkill] = Field(default_factory=list)
     human_requests: list[HumanRequest] = Field(default_factory=list)
@@ -334,6 +351,21 @@ class MissionState(BaseModel):
             referenced.update(t.verification_ids)
             referenced.update(t.verification_attempt_ids)
         return referenced
+
+    def open_holds(self) -> list[BranchHold]:
+        return [h for h in self.holds if h.status == HoldStatus.OPEN]
+
+    def observation(self, observation_id: str) -> Optional[Observation]:
+        for o in self.observations:
+            if o.id == observation_id:
+                return o
+        return None
+
+    def evidence_snapshot(self, snapshot_id: str) -> Optional[EvidenceSnapshot]:
+        for s in self.evidence_snapshots:
+            if s.id == snapshot_id:
+                return s
+        return None
 
     def evidence_item(self, evidence_id: str) -> Optional[Evidence]:
         for e in self.evidence:

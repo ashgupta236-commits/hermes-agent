@@ -30,7 +30,10 @@ from cogos.memory import MemoryManager
 from cogos.observability import CalibrationTracker, DecisionJournal, ResourceLedger, Tracer
 from cogos.persistence import StateStore
 from cogos.planner import Planner
+from cogos.executive.anchor_service import AnchorService
+from cogos.schemas.anchor import HoldStatus
 from cogos.schemas.beliefs import Claim, ClaimStatus, Contradiction, Evidence, EvidenceKind
+from cogos.verification.reality_anchor import MAX_RESOLUTION_ROUNDS
 from cogos.schemas.cognition import (
     EvidenceSpec,
     ObservationInterpretation,
@@ -123,6 +126,7 @@ class Executive:
         self.controller = controller or MetaCognitiveController()
         self.calibration = CalibrationTracker(store)
         self.workspace = GlobalWorkspace(config.workspace_max_chars)
+        self.anchors = AnchorService(self)
         self._sleep = sleep_fn
         self._tool_history: list[bool] = []
 
@@ -570,10 +574,18 @@ class Executive:
             self._refresh_changed_artifacts(state, engine)
             gate = engine.mission_completion_check(state)
             self.tracer.emit("verify", f"completion gate: {gate.status.value} — {gate.summary[:200]}", data=gate.model_dump(mode="json"))
-            if gate.status == VerificationStatus.PASSED:
-                out.completed = True
-            else:
+            if gate.status != VerificationStatus.PASSED:
                 out.completion_refusal = gate.summary
+            else:
+                # R1: the deterministic gate passing is necessary, not sufficient. Before the
+                # mission is declared done, a blind assessment of the same raw evidence has to
+                # agree — and an open hold blocks completion regardless of what either side
+                # would prefer. A passing anchor is additional evidence, never an action grant.
+                blocked = self._anchor_before_completion(state)
+                if blocked:
+                    out.completion_refusal = blocked
+                else:
+                    out.completed = True
         return out
 
     def _executive_position(self, state: MissionState) -> str:
@@ -645,6 +657,40 @@ class Executive:
             if res.verdict.decision == PolicyDecision.REQUIRE_HUMAN:
                 state.human_requests.append(HumanRequest(kind="authorization", question=f"Authorize {res.verdict.action_class.value} operation: {blocked.operation}", why_not_inferable="the action class requires explicit human authorization by policy", options=["authorize", "deny"], independent_work_remaining=True))
         return res
+
+    def _anchor_before_completion(self, state: MissionState) -> str:
+        """Run (or honour) the reality anchor on the mission's headline position.
+
+        Returns a refusal reason, or "" when nothing is holding completion. A hold from an
+        earlier cycle is honoured here even if it was opened against a queued branch: this is
+        the dispatch point for "declare the mission done".
+        """
+        for hold in state.open_holds():
+            if hold.rounds < MAX_RESOLUTION_ROUNDS:
+                self.anchors.attempt_resolution(state, hold)
+        still_open = state.open_holds()
+        if still_open:
+            return "completion held by reality anchor: " + "; ".join(f"{h.kind.value}: {h.cause[:160]}" for h in still_open[:3])
+        exhausted = [h for h in state.holds if h.status == HoldStatus.UNRESOLVED_EXHAUSTED and not h.resolution_receipt_id]
+        if exhausted:
+            # An exhausted dispute is reported as unresolved. Running out of rounds is not
+            # agreement, so it does not become a pass.
+            return "completion blocked: unresolved reality disagreement after the permitted resolution rounds: " + "; ".join(h.cause[:160] for h in exhausted[:3])
+
+        if state.resources.get("anchor", {}).get("completion_assessment_id"):
+            return ""  # already anchored for this completion attempt and cleared
+        proposition = self._executive_position(state)
+        outcome = self.anchors.run(
+            state,
+            question=f"From the observations alone, what do they establish about this mission's objective: {state.objective}",
+            proposition=proposition,
+            branch="mission",
+            propositions=[c.description for c in state.success_criteria],
+        )
+        if outcome.held:
+            return f"completion held by reality anchor: {outcome.summary()}"
+        state.resources.setdefault("anchor", {})["completion_assessment_id"] = outcome.assessment.id
+        return ""
 
     def _refresh_changed_artifacts(self, state: MissionState, engine: VerificationEngine) -> list[str]:
         """Re-verify artifacts whose bytes no longer match what was verified.

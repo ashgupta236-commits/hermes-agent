@@ -202,6 +202,26 @@ class HeuristicExecutive:
         comp = default_compilation(str(md.get("objective", "")), dict(md.get("context") or {}))
         return comp.model_dump(mode="json")
 
+    # anchor ----------------------------------------------------------------------
+
+    def _anchor(self, req: CognitionRequest) -> dict[str, Any]:
+        """Offline reality anchor: a deterministic reading of the packet, no model involved.
+
+        It receives the same packet a model anchor would and answers from the observations
+        alone, so it establishes the protocol's behaviour honestly. It does not establish
+        anything about model bias — that requires the real adapter.
+        """
+        import json as _json
+
+        from cogos.verification.reality_anchor import deterministic_anchor
+
+        body = req.prompt.split("EVIDENCE PACKET:", 1)[-1].strip()
+        try:
+            packet = _json.loads(body)
+        except _json.JSONDecodeError:
+            return {"verdict": "inconclusive", "missing_information": ["the evidence packet could not be parsed"], "uncertainty": 1.0}
+        return deterministic_anchor(packet)
+
     # select ----------------------------------------------------------------------
 
     def _select(self, req: CognitionRequest) -> dict[str, Any]:
