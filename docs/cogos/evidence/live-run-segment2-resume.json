@@ -1,0 +1,114 @@
+{
+ "status": "paused",
+ "resume_elapsed_seconds": 2179.8,
+ "completion_gate": "failed",
+ "gate_checks": [
+  {
+   "name": "success_criteria",
+   "status": "failed",
+   "detail": "'calc.py exists at /tmp/cogos-live-run/calc.py and defines add_percent(value: float, percent: float) -> float with type hints' (no passing verification record bound to it); 'add_percent returns value "
+  },
+  {
+   "name": "tests",
+   "status": "passed",
+   "detail": "0 test record(s), none failing"
+  },
+  {
+   "name": "contradictions",
+   "status": "failed",
+   "detail": "ctr_1m267xge119c5a184 (severity 1.00), ctr_1m269vq9c59082198 (severity 0.94), ctr_1m269vq9c7d8d1524 (severity 0.84), ctr_1m269vq9c8146e1a2 (severity 0.76)"
+  },
+  {
+   "name": "blocked_operations",
+   "status": "passed",
+   "detail": "no unresolved blocked operations on unfinished tasks"
+  },
+  {
+   "name": "human_requests",
+   "status": "passed",
+   "detail": "no blocking unanswered human requests"
+  },
+  {
+   "name": "artifact_integrity",
+   "status": "skipped",
+   "detail": "no verified artifacts to re-check"
+  },
+  {
+   "name": "required_artifacts",
+   "status": "failed",
+   "detail": "missing or unverified: /tmp/cogos-live-run/calc.py, /tmp/cogos-live-run/test_calc.py"
+  }
+ ],
+ "criteria": [
+  {
+   "description": "calc.py exists at /tmp/cogos-live-run/calc.py and defines add_percent(value: float, percen",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "add_percent returns value increased by percent percent, rounded to 2 decimals (e.g. add_pe",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "test_calc.py exists and contains tests for a positive percent, a zero percent, and a negat",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "Full test suite passes with the environment test command",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "No other files in the project root are modified or deleted (README.md, REQUIREMENTS.md, py",
+   "satisfied": false,
+   "bound_receipts": []
+  }
+ ],
+ "artifacts": [],
+ "tests": [],
+ "usage": {
+  "model_calls": 24,
+  "input_tokens": 265962,
+  "output_tokens": 280159,
+  "tool_calls": 21,
+  "retries": 0,
+  "subagents_spawned": 3,
+  "network_requests": 0,
+  "wall_clock_seconds": 7297.281342281997,
+  "estimated_cost_usd": 20.508815249999994,
+  "cycles": 11
+ },
+ "executive_model": "claude-fable-5-1",
+ "anchor": {
+  "assessments": 0,
+  "verdicts": [],
+  "observations": 0,
+  "holds": [],
+  "isolation": null,
+  "uncorroborated": []
+ },
+ "residency_tally": {
+  "verified": 8
+ },
+ "notes": [
+  "material disagreement recorded: Provenance and epistemic status of the mission constraint 'Use Python's built-in round(x, 2)'",
+  "paused: wall-clock budget exhausted: 2940s of 2400s elapsed",
+  "paused: cost budget exhausted: $20.51 of $19.00 committed"
+ ],
+ "unresolved": {
+  "contradictions": [
+   "The mission constraint 'Use Python's built-in round(x, 2) for rounding' is recorded as a hard constraint, while the controller's c (sev 0.35)",
+   "Conflicting evidence for: Baseline file set of /tmp/cogos-live-run is {.cogos/, README.md, REQUIREMENTS.md, pytest.ini}; calc.py a (sev 1.0)",
+   "clm_1m267r7nt7b1336c8 (0.05) says REQUIREMENTS.md is evidenced by a single paraphrased read with 'no second read', while clm_1m268 (sev 0.35)",
+   "RESOLVED by time scope: the baseline claim (deliverables absent) describes the pre-write state (baseline files mtime 17:52); the e (sev 0.0)",
+   "The pytest-collection claim presupposes a runnable pytest; observed: the sandbox default interpreter /usr/local/bin/python3 (3.11. (sev 0.4)",
+   "Conflicting evidence for: The content of test_calc.py (whether it covers positive, zero and negative percent, and whether it avoid (sev 0.945)",
+   "Conflicting evidence for: The rounding check validated the formula inline, not the calc.py module import path; module-level correc (sev 0.845)",
+   "Conflicting evidence for: Corroboration is weaker than it looks: the 'verbatim' evidence item is a summary rather than quoted text (sev 0.7570625)"
+  ],
+  "blocked": [],
+  "undecidable_criteria": []
+ }
+}

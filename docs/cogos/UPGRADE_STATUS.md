@@ -10,11 +10,23 @@ This report tracks three states separately, as the brief requires:
 | **verified locally** | the relevant local checks were actually run, and are named below |
 | **validated live** | a real supported provider or environment run supplied the evidence |
 
-**Nothing in this repository is `validated live` for the upgrade work.** Every result below came
-from local checks with the offline scripted adapter. A real-model run was performed before this
-work began and is recorded in `EVALS.md`; it has not been repeated against these changes, so no
-claim here rests on it. Where a live run is the only thing that could settle a question, that is
-stated in the row rather than substituted for.
+A live run against the real `claude_code` adapter **has now been performed** — 11 cycles, 24
+model calls, $20.51, Claude Code CLI 2.1.267, model `claude-fable-5-1`. Full write-up in
+[`evidence/LIVE_RUN.md`](evidence/LIVE_RUN.md).
+
+It validates live: adapter command shape and structured-output parsing; **model residency
+verified on every cognition call** with no downgrade; **completion integrity — no false
+completion across 11 cycles**; pause and resume from durable state; budget guards firing;
+failure diagnosis and replan. The mission itself did **not** complete: it wrote both
+deliverables correctly (independently confirmed, 4/4 tests pass) but never ran its own
+verification of them, so the gate refused for want of a bound receipt. Conservative, not wrong —
+and a real shortcoming, since it spent its budget on epistemics instead of closing work it had
+already done.
+
+It does **not** validate the reality anchor: R1 triggers before a completion attempt, and the
+mission never reached one. Rows below say `validated live` only where that run actually supplied
+the evidence. Everything else remains local-only, and where a live run is the only thing that
+could settle a question, that is stated in the row rather than substituted for.
 
 ---
 
@@ -119,14 +131,14 @@ ledger, and the ledger can reserve budget for a call in flight.
 | A03 | F3 artifact integrity | yes | partial | no | Mutation and deletion covered. **Not covered:** an inaccessible *delivery* target (no delivery channel exists in this runtime) and a verification/commit race, which needs a concurrency fixture. |
 | A04 | F4 receipt binding | yes | partial | no | Wrong target rejected at citation and at the gate. **Not covered:** rubric- and revision-scoped binding — there is no rubric object, and receipts are not yet bound to a state revision. |
 | A05 | F5 durable history | yes | partial | no | Referenced receipts survive volume pressure and restart. **Not covered:** an interrupted write mid-append. |
-| A06 | F6 model identity | yes | yes | no | Mismatch, unknown and alias resolution distinguished; a refusal never downgrades the executive (existing test). |
+| A06 | F6 model identity | yes | yes | **yes** | Mismatch, unknown and alias resolution distinguished. Live: residency verified on every cognition call of the 11-cycle run, auxiliary haiku correctly excluded, executive never downgraded. |
 | A07 | F7 complete accounting | yes | partial | no | The retry fixture records two attempts and $3. **Not covered:** concurrent calls sharing a ledger, and deadline enforcement. Unknown cost is recorded as 0 and not distinguished from a real zero. |
 | A08 | R1 independent input | yes | yes | no | The packet excludes the executive's conclusion by construction and by check; units, environment identity, timestamps and the omission manifest travel with it. Isolation is recorded, including what it does not establish. |
 | A09 | R1 enforced holds | yes | yes | no | Refutation, timeout, malformed and unverifiable-isolation verdicts all hold; holds block a task queued before them, survive a reload, permit read-only evidence gathering, and clear only on new evidence within two rounds. |
 | A10 | R2 behaviour records | yes | yes | no | Four channels recorded and reconciled across a real run; forged self-reports (claimed checks with no execution) and missing telemetry are visible; the chain detects an edited record. |
-| A11 | R3 continuity | yes | yes | no | The headless adapter reports `external_state_only` with its cost stated; handoff completeness is checked; the anchor's policy is the inverse of the executive's. **Not covered:** native session continuation, because no adapter here supports it. |
+| A11 | R3 continuity | yes | yes | **partial** | The headless adapter reports `external_state_only` with its cost stated; handoff completeness is checked; the anchor's policy is the inverse of the executive's. **Not covered:** native session continuation, because no adapter here supports it. Live: the headless adapter ran 24 calls as `external_state_only` and the mission resumed from durable state across a pause. |
 | A12 | R4 tools and boundaries | yes | partial | no | Discovery works and is not authorization; a denied destination is now denied on the shell route too. **Weaker than it sounds:** boundary enforcement is argument analysis, not OS-level sandboxing — an allowed interpreter can still write wherever its process can. Specialist-subprocess effects are not separately audited. |
-| A13 | R5 recovery | yes | partial | no | Restart preserves holds, spent rounds, denied grants, attempt budgets, resource totals and contradictions; held branches do not stop unrelated work. **Not covered:** idempotency keys and effect-checking before replay of an interrupted *external* operation. |
+| A13 | R5 recovery | yes | partial | **partial** | Restart preserves holds, spent rounds, denied grants, attempt budgets, resource totals and contradictions; held branches do not stop unrelated work. **Not covered:** idempotency keys and effect-checking before replay of an interrupted *external* operation. Live: a paused mission resumed at cycle 6 with $8.81 already spent and continued to cycle 11 without repeating completed work. |
 | A14 | L1 outcome data | yes | yes | no | Pre-action features only (asserted structurally); receipts must resolve; invalidated receipts traceable through lineage; unknown/censored kept but excluded. |
 | A15 | L2 learning | yes | yes | no | Hand-calculated SARSA transition checked term by term; parameters persist across restart; the bandit's estimates change the runtime's next retrieval. **Real-task gain: not measured.** No comparative evaluation of missions with and without the learned policy has been run. |
 | A16 | L3 replay and retention | yes | partial | no | Split by task instance, duplicates collapsed and counted, on-policy restriction, sampling tracked, retention measured before/after. **Not covered:** option discovery evaluated on fresh instances — options are still the skill compiler's candidates. |
@@ -155,27 +167,33 @@ it did not block completion, and it did not silently pass either.
 Both are **scripted demonstrations**: the specialist policies are deterministic fixtures, not a
 model. They validate the plumbing end to end and nothing about model behaviour.
 
-## 7. Live validation: what is blocked and how to run it
+## 7. Live validation
 
-No live provider run was performed for this work, so there are no live costs, model identities
-or outcomes to report. The runtime is ready for one:
+A live run **was** performed — see [`evidence/LIVE_RUN.md`](evidence/LIVE_RUN.md) for the full
+account, including the two defects it found (a billed failure recorded with an empty error, and
+a resolved contradiction that had no channel to be recorded as resolved), and the limitation it
+exposed: budget guards are cycle-boundary checks, not hard interrupts, so a long cycle overshoots
+the cap by roughly one cycle.
+
+Reproduce it with:
 
 ```bash
 .venv/bin/python -m cogos --adapter claude_code --model claude-fable-5-1 \
   mission new "Build the feature described in REQUIREMENTS.md." --run
 ```
 
-Prerequisites that were not met here: an authorized `claude` CLI on PATH with a budget the user
-has approved for new paid runs. This brief does not create that authorization, and capability
-detection must not launch a paid benchmark on its own, so no run was attempted.
+Budget it explicitly: the run above cost $20.51 for 11 cycles without completing. Capability
+detection still must not launch a paid run on its own.
 
-Until such a run exists, three things are specifically **not** established:
+Three things remain specifically **not** established, and the live run did not settle any of
+them:
 
-1. whether blinding reduces a real model's bias — the offline anchor is deterministic, and a
-   scripted anchor establishes protocol behaviour only;
+1. whether blinding reduces a real model's bias — R1 never ran live, because the mission never
+   reached a completion attempt, and the offline anchor is deterministic;
 2. whether the isolation boundary holds against a real headless process, which may still inherit
    project context (`CLAUDE.md`, skills, MCP configuration);
-3. whether the learned retrieval policy improves real missions.
+3. whether the learned retrieval policy improves real missions — it stayed on its validated
+   baseline for all five live decisions, correctly, being below the data-support threshold.
 
 ## 8. Learning: what actually changed
 

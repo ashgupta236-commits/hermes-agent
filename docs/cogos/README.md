@@ -14,6 +14,7 @@ Claude executive model. It lives in `cogos/` at the repository root, ships its o
 | [EVALS.md](EVALS.md) | The twelve metrics, acceptance scenarios A-J, adversarial scenarios, how to run, measured results. |
 | [SECURITY.md](SECURITY.md) | Capability firewall, injection defence, trust levels, false-consensus guard, specialist tool surface, non-goals. |
 | [EXAMPLE_MISSION.md](EXAMPLE_MISSION.md) | A research mission walked end to end: what the human supplies, what the system decides, how completion is earned. |
+| [evidence/LIVE_RUN.md](evidence/LIVE_RUN.md) | The live `claude_code` run: what it validated (residency, completion integrity, resume, budget guards), what it did not (the reality anchor never ran), the two defects it found, and its cost. |
 | [UPGRADE_STATUS.md](UPGRADE_STATUS.md) | F1-F7 repairs, R1-R5 and L1-L6 additions, the A01-A20 acceptance matrix with implemented / verified-locally / validated-live tracked separately, and what the evidence does not show. |
 | [OPERATIONS.md](OPERATIONS.md) | Setup, every CLI command, `cogos.yaml`, environment variables, human answer/authorize flow, snapshots, troubleshooting. |
 
