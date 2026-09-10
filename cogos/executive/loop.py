@@ -1219,6 +1219,14 @@ class Executive:
         resp = self.adapter.call(req)
         ResourceLedger(state.usage).add_model_call(resp)
         self.tracer.emit("operation", f"cognition:{req.kind} {'ok' if resp.ok else 'FAILED'} model={','.join(resp.models_used) or req.model} {resp.duration_ms}ms", data={"kind": req.kind, "ok": resp.ok, "error": resp.error[:200], "error_kind": resp.error_kind, "models_used": resp.models_used, "residency_ok": resp.residency_ok}, cost={"cost_usd": resp.cost_usd, "input_tokens": resp.input_tokens, "output_tokens": resp.output_tokens})
+        if not resp.ok and resp.error_kind == "refused":
+            # A provider safety classification narrows what this call can do; it never changes
+            # the resident executive model and never justifies working around the safeguard.
+            note = f"executive cognition '{req.kind}' was declined by provider safety classification; deterministic policy used for this step"
+            if note not in state.notes:
+                state.notes.append(note)
+            state.capability_state[f"cognition:{req.kind}"] = {"last_verdict": "refused", "reason": resp.error[:300], "executive_model": state.executive_model}
+            self.tracer.emit("blocked", f"cognition:{req.kind} declined by provider safety classification (model residency preserved)", data={"kind": req.kind, "error": resp.error[:300], "executive_model": state.executive_model})
         if req.kind in EXECUTIVE_KINDS:
             self._check_residency(state, resp, req.kind)
             if resp.ok and not resp.residency_ok:

@@ -174,3 +174,32 @@ denial narrows the action space and nothing else." In code:
   action space, never your reasoning."
 * There is no code path that selects a different model in response to a policy verdict, a budget
   breach or a tool failure.
+
+## Provider safety classifications (`refused`)
+
+A cognition call can be declined by the provider's own safety classification (the CLI returns
+`is_error` with text naming Anthropic's usage policy). `ClaudeCodeExecutive._parse` gives this its
+own `error_kind="refused"`, distinct from `transient`, `structural` and `unavailable`.
+
+Observed behaviour during real-model validation: the classification is **not deterministic on
+identical input** — the same prompt and schema were accepted on some attempts and declined on
+others, and both larger and smaller schemas were declined. It correlates loosely with total
+request size, not with any particular field.
+
+The runtime's response is fixed and deliberately narrow:
+
+1. **Retry exactly once, byte-identical.** `call()` retries a refusal a single time with the same
+   argv and the same prompt. It never shortens, rephrases, re-encodes, splits or otherwise reshapes
+   the request to get a different classification. `tests/cogos/test_refusal_handling.py` asserts the
+   two commands are equal.
+2. **Record it as a capability fact.** `Executive._cognition` writes
+   `capability_state["cognition:<kind>"] = {"last_verdict": "refused", …}`, appends a mission note,
+   and emits a `blocked` trace event.
+3. **Degrade, do not stop.** The affected call falls back to deterministic policy for that step
+   (`_fallback_select`, the heuristic interpreter, `_heuristic_replan`). The mission continues.
+4. **Never downgrade the executive.** `executive_model` is unchanged and every subsequent call is
+   still made to the resident model. A refusal is a permission-state event, not a capability-state
+   downgrade of the reasoning process.
+
+There is no configuration, prompt variant, or flag in this repository intended to avoid a safety
+classification, and adding one is out of scope.

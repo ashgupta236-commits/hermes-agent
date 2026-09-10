@@ -28,6 +28,16 @@ from cogos.adapters.base import (
     render_untrusted,
 )
 
+# Provider-side safety classification. This is NOT something to work around: the runtime
+# records it, retries once (the classifier is not deterministic on identical input), and
+# otherwise falls back to deterministic policy while preserving the executive model.
+_REFUSAL_MARKERS = (
+    "safeguards flagged this message",
+    "anthropic.com/legal/aup",
+    "declined to respond",
+    "content policy",
+)
+
 _TRANSIENT_MARKERS = (
     "overloaded",
     "rate limit",
@@ -46,6 +56,11 @@ _TRANSIENT_MARKERS = (
 def _is_transient(text: str) -> bool:
     low = text.lower()
     return any(m.lower() in low for m in _TRANSIENT_MARKERS)
+
+
+def _is_refusal(text: str) -> bool:
+    low = text.lower()
+    return any(m.lower() in low for m in _REFUSAL_MARKERS)
 
 
 class ClaudeCodeExecutive:
@@ -147,6 +162,11 @@ class ClaudeCodeExecutive:
                 time.sleep(delay)
                 delay *= 2
                 continue
+            if resp.error_kind == "refused" and attempt == 0:
+                # One retry only: the safety classifier is not deterministic on identical
+                # input. We never reshape the request to evade it.
+                time.sleep(delay)
+                continue
             return resp
         return CognitionResponse(ok=False, model_requested=req.model, error=last_err, error_kind="transient")
 
@@ -189,6 +209,8 @@ class ClaudeCodeExecutive:
         )
         if data.get("is_error"):
             err = str(data.get("result", ""))[:2000]
+            if _is_refusal(err):
+                return CognitionResponse(ok=False, error=err, error_kind="refused", raw_text=err, **base)
             kind = "transient" if _is_transient(err) else "structural"
             if "not available" in err.lower() or "does not exist" in err.lower() or "model" in err.lower() and "invalid" in err.lower():
                 kind = "unavailable"

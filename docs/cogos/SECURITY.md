@@ -201,3 +201,12 @@ the `--tools`/`--allowedTools` set described above.
   optional API adapter.
 * Trust scoring is a prior, not verification; primary evidence and deterministic checks remain the
   standard for `established` claims.
+
+## Provider safeguards are respected, never routed around
+
+When the provider's safety classifier declines a cognition call the runtime classifies it as
+`refused`, retries once with a byte-identical request (the classifier is non-deterministic on
+identical input), records it in `capability_state` and the trace, and falls back to deterministic
+policy for that step. It does not shorten, rephrase, split or re-encode the request to obtain a
+different classification, and it never lowers the executive model in response. See
+`docs/cogos/MODEL_POLICY.md` for the full rule and the tests that pin it.
