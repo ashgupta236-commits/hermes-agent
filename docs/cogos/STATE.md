@@ -177,3 +177,21 @@ harder case of a `KeyboardInterrupt` mid-cycle and checks `PRAGMA quick_check ==
 variable, or `<repo>/.cogos`; a relative path is resolved against `repo_root`. The `--home` CLI
 flag overrides all of them. `COGOS_HOME` is also added to the firewall's writable roots so the
 runtime can always write its own state.
+
+## Verification records are durable state
+
+`MissionState.verifications` holds every `VerificationResult` the engine produces
+(`cogos/schemas/verification.py`), capped at the most recent 500. This exists because every
+completion gate claims to require "a verification record", and before the records were persisted
+those gates could only test that a list of ids was non-empty — which an attempted-and-failed
+verification satisfied just as well as a passing one.
+
+Two rules follow from it:
+
+- `SuccessCriterion.verification_ids` cites **only passing** records. A failed or inconclusive
+  attempt is still persisted (so it is auditable) but is never added to the criterion.
+- `mission_completion_check` resolves each id through `MissionState.passing_verifications` and
+  requires `status == PASSED`. A forged or stale id resolves to nothing and the gate refuses.
+
+Because the records live in mission state, they survive a restart and a snapshot round-trip, so
+`cogos explain` and an auditor can answer "which check established this criterion, and when".

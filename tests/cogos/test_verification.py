@@ -207,13 +207,16 @@ def test_verify_criterion_test_gating():
     result = engine.verify_criterion(criterion)
     assert result.status == FAILED
     assert criterion.satisfied is False
-    assert criterion.verification_ids == [result.id]
+    # a failed attempt is persisted but never cited as evidence on the criterion
+    assert criterion.verification_ids == []
+    assert state.verification(result.id) is not None
 
     state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now()))
     again = engine.verify_criterion(criterion)
     assert again.status == PASSED
     assert criterion.satisfied is True
-    assert criterion.verification_ids == [result.id, again.id]
+    assert criterion.verification_ids == [again.id]
+    assert state.passing_verifications(criterion.verification_ids) == [again]
 
     # a stale record (older than the criterion) does not count
     state.tests = [_TestRecord(name="old", status=PASSED, ran_at="2000-01-01T00:00:00+00:00")]

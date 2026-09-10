@@ -278,9 +278,16 @@ class Executive:
             for cid in affects.get("claims", []):
                 c = state.claim(cid)
                 if c:
+                    from cogos.schemas.beliefs import ClaimStatus
+
                     c.last_verified_at = None
-                    c.status = c.status if c.status.value != "established" else c.status
-                    state.notes.append(f"claim {cid} flagged for re-verification by event {ev.id}")
+                    if c.status in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED):
+                        # New information invalidates the standing verification: demote so the
+                        # claim cannot satisfy a criterion until it is re-established.
+                        c.status = ClaimStatus.STALE
+                        c.confidence = _clamp(0.5 + (c.confidence - 0.5) * 0.7)
+                    c.updated_at = iso_now()
+                    state.notes.append(f"claim {cid} demoted to stale for re-verification by event {ev.id}")
             for uid in affects.get("unknowns", []):
                 for u in state.unknowns:
                     if u.id == uid:
@@ -290,14 +297,11 @@ class Executive:
                 if t and t.status in (TaskStatus.BLOCKED, TaskStatus.FAILED):
                     t.status = TaskStatus.PENDING
             self.events.mark_handled(ev.id, state.mission_id)
-        # Blocked tasks whose human requests were answered become pending again.
-        answered = {h.id for h in state.human_requests if h.answered}
-        for b in state.blocked_operations:
-            if not b.resolved and b.task_id and any(h.id in answered for h in state.human_requests if h.question and b.operation in h.question):
-                b.resolved = True
-                t = state.task(b.task_id)
-                if t and t.status == TaskStatus.BLOCKED:
-                    t.status = TaskStatus.PENDING
+        # A blocked operation is cleared only by an actual authorization grant (see
+        # _apply_grants). An answered request is not consent: "deny" is an answer too, and
+        # substring-matching a question against an operation reactivated denied work forever.
+        self._apply_grants(state)
+        self._record_denied_authorization(state)
         beliefs.recompute()
         beliefs.detect_contradictions()
         beliefs.mark_stale(max_age_days=90)
@@ -404,6 +408,10 @@ class Executive:
         # Hard governance: runtime, not model, decides completion; verification precedes claiming criteria.
         if decision.operation == OperationKind.COMPLETE_MISSION and verification_pending:
             decision = StepDecision(operation=OperationKind.VERIFY, task_id=verification_pending[0], rationale="runtime override: unverified outputs must be verified before completion", confidence=decision.confidence)
+        if decision.operation == OperationKind.VERIFY and not decision.task_id and verification_pending:
+            # A verify step with no target repeatedly re-ran the criteria pass without ever
+            # clearing the pending output; bind it to the actual unverified task.
+            decision = decision.model_copy(update={"task_id": verification_pending[0], "rationale": f"runtime override: bound verification to unverified task ({decision.rationale[:120]})"})
         if decision.task_id and state.task(decision.task_id) is None:
             decision.task_id = ""
         return decision
@@ -455,15 +463,20 @@ class Executive:
                 calls = [c for c in calls if c.tool != "web_search"]
                 queries = [str(c.arguments().get("query") or c.purpose) for c in searches]
                 spec = SpecialistSpec(role="researcher", objective="Search the web and report sourced findings for: " + "; ".join(queries), tools=["web_search", "web_fetch"], context_keys=["unknowns"], max_turns=12, evidence_standard="primary sources; cite URL, date, scope; note repeated sources")
-                run = self.foundry.run(spec, state)
-                ledger.add_subagent()
-                ledger.add_model_call(run.response)
-                if run.report is not None:
+                sd = AgentFoundry.should_spawn(spec, expertise_value=True, budget_left=state.budget.max_subagents - state.usage.subagents_spawned)
+                run = self.foundry.run(spec, state) if sd.spawn else None
+                if run is None:
+                    out.errors.append(f"web search not delegated: {sd.reason}")
+                    self.tracer.emit("specialist", f"declined web-search researcher: {sd.reason}")
+                ledger.add_subagent() if run is not None else None
+                if run is not None:
+                    ledger.add_model_call(run.response)
+                if run is not None and run.report is not None:
                     rep = run.report.model_dump(mode="json")
                     rep["_injection_flags"] = run.injection_flags
                     out.specialist_reports.append(rep)
                     self.tracer.emit("specialist", f"researcher (web search): {run.report.conclusion[:160]}", data={"role": "researcher", "queries": queries, "model": run.model})
-                else:
+                elif run is not None:
                     out.errors.append(f"web search specialist failed: {run.response.error[:160]}")
             for spec in calls:
                 res = self._tool(state, ToolCall(tool=spec.tool, arguments=spec.arguments(), task_id=out.task_id, purpose=spec.purpose), ledger, task)
@@ -639,6 +652,7 @@ class Executive:
                 raw_cmds = p.get("commands") or p.get("verify_commands") or [p.get("test_command")]
                 cmds: list[str] = [str(raw_cmds)] if isinstance(raw_cmds, str) else [str(c) for c in raw_cmds if c]
                 before = len(self.fabric.call_log)
+                tests_before = len(state.tests)
                 result = engine.verify_code(cmds, cwd=p.get("cwd"), task_id=task.id)
                 for res in self.fabric.call_log[before:]:
                     if res.error_kind in ("denied", "requires_human", "unavailable") and not any(b.operation.startswith(f"{res.tool} ") and not b.resolved for b in state.blocked_operations):
@@ -646,13 +660,15 @@ class Executive:
                         state.capability_state[res.tool] = {"last_verdict": res.error_kind, "reason": res.error}
                         self.tracer.emit("blocked", f"verification tool {res.tool} unavailable: {res.error}", data={"task_id": task.id})
                 if p.get("expect_failure"):
-                    # A reproduction step succeeds when the failure is observed.
+                    # A reproduction step succeeds when the failure is observed. Only the
+                    # verification result is inverted: the test ledger keeps the observed
+                    # status, flagged so it is never mistaken for evidence the suite passes.
                     observed = result.status == VerificationStatus.FAILED
                     result.status = VerificationStatus.PASSED if observed else VerificationStatus.FAILED
                     result.summary = ("failure reproduced: " if observed else "failure did NOT reproduce: ") + result.summary
-                    for rec in state.tests[-len(cmds):]:
+                    for rec in state.tests[tests_before:]:
+                        rec.expected_failure = True
                         rec.summary = "(reproduction) " + rec.summary
-                        rec.status = VerificationStatus.PASSED if observed else VerificationStatus.FAILED
             elif p.get("research"):
                 relevant = [c.id for c in state.claims if c.decision_relevance >= 0.5]
                 result = engine.verify_research(relevant or None)
@@ -663,6 +679,10 @@ class Executive:
                 result = engine.verify_task(task)
             if result is not None and result.id not in task.verification_ids:
                 task.verification_ids.append(result.id)
+        if result is None and not self._criteria_pass_useful(state, Planner(state), self._verification_pending(state)):
+            # Nothing has changed since the last pass, or every open criterion is already
+            # recorded undecidable: re-running it would only add dead records.
+            result = VerificationResult(target_type="criteria", target_id=state.mission_id, status=VerificationStatus.INCONCLUSIVE, summary="criteria pass skipped: no change since the last pass", checks=[])
         if result is None:
             # Criteria pass: evaluate every unsatisfied criterion against verified state.
             checks = []
@@ -823,7 +843,7 @@ class Executive:
         # The runtime, not the model, owns criterion satisfaction: strip unverified assertions.
         for ca in syn.criteria_assessment:
             crit = next((c for c in state.success_criteria if c.id == ca.criterion_id), None)
-            if crit is not None and ca.satisfied and not crit.verification_ids:
+            if crit is not None and ca.satisfied and not state.passing_verifications(crit.verification_ids):
                 ca.satisfied = False
                 ca.evidence = (ca.evidence + " [runtime: no verification record]").strip()
         state.synthesis = syn.model_dump(mode="json")
@@ -931,10 +951,19 @@ class Executive:
             c.updated_at = iso_now()
         for cs in interp.contradictions:
             ids = [cid for cid in cs.claim_ids if state.claim(cid)]
-            if ids or cs.description:
-                existing = {tuple(sorted(c.claim_ids)) for c in state.contradictions}
-                if tuple(sorted(ids)) not in existing or not ids:
-                    state.contradictions.append(Contradiction(claim_ids=ids, description=cs.description, severity=_clamp(cs.severity), suspected_cause=cs.suspected_cause or "unknown"))
+            unresolved_ids = [cid for cid in cs.claim_ids if not state.claim(cid)]
+            description = cs.description
+            if unresolved_ids:
+                description = f"{description} [unresolved claim ids: {', '.join(unresolved_ids[:5])}]"
+            if not ids and not description.strip():
+                continue
+            # Dedupe on claim ids when they resolve, otherwise on the normalised description.
+            # Without this an unresolvable id appended a fresh contradiction every cycle,
+            # which no completion gate could ever clear.
+            key = tuple(sorted(ids)) if ids else ("desc", _normalise(cs.description))
+            existing = {(tuple(sorted(c.claim_ids)) if c.claim_ids else ("desc", _normalise(c.description.split(" [unresolved claim ids:")[0]))) for c in state.contradictions}
+            if key not in existing:
+                state.contradictions.append(Contradiction(claim_ids=ids, description=description, severity=_clamp(cs.severity), suspected_cause=cs.suspected_cause or "unknown"))
         for hu in interp.hypothesis_updates:
             for h in state.hypotheses:
                 if h.id == hu.hypothesis_id:
@@ -965,8 +994,14 @@ class Executive:
             state.learned_lessons.append(Lesson(statement=ls, category="failure"))
         for cid in interp.criteria_satisfied:
             for c in state.success_criteria:
-                if c.id == cid and c.verification_ids:
+                if c.id != cid:
+                    continue
+                # The runtime, not the model, owns criterion satisfaction: an assertion is
+                # honoured only when a verification record for it actually passed.
+                if state.passing_verifications(c.verification_ids):
                     c.satisfied = True
+                else:
+                    self.tracer.emit("verify", f"ignored unverified claim that criterion {cid} is satisfied", data={"criterion_id": cid, "verification_ids": c.verification_ids})
         # Task updates from the model, subject to runtime rules.
         seen_task_update = False
         for tu in interp.task_updates:
@@ -1173,8 +1208,29 @@ class Executive:
                 t.status = TaskStatus.CANCELLED
                 t.failure_reason = f"prerequisite {task.id} abandoned"
 
+    MAX_REPLAN_DEPTH = 3
+    MAX_REPLANS_PER_CHAIN = 5
+
     def _replan_task(self, state: MissionState, planner: Planner, task: Task, error: str, kind: str) -> None:
-        """A structural failure needs a different strategy before the task is retried."""
+        """A structural failure needs a different strategy before the task is retried.
+
+        Replanning is bounded twice over: by the depth of the prerequisite chain it creates and
+        by the number of replans spent on one root task. Without both, each replacement task
+        brought a fresh attempt budget and its own replan budget, so the plan never exhausted.
+        """
+        controller = state.resources.setdefault("controller", {})
+        chain_counts: dict[str, int] = controller.setdefault("task_replans", {})
+        root = str(task.parameters.get("_replan_root") or task.id)
+        depth = int(task.parameters.get("_replan_depth", 0))
+        spent = int(chain_counts.get(root, 0))
+        if depth >= self.MAX_REPLAN_DEPTH or spent >= self.MAX_REPLANS_PER_CHAIN:
+            reason = f"replanning exhausted for this branch (depth {depth}, {spent} replans on {root})"
+            self.tracer.emit("failure", f"abandoning '{task.title[:60]}': {reason}", data={"task_id": task.id, "root": root, "depth": depth, "replans": spent})
+            task.attempts = max(task.attempts, task.max_attempts)
+            task.failure_reason = f"{task.failure_reason} | {reason}".strip(" |")[:300]
+            self._cancel_dependents(state, task)
+            return
+        chain_counts[root] = spent + 1
         metadata = {"failed_task": self._task_view(task), "error": error[:500], "failure_kind": kind, "criteria": [{"id": c.id, "description": c.description, "satisfied": c.satisfied} for c in state.success_criteria], "tests": [t.model_dump(mode="json") for t in state.tests[-3:]], "blocked": [b.model_dump(mode="json") for b in state.blocked_operations if not b.resolved]}
         prompt = "MISSION: " + state.objective + "\n\nTASK FAILED STRUCTURALLY:\n" + json.dumps(metadata, default=str)[:12_000] + "\n\nPropose the minimal new tasks that change strategy (they will become prerequisites of the failed task, which is then retried), or explain what blocks it. Return the Replan JSON."
         req = CognitionRequest(kind="replan", system_prompt=PROMPTS["replan"], prompt=prompt, schema_name="Replan", output_schema=schema_for(Replan), model=self.config.executive.model, timeout_seconds=self.config.executive.call_timeout_seconds, mission_id=state.mission_id, metadata=metadata)
@@ -1194,6 +1250,10 @@ class Executive:
             created = planner.add_tasks_from_specs(plan.new_tasks)
             created_ids = [t.id for t in created if task.id not in t.depends_on]
             if created_ids:
+                depth = int(task.parameters.get("_replan_depth", 0)) + 1
+                for t in created:
+                    t.parameters["_replan_depth"] = depth
+                    t.parameters["_replan_root"] = str(task.parameters.get("_replan_root") or task.id)
                 task.depends_on = sorted(set(task.depends_on + created_ids))
                 task.status = TaskStatus.PENDING
                 task.parameters["_strategy_note"] = f"strategy changed after: {error[:160]}"
@@ -1314,20 +1374,47 @@ class Executive:
         self.tracer.emit("blocked", f"executive unavailable: {error[:160]}", cycle=cycle_no, data={"executive_model": state.executive_model})
         return CycleResult(cycle_no, None, None, assessment, stop=True, stop_reason="executive unavailable")
 
+    DENIAL_ANSWERS = ("deny", "denied", "no", "refuse", "refused", "reject", "rejected", "do not", "don't")
+
     def _apply_grants(self, state: MissionState) -> None:
         for g in state.permissions.get("grants", []) or []:
             self.fabric.firewall.grant(str(g))
-        # Unblock tasks whose blocked operation is now authorised.
+        # Unblock tasks whose blocked operation is now authorised. Retry attempts stay bounded:
+        # a reactivated task that fails again still runs through retry_decision.
         for b in state.blocked_operations:
-            if not b.resolved and b.action_class.value in self.fabric.firewall.human_grants:
-                b.resolved = True
-                t = state.task(b.task_id) if b.task_id else None
-                if t and t.status == TaskStatus.BLOCKED:
+            if b.resolved or b.action_class.value not in self.fabric.firewall.human_grants:
+                continue
+            b.resolved = True
+            t = state.task(b.task_id) if b.task_id else None
+            if t and t.status == TaskStatus.BLOCKED:
+                if t.attempts >= t.max_attempts:
+                    t.status = TaskStatus.FAILED
+                    t.failure_reason = f"authorized after {t.attempts} attempts, but the attempt budget is exhausted"
+                else:
                     t.status = TaskStatus.PENDING
-                for hr in state.human_requests:
-                    if not hr.answered and b.action_class.value in hr.question:
-                        hr.answered = True
-                        hr.answer = "authorized"
+            for hr in state.human_requests:
+                if not hr.answered and b.action_class.value in hr.question:
+                    hr.answered = True
+                    hr.answer = "authorized"
+
+    def _record_denied_authorization(self, state: MissionState) -> None:
+        """An explicit refusal permanently closes the blocked operation and its task."""
+        for hr in state.human_requests:
+            if not hr.answered or hr.kind != "authorization":
+                continue
+            if not any(hr.answer.strip().lower().startswith(d) for d in self.DENIAL_ANSWERS):
+                continue
+            for b in state.blocked_operations:
+                if b.resolved or b.action_class.value not in hr.question:
+                    continue
+                b.resolved = True
+                b.what_would_unblock = f"denied by the human ({hr.answer[:80]}); this operation will not be retried"
+                t = state.task(b.task_id) if b.task_id else None
+                if t and t.status in (TaskStatus.BLOCKED, TaskStatus.PENDING, TaskStatus.READY):
+                    t.status = TaskStatus.CANCELLED
+                    t.failure_reason = "human denied the required authorization"
+                    self._cancel_dependents(state, t)
+                    self.tracer.emit("blocked", f"authorization denied; cancelled task '{t.title[:80]}'", data={"task_id": t.id, "action_class": b.action_class.value})
 
     def _scenario_from_state(self, state: MissionState) -> dict[str, Any]:
         """Build a scenario from hypotheses when the executive supplied none (scenario analysis, not fake precision)."""
@@ -1367,6 +1454,10 @@ class Executive:
             self.store.save_mission(state, "checkpoint")
         except Exception as exc:  # noqa: BLE001
             self.tracer.emit("error", f"checkpoint save failed: {exc}")
+
+
+def _normalise(text: str) -> str:
+    return " ".join(text.lower().split())
 
 
 def _clamp(x: Any) -> float:

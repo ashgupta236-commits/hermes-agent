@@ -132,3 +132,19 @@ Run: 2026-09-10, `python -m cogos eval --suite all` (scripted executive, offline
 
 Real-model validation (`--adapter claude_code`, `claude-fable-5-1`): mission compilation, step selection, interpretation, replanning, independent challenge and specialist runs were exercised end to end; see OPERATIONS.md to reproduce.
 
+## Adversarial review of the loop
+
+`tests/cogos/test_loop_hardening.py` and `tests/cogos/test_criteria_convergence.py` are regression
+tests for defects found by an adversarial review of `cogos/executive/loop.py`, each reproducing the
+original failure before pinning the fix:
+
+| Defect | Consequence before the fix |
+|---|---|
+| Answered-but-denied authorization reactivated the task | 200-cycle budget burned on one denied command |
+| `criteria_satisfied` accepted against a failed record | mission `COMPLETE` with no passing verification |
+| Reproduction run rewrote the test ledger to PASSED | a failing suite satisfied a "tests pass" criterion |
+| `_replan_task` chained replacements without a cap | plan never exhausted; state grew every cycle |
+| `VERIFY` with no `task_id` re-ran the criteria pass | dead verification ids accumulated; stall |
+| Contradiction dedupe bypassed for unresolvable ids | completion permanently blocked; subagent budget drained |
+| Verification records were never persisted | every "requires a record" gate was a non-empty-list check |
+| Invalidating events did not demote a claim | stale claims kept satisfying criteria |

@@ -165,16 +165,9 @@ class Runtime:
         state.permission_state["grants"] = list(state.permissions["grants"])
         if state.status in (MissionStatus.BLOCKED_EXTERNAL, MissionStatus.PAUSED):
             state.status = MissionStatus.ACTIVE
-        for b in state.blocked_operations:
-            if not b.resolved and b.action_class.value == action_class:
-                b.resolved = True
-                t = state.task(b.task_id) if b.task_id else None
-                if t and t.status == TaskStatus.BLOCKED:
-                    t.status = TaskStatus.PENDING
-        for hr in state.human_requests:
-            if not hr.answered and action_class in hr.question:
-                hr.answered = True
-                hr.answer = "authorized"
+        # One implementation of "a grant unblocks this": the executive's, which also keeps
+        # the reactivated task inside its attempt budget.
+        self.executive._apply_grants(state)
         self.store.save_mission(state, "authorized", {"action_class": action_class})
         self.tracer.set_mission(mission_id)
         self.tracer.emit("event", f"human authorized action class '{action_class}'", data={"action_class": action_class})

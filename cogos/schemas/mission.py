@@ -11,6 +11,7 @@ from cogos.ids import iso_now, new_id
 from cogos.schemas.beliefs import Claim, Contradiction, Evidence, Hypothesis
 from cogos.schemas.common import ActionClass, EpistemicStatus, Provenance, VerificationStatus
 from cogos.schemas.decisions import Decision
+from cogos.schemas.verification import VerificationResult
 from cogos.schemas.world import WorldModel
 
 
@@ -159,6 +160,10 @@ class TestRecord(BaseModel):
     summary: str = ""
     ran_at: Optional[str] = None
     task_id: Optional[str] = None
+    expected_failure: bool = Field(
+        default=False,
+        description="A reproduction run: a FAILED status here is the desired observation, so this record is never evidence that tests pass.",
+    )
 
 
 class Lesson(BaseModel):
@@ -247,6 +252,7 @@ class MissionState(BaseModel):
     blocked_operations: list[BlockedOperation] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
     tests: list[TestRecord] = Field(default_factory=list)
+    verifications: list[VerificationResult] = Field(default_factory=list)
     learned_lessons: list[Lesson] = Field(default_factory=list)
     candidate_skills: list[CandidateSkill] = Field(default_factory=list)
     human_requests: list[HumanRequest] = Field(default_factory=list)
@@ -276,6 +282,21 @@ class MissionState(BaseModel):
             if c.id == claim_id:
                 return c
         return None
+
+    def verification(self, verification_id: str) -> Optional[VerificationResult]:
+        for v in self.verifications:
+            if v.id == verification_id:
+                return v
+        return None
+
+    def passing_verifications(self, ids: list[str]) -> list[VerificationResult]:
+        """Resolve ids to records that actually passed. Unknown ids resolve to nothing."""
+        out = []
+        for vid in ids:
+            v = self.verification(vid)
+            if v is not None and v.status == VerificationStatus.PASSED:
+                out.append(v)
+        return out
 
     def evidence_item(self, evidence_id: str) -> Optional[Evidence]:
         for e in self.evidence:

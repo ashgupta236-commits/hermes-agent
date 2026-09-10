@@ -186,3 +186,24 @@ The runtime now converges instead:
 
 The completion gate is unchanged: an undecidable criterion is an unsatisfied criterion, so the
 mission cannot be marked `COMPLETE`.
+
+## A denial is an answer, and it is final
+
+Answering a human request is not consent. `Executive._record_denied_authorization` reads the answer
+text: an explicit refusal ("deny", "no", "reject", …) resolves the blocked operation permanently,
+cancels the task that needed it and its dependents, and records why. Only an actual authorization
+grant (`cogos authorize <mission> <action_class>`, or `--grant` on an answer) unblocks work, through
+the single implementation in `Executive._apply_grants` — which also refuses to reactivate a task
+whose attempt budget is already spent.
+
+This replaced a rule that reactivated a task whenever *any* related request had been answered. A
+denied destructive command was retried, re-blocked and re-requested every cycle, consuming a whole
+200-cycle budget while no other work advanced.
+
+## Replanning is bounded in two dimensions
+
+`_replan_task` inserts new prerequisite tasks when a task fails structurally. Each insertion is
+bounded by `MAX_REPLAN_DEPTH` (how deep a chain of replacements may go) and `MAX_REPLANS_PER_CHAIN`
+(how many replans one root task may consume, tracked in `resources["controller"]["task_replans"]`).
+Without both, every replacement task arrived with a fresh attempt budget *and* a fresh replan
+budget, so the plan never exhausted and the mission could never reach synthesis or completion.

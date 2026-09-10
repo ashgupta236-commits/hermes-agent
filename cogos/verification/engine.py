@@ -26,6 +26,7 @@ from cogos.schemas.common import VerificationStatus
 from cogos.schemas.decisions import Decision
 from cogos.schemas.mission import Artifact, MissionState, SuccessCriterion, Task, TaskStatus, TestRecord
 from cogos.schemas.tools import ToolCall
+from cogos.schemas.verification import VerificationCheck, VerificationResult
 from cogos.tools.fabric import ToolFabric
 
 PASSED = VerificationStatus.PASSED
@@ -59,24 +60,6 @@ _JSON_TYPES: dict[str, tuple[type, ...]] = {
 }
 
 
-class VerificationCheck(BaseModel):
-    name: str
-    status: VerificationStatus
-    detail: str = ""
-
-
-class VerificationResult(BaseModel):
-    id: str = Field(default_factory=lambda: new_id("ver"))
-    target_type: str = Field(description="task|criterion|claim|artifact|code|data|decision|mission")
-    target_id: str
-    status: VerificationStatus
-    summary: str
-    checks: list[VerificationCheck] = Field(default_factory=list)
-    evidence_ids: list[str] = Field(default_factory=list)
-    ran_at: str = Field(default_factory=iso_now)
-
-    def failed_checks(self) -> list[VerificationCheck]:
-        return [c for c in self.checks if c.status == FAILED]
 
 
 # --- helpers ---------------------------------------------------------------------
@@ -163,8 +146,15 @@ class VerificationEngine:
         self.state = state
         self.results: list[VerificationResult] = []
 
+    MAX_DURABLE_VERIFICATIONS = 500
+
     def record(self, result: VerificationResult) -> VerificationResult:
+        """Persist a verification record into mission state so gates can resolve it later."""
         self.results.append(result)
+        if self.state is not None:
+            if not any(v.id == result.id for v in self.state.verifications):
+                self.state.verifications.append(result)
+            del self.state.verifications[: -self.MAX_DURABLE_VERIFICATIONS]
         return result
 
     # -- code -----------------------------------------------------------------------
@@ -413,11 +403,11 @@ class VerificationEngine:
         created_ms = _id_timestamp_ms(criterion.id) or 0
 
         if re.search(r"\b(tests?|pytest|unit\s*tests?)\b", method):
-            fresh = [t for t in self.state.tests if t.status == PASSED and (_iso_to_ms(t.ran_at) or -1) >= created_ms]
+            fresh = [t for t in self.state.tests if t.status == PASSED and not t.expected_failure and (_iso_to_ms(t.ran_at) or -1) >= created_ms]
             if fresh:
                 checks.append(VerificationCheck(name="tests", status=PASSED, detail=f"{len(fresh)} passed test record(s) newer than criterion: " + ", ".join(t.name for t in fresh[:3])))
             else:
-                checks.append(VerificationCheck(name="tests", status=FAILED, detail="no passed test record newer than the criterion"))
+                checks.append(VerificationCheck(name="tests", status=FAILED, detail="no passed (non-reproduction) test record newer than the criterion"))
 
         if "artifact" in method:
             matches = [a for a in self.state.artifacts if a.verified and token_overlap(criterion.description, f"{a.name} {a.summary}") >= TOKEN_OVERLAP_THRESHOLD]
@@ -457,7 +447,11 @@ class VerificationEngine:
             checks=checks,
             evidence_ids=sorted(set(evidence_ids)),
         )
-        criterion.verification_ids.append(result.id)
+        # Only a passing record is citable evidence. A failed or inconclusive attempt is still
+        # persisted (see record()), but citing it would turn the completion gate into a
+        # has-this-been-attempted check.
+        if status == PASSED and result.id not in criterion.verification_ids:
+            criterion.verification_ids.append(result.id)
         return self.record(result)
 
     # -- decisions ------------------------------------------------------------------
@@ -551,12 +545,14 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
     checks: list[VerificationCheck] = []
     missing: list[str] = []
 
-    unverified = [c for c in state.success_criteria if not (c.satisfied and c.verification_ids)]
+    # A criterion counts as verified only when an id on it resolves to a PASSED record in
+    # durable state. A non-empty id list is not evidence of anything.
+    unverified = [c for c in state.success_criteria if not (c.satisfied and state.passing_verifications(c.verification_ids))]
     if not state.success_criteria:
         checks.append(VerificationCheck(name="success_criteria", status=INCONCLUSIVE, detail="mission declares no success criteria"))
         missing.append("no success criteria declared")
     elif unverified:
-        detail = "; ".join(f"'{c.description}'" + (" (unverified)" if not c.verification_ids else " (not satisfied)") for c in unverified)
+        detail = "; ".join(f"'{c.description}'" + (" (no passing verification record)" if not state.passing_verifications(c.verification_ids) else " (not satisfied)") for c in unverified)
         checks.append(VerificationCheck(name="success_criteria", status=FAILED, detail=detail))
         missing.append(f"{len(unverified)} of {len(state.success_criteria)} success criteria not verified: {detail}")
     else:
@@ -565,6 +561,8 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
     # Only the latest record per test command counts: a fixed failure is not a failure.
     latest: dict[str, Any] = {}
     for rec in state.tests:
+        if rec.expected_failure:
+            continue  # a reproduction run is evidence the bug exists, never that the suite passes
         latest[rec.name] = rec
     failing_tests = [t for t in latest.values() if t.status == FAILED]
     if failing_tests:
