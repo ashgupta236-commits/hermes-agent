@@ -161,3 +161,28 @@ Additional enforcement outside the gate:
 On a passed gate `_attribute` sets `COMPLETE`, `timestamps.completed_at`, traces `complete`, and
 `Runtime.run` proposes a candidate skill. Scenario `J_completion_integrity` asserts that an
 executive which keeps selecting `complete_mission` with buggy code is refused every time.
+
+## Criteria that deterministic checks cannot decide
+
+`VerificationEngine.verify_criterion` decides a criterion from test records, verified artifacts and
+supported claims. A criterion whose `verification_method` names none of those (for example
+"reviewer judgement of overall quality") returns `inconclusive`, and an inconclusive criterion used
+to make the executive re-select `verify` indefinitely — observed as a six-cycle stall during
+real-model validation.
+
+The runtime now converges instead:
+
+1. `Executive._judge_criterion` asks the executive for a `VerificationJudgment` over the
+   deterministic checks plus the relevant state (artifacts, test records, ranked claims, unresolved
+   contradictions, completed tasks).
+2. A judgement satisfies the criterion **only** when it is `passed`, its confidence is at least
+   0.7, *and* it names the properties it actually checked. "Looks right" with an empty `checked`
+   list never satisfies a criterion — a test pins this.
+3. A `failed` judgement marks the criterion unsatisfied with the stated issues.
+4. A judgement that is itself inconclusive twice records the criterion in
+   `resources["controller"]["undecidable_criteria"]`. `_criteria_pass_useful` then stops selecting
+   the criteria pass for it, so the executive replans or reports the criterion honestly rather than
+   re-verifying an unchanged state.
+
+The completion gate is unchanged: an undecidable criterion is an unsatisfied criterion, so the
+mission cannot be marked `COMPLETE`.

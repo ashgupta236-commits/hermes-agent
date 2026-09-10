@@ -373,7 +373,7 @@ class Executive:
             "contradictions": [c.model_dump(mode="json") for c in state.unresolved_contradictions()[:5]],
             "directives": assessment.directives,
             "verification_pending": verification_pending,
-            "criteria_verification_pending": any(not c.satisfied for c in state.success_criteria) and planner.is_plan_exhausted() and not verification_pending and state.resources.get("controller", {}).get("criteria_checked_sig") != self._criteria_sig(state),
+            "criteria_verification_pending": self._criteria_pass_useful(state, planner, verification_pending),
             "synthesis_exists": bool(state.synthesis),
             "human_requests": [h.model_dump(mode="json") for h in state.unanswered_human_requests()],
             "independent_work_remaining": bool(ready),
@@ -407,6 +407,17 @@ class Executive:
         if decision.task_id and state.task(decision.task_id) is None:
             decision.task_id = ""
         return decision
+
+    def _criteria_pass_useful(self, state: MissionState, planner: Planner, verification_pending: list[str]) -> bool:
+        """A criteria pass is only worth running when it can still change something."""
+        open_criteria = [c for c in state.success_criteria if not c.satisfied]
+        if not open_criteria or verification_pending or not planner.is_plan_exhausted():
+            return False
+        controller = state.resources.get("controller", {})
+        if controller.get("criteria_checked_sig") == self._criteria_sig(state):
+            return False  # nothing has changed since the last pass
+        undecidable = set(controller.get("undecidable_criteria", []))
+        return not all(c.id in undecidable for c in open_criteria)
 
     @staticmethod
     def _criteria_sig(state: MissionState) -> list[int]:
@@ -658,7 +669,12 @@ class Executive:
             for c in state.success_criteria:
                 if c.satisfied:
                     continue
-                checks.append(engine.verify_criterion(c, evidence_ok=self._runtime_criterion_evidence(state, c)))
+                res = engine.verify_criterion(c, evidence_ok=self._runtime_criterion_evidence(state, c))
+                if res.status == VerificationStatus.INCONCLUSIVE:
+                    # A criterion the deterministic checks cannot decide is resolved by an
+                    # independent executive judgement over the evidence, not left to loop.
+                    res = self._judge_criterion(state, c, res, engine)
+                checks.append(res)
             state.resources.setdefault("controller", {})["criteria_checked_sig"] = self._criteria_sig(state)
             if checks:
                 failed = [c for c in checks if c.status != VerificationStatus.PASSED]
@@ -676,21 +692,31 @@ class Executive:
         self.tracer.emit("verify", f"{result.target_type}:{result.target_id} {result.status.value} — {result.summary[:160]}", data=result.model_dump(mode="json"))
         return result
 
-    def _judge_verification(self, state: MissionState, task: Task, result: VerificationResult) -> VerificationResult:
-        """Independent executive judgement over inconclusive deterministic checks (never over failed ones)."""
+    def _judge(self, state: MissionState, target: str, detail: str, result: VerificationResult, extra: Optional[dict[str, Any]] = None) -> Optional[Any]:
+        """Ask the executive to judge deterministic checks it cannot decide. Returns a VerificationJudgment or None."""
         from cogos.schemas.cognition import VerificationJudgment
 
         checks = [c.model_dump(mode="json") for c in result.checks]
-        req = CognitionRequest(kind="verify", system_prompt=PROMPTS["verify"], prompt=f"MISSION: {state.objective}\n\nTARGET: task '{task.title}' — {task.description}\nRESULT SUMMARY: {task.result_summary[:500]}\n\nDETERMINISTIC CHECKS:\n{json.dumps(checks, default=str)[:8000]}\n\nJudge whether the target meets its requirement. Return the VerificationJudgment JSON.", schema_name="VerificationJudgment", output_schema=schema_for(VerificationJudgment), model=self.config.executive.model, mission_id=state.mission_id, metadata={"checks": checks, "task": self._task_view(task)})
+        prompt = f"MISSION: {state.objective}\n\nTARGET: {target}\n{detail}\n\nDETERMINISTIC CHECKS (already run by the runtime):\n{json.dumps(checks, default=str)[:8000]}"
+        if extra:
+            prompt += "\n\nSTATE EVIDENCE:\n" + json.dumps(extra, default=str)[:8000]
+        prompt += "\n\nJudge whether the target meets its requirement. List exactly which properties you checked. Return the VerificationJudgment JSON."
+        req = CognitionRequest(kind="verify", system_prompt=PROMPTS["verify"], prompt=prompt, schema_name="VerificationJudgment", output_schema=schema_for(VerificationJudgment), model=self.config.executive.model, mission_id=state.mission_id, metadata={"checks": checks, "target": target})
         try:
             resp = self._cognition(state, req)
         except ExecutiveUnavailable:
-            return result
+            return None
         if not resp.ok:
-            return result
+            return None
         try:
-            judgment = VerificationJudgment.model_validate(resp.parsed)
+            return VerificationJudgment.model_validate(resp.parsed)
         except Exception:  # noqa: BLE001
+            return None
+
+    def _judge_verification(self, state: MissionState, task: Task, result: VerificationResult) -> VerificationResult:
+        """Independent executive judgement over inconclusive deterministic checks (never over failed ones)."""
+        judgment = self._judge(state, f"task '{task.title}' — {task.description}", f"RESULT SUMMARY: {task.result_summary[:500]}", result)
+        if judgment is None:
             return result
         if judgment.status == "passed" and judgment.confidence >= 0.7 and judgment.checked:
             result.status = VerificationStatus.PASSED
@@ -698,6 +724,46 @@ class Executive:
         elif judgment.status == "failed":
             result.status = VerificationStatus.FAILED
             result.summary = f"executive judgement failed: {judgment.summary[:160]}; issues: {'; '.join(judgment.issues[:3])}"
+        return result
+
+    def _judge_criterion(self, state: MissionState, criterion: Any, result: VerificationResult, engine: VerificationEngine) -> VerificationResult:
+        """Resolve a criterion the deterministic checks cannot decide, so the loop converges.
+
+        The judgement is bounded by the same rules as everywhere else: it may satisfy a criterion
+        only with named checks and high confidence, and a failed judgement marks it unsatisfied.
+        A repeated inconclusive judgement records the criterion as undecidable so the executive
+        stops re-verifying it and either replans or reports it honestly.
+        """
+        extra = {
+            "artifacts": [{"name": a.name, "path": a.path, "verified": a.verified, "summary": a.summary[:160]} for a in state.artifacts[-10:]],
+            "tests": [{"name": t.name, "status": t.status.value, "summary": t.summary[:160]} for t in state.tests[-6:]],
+            "claims": [{"proposition": c.proposition[:200], "status": c.status.value, "confidence": c.confidence, "independent_roots": c.source_independence} for c in sorted(state.claims, key=lambda c: -c.decision_relevance)[:10]],
+            "unresolved_contradictions": [c.description[:160] for c in state.unresolved_contradictions()],
+            "completed_tasks": [t.title for t in state.completed_tasks()[-10:]],
+        }
+        judgment = self._judge(state, f"success criterion '{criterion.description}'", f"VERIFICATION METHOD: {criterion.verification_method or '(unspecified)'}", result, extra)
+        controller = state.resources.setdefault("controller", {})
+        undecidable: list[str] = controller.setdefault("undecidable_criteria", [])
+        if judgment is None or judgment.status == "inconclusive" or (judgment.status == "passed" and not judgment.checked):
+            if criterion.id in undecidable:
+                result.summary = f"criterion '{criterion.description[:80]}' is not decidable from available evidence (recorded; will not be re-verified)"
+                self.tracer.emit("verify", f"criterion undecidable: {criterion.description[:120]}", data={"criterion_id": criterion.id})
+            else:
+                undecidable.append(criterion.id)
+            return result
+        if judgment.status == "passed" and judgment.confidence >= 0.7:
+            criterion.satisfied = True
+            result.status = VerificationStatus.PASSED
+            result.summary = f"criterion satisfied by executive judgement ({judgment.confidence:.2f}): {judgment.summary[:160]}; checked: {', '.join(judgment.checked[:5])}"
+            if criterion.id in undecidable:
+                undecidable.remove(criterion.id)
+            engine.record(result)
+            if result.id not in criterion.verification_ids:
+                criterion.verification_ids.append(result.id)
+        elif judgment.status == "failed":
+            criterion.satisfied = False
+            result.status = VerificationStatus.FAILED
+            result.summary = f"criterion not met: {judgment.summary[:160]}; issues: {'; '.join(judgment.issues[:3])}"
         return result
 
     def _runtime_criterion_evidence(self, state: MissionState, criterion: Any) -> Optional[bool]:
