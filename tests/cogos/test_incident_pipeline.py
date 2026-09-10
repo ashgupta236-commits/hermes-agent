@@ -1153,20 +1153,26 @@ def test_a_symlink_repointed_after_verification_is_detected(tmp_path):
 
 
 def test_ver1_a_composed_command_cannot_forge_test_evidence(tmp_path):
-    """Reproduced against the repair: `pytest -q > /dev/null 2>&1; echo "1 passed in 0.02s"` named
-    a real runner, discarded its real failing output and printed a convincing summary, producing a
-    PASSED record with one fabricated test. Detecting the runner from the command is not enough —
-    the command is model-authored, and the firewall classifies danger, not truthfulness."""
-    _write(tmp_path, "test_x.py", "def test_fails():\n    assert False\n")
+    """Reproduced against the repair: a command that merely mentions a runner and then prints a
+    summary produced a PASSED record with a fabricated test. Detecting the runner from the command
+    is not enough — the command is model-authored, and the firewall classifies danger, not
+    truthfulness.
+
+    The command here is deliberately chosen to isolate *this* guard: it names a runner, it is
+    composed, its output holds exactly one summary line, and it writes nowhere — so neither the
+    ambiguous-summary rule nor the firewall's write-target rule can account for the outcome. (An
+    earlier version of this test used `> /dev/null`, which the firewall denies as a write outside
+    the workspace, so it passed without ever reaching the guard it was named for.)"""
     state = MissionState(objective="forgery via composition")
     engine = VerificationEngine(_fabric(tmp_path), state)
 
-    res = engine.verify_code([f'{sys.executable} -m pytest -q > /dev/null 2>&1; echo "1 passed in 0.02s"'], cwd=str(tmp_path))
+    res = engine.verify_code(['echo pytest && echo "7 passed in 0.42s"'], cwd=str(tmp_path))
 
     assert res.status != PASSED, f"a composed command's stdout is not test evidence: {res.summary}"
     rec = state.tests[-1]
     assert rec.framework == "unknown"
     assert rec.executed == 0, f"fabricated counts must not be recorded as real: {rec.counts}"
+    assert "attributable" in rec.outcome_reason
 
 
 def test_ver1b_legitimate_simple_runner_commands_still_pass_and_fail_correctly(tmp_path):
