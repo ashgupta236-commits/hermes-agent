@@ -1,0 +1,908 @@
+{
+ "mission_id": "msn_1m26h69c9f8291511",
+ "status": "paused",
+ "objective": "Build the feature described in REQUIREMENTS.md.",
+ "elapsed_seconds": 3351.7,
+ "completion_gate": "failed",
+ "gate_summary": "completion blocked: 4 of 5 success criteria not verified: 'calc.py exists at project root and defines add_percent(value: float, percent: float) -> float with type hints' (no passing verification record bound to it); 'add_percent returns value increased by percent percent, rounded to 2 decimals (e.g. add_percent(100, 10) == 110.0, add_percent(100, 0) == 100.0, add_percent(200, -25) == 150.0, add_percent(10, 3.333) == 10.33)' (no passing verification record bound to it); 'test_calc.py exists with tests covering a positive, a zero, and a negative percent' (no passing verification record bound to it); 'Rounding edge case handled by an additional test (e.g. result needing 2-decimal rounding)' (no passing verification record bound to it) | unresolved contradictions with severity >= 0.5: ctr_1m26",
+ "gate_checks": [
+  {
+   "name": "success_criteria",
+   "status": "failed",
+   "detail": "'calc.py exists at project root and defines add_percent(value: float, percent: float) -> float with type hints' (no passing verification record bound to it); 'add_percent returns value increased by percent percent, rounded to 2 decimals (e.g. add_percent(100, 10) == 110.0, add_percent(100, 0) == 100.0, add_percent(200, -25) == 150.0, add_percent(10, 3.333) == 10.33)' (no passing verification recor"
+  },
+  {
+   "name": "tests",
+   "status": "passed",
+   "detail": "2 test record(s), none failing"
+  },
+  {
+   "name": "contradictions",
+   "status": "failed",
+   "detail": "ctr_1m26j7cwd6aa00b46 (severity 0.70)"
+  },
+  {
+   "name": "blocked_operations",
+   "status": "passed",
+   "detail": "no unresolved blocked operations on unfinished tasks"
+  },
+  {
+   "name": "human_requests",
+   "status": "passed",
+   "detail": "no blocking unanswered human requests"
+  },
+  {
+   "name": "artifact_integrity",
+   "status": "skipped",
+   "detail": "no verified artifacts to re-check"
+  },
+  {
+   "name": "required_artifacts",
+   "status": "failed",
+   "detail": "missing or unverified: /tmp/cogos-live-run-2/calc.py, /tmp/cogos-live-run-2/test_calc.py"
+  }
+ ],
+ "provenance": {
+  "captured_at": "2026-09-10T20:47:17.389+00:00",
+  "git_commit": "03f059587f5e75e43466bdabeacb3e325a55790b",
+  "git_branch": "claude/autonomous-cognitive-os-og6r0p",
+  "git_dirty": false,
+  "dirty_files": [],
+  "adapter": "claude_code",
+  "adapter_version": "2.1.267 (Claude Code)",
+  "model_requested": "claude-fable-5-1",
+  "config_hash": "5e690996965e936b",
+  "mission_schema_version": 1,
+  "python_version": "3.11.15",
+  "platform": "Linux-6.18.44-fc-v24-x86_64-with-glibc2.39",
+  "workspace": "/tmp/cogos-live-run-2",
+  "workspace_commit": ""
+ },
+ "run_segments": [
+  {
+   "captured_at": "2026-09-10T20:47:17.430+00:00",
+   "git_commit": "03f059587f5e75e43466bdabeacb3e325a55790b",
+   "git_branch": "claude/autonomous-cognitive-os-og6r0p",
+   "git_dirty": false,
+   "dirty_files": [],
+   "adapter": "claude_code",
+   "adapter_version": "2.1.267 (Claude Code)",
+   "model_requested": "claude-fable-5-1",
+   "config_hash": "5e690996965e936b",
+   "mission_schema_version": 1,
+   "python_version": "3.11.15",
+   "platform": "Linux-6.18.44-fc-v24-x86_64-with-glibc2.39",
+   "workspace": "/tmp/cogos-live-run-2",
+   "workspace_commit": "",
+   "started_at_cycle": 0,
+   "spend_at_start_usd": 0.0
+  }
+ ],
+ "budget": {
+  "max_cycles": 30,
+  "max_model_calls": 80,
+  "max_subagents": 12,
+  "max_cost_usd": 12.0,
+  "max_wall_clock_seconds": 3600.0
+ },
+ "usage": {
+  "model_calls": 23,
+  "input_tokens": 213018,
+  "output_tokens": 147408,
+  "tool_calls": 11,
+  "retries": 0,
+  "subagents_spawned": 1,
+  "network_requests": 0,
+  "wall_clock_seconds": 3351.6661752420077,
+  "estimated_cost_usd": 10.474901500000001,
+  "cycles": 10
+ },
+ "executive_model": "claude-fable-5-1",
+ "criteria": [
+  {
+   "id": "sc_1m26h69c9fa1cad56",
+   "description": "calc.py exists at project root and defines add_percent(value: float, percent: float) -> float with type hints",
+   "satisfied": false,
+   "verification_method": "inspect_files on /tmp/cogos-live-run-2/calc.py; import and check signature via inspect.signature",
+   "verification_ids": []
+  },
+  {
+   "id": "sc_1m26h69c9d8a220cc",
+   "description": "add_percent returns value increased by percent percent, rounded to 2 decimals (e.g. add_percent(100, 10) == 110.0, add_percent(100, 0) == 100.0, add_percent(200, -25) == 150.0, add",
+   "satisfied": false,
+   "verification_method": "execute_code: run the examples and independent spot checks via python -c",
+   "verification_ids": []
+  },
+  {
+   "id": "sc_1m26h69c9de72db53",
+   "description": "test_calc.py exists with tests covering a positive, a zero, and a negative percent",
+   "satisfied": false,
+   "verification_method": "inspect_files: confirm three distinct test functions/cases exist for the three categories",
+   "verification_ids": []
+  },
+  {
+   "id": "sc_1m26h69c93c46c4d5",
+   "description": "Full test suite passes",
+   "satisfied": true,
+   "verification_method": "run /home/user/hermes-agent/.venv/bin/python -m pytest -q in /tmp/cogos-live-run-2 and confirm exit code 0 with >=3 tests passed",
+   "verification_ids": [
+    "ver_1m26hwf9c6a0124ce"
+   ]
+  },
+  {
+   "id": "sc_1m26h69c96379d9fc",
+   "description": "Rounding edge case handled by an additional test (e.g. result needing 2-decimal rounding)",
+   "satisfied": false,
+   "verification_method": "pytest run includes a rounding test that passes",
+   "verification_ids": []
+  }
+ ],
+ "verifications": [
+  {
+   "id": "ver_1m26hqkc2959f75da",
+   "target_type": "task",
+   "target_id": "task_1m26hpxfw06de9490",
+   "status": "failed",
+   "summary": "executive judgement failed: The task result is empty: no pytest output, no exit code, no `command -v pytest` result, no shebang/interpreter bytes, and no evidence the run happened from /tm; issues: RESULT SUMMARY is empty \u2014 no artifact to evaluate.; No evidence the `pytest` executable (as opposed to",
+   "checks": [
+    {
+     "name": "output",
+     "status": "inconclusive",
+     "detail": "no verifiable output declared"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26ht0stf972d351",
+   "target_type": "task",
+   "target_id": "task_1m26hs2c77b43f130",
+   "status": "failed",
+   "summary": "executive judgement failed: The task required three concrete observable outputs (the literal line COGOS_PROBE_OK, the cwd, and an exit-code line). The result summary is empty and the runti; issues: Result summary is empty: no COGOS_PROBE_OK line present; No cwd line present in the result; No exit-co",
+   "checks": [
+    {
+     "name": "output",
+     "status": "inconclusive",
+     "detail": "no verifiable output declared"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26hwf9bb61df549",
+   "target_type": "code",
+   "target_id": "task_1m26h69c9628e9e76",
+   "status": "passed",
+   "summary": "1/1 commands passed, 0 failed, 0 inconclusive; tests: 12 passed, 0 failed, 0 errors",
+   "checks": [
+    {
+     "name": "/home/user/hermes-agent/.venv/bin/python -m pytest -q",
+     "status": "passed",
+     "detail": "12 passed"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26hwf9c6a0124ce",
+   "target_type": "criterion",
+   "target_id": "sc_1m26h69c93c46c4d5",
+   "status": "passed",
+   "summary": "criterion 'Full test suite passes': 1 passed, 0 failed, 0 inconclusive, 0 skipped",
+   "checks": [
+    {
+     "name": "tests",
+     "status": "passed",
+     "detail": "1 passed test record(s) newer than criterion: /home/user/hermes-agent/.venv/bin/python -m pytest -q"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26hx9rc493b844d",
+   "target_type": "code",
+   "target_id": "task_1m26h69cae99fda58",
+   "status": "passed",
+   "summary": "1/1 commands passed, 0 failed, 0 inconclusive; tests: 0 passed, 0 failed, 0 errors",
+   "checks": [
+    {
+     "name": "/home/user/hermes-agent/.venv/bin/python -c \"import inspect, calc; print(inspect.signature(calc.add_percent)); print(calc.add_percent(50, 7.5), calc.add_percent(1, 0.001), calc.add_percent(-100, 10))\"",
+     "status": "passed",
+     "detail": "53.75 1.0 -110.0"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26hx9rc10cfe5e0",
+   "target_type": "criterion",
+   "target_id": "sc_1m26h69c9fa1cad56",
+   "status": "inconclusive",
+   "summary": "criterion 'calc.py exists at project root and defines add_percent(value: float, percent: float) -> float with type hints': 0 passed, 0 failed, 1 inconclusive, 0 skipped",
+   "checks": [
+    {
+     "name": "method",
+     "status": "inconclusive",
+     "detail": "verification method 'inspect_files on /tmp/cogos-live-run-2/calc.py; import and check signature via inspect.signature' is not machine-checkable and no evidence_ok was supplied"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26hx9rce72c5d55",
+   "target_type": "criterion",
+   "target_id": "sc_1m26h69c9d8a220cc",
+   "status": "inconclusive",
+   "summary": "criterion 'add_percent returns value increased by percent percent, rounded to 2 decimals (e.g. add_percent(100, 10) == 110.0, add_percent(100, 0) == 100.0, add_percent(200, -25) == 150.0, add_percent(10, 3.333) == 10.33)': 0 passed, 0 failed, 1 inconclusive, 0 skipped",
+   "checks": [
+    {
+     "name": "method",
+     "status": "inconclusive",
+     "detail": "verification method 'execute_code: run the examples and independent spot checks via python -c' is not machine-checkable and no evidence_ok was supplied"
+    }
+   ]
+  },
+  {
+   "id": "ver_1m26hy0t6f6343cb1",
+   "target_type": "task",
+   "target_id": "task_1m26hpxfwd22f225e",
+   "status": "failed",
+   "summary": "executive judgement failed: The task's entire purpose was to put deterministic evidence into mission state (cat -n of calc.py and its test file, py_compile results, per-case rows comparing; issues: RESULT SUMMARY is empty: no cat -n output for calc.py or its test file, so docstring/cases/expected va",
+   "checks": [
+    {
+     "name": "output",
+     "status": "inconclusive",
+     "detail": "no verifiable output declared"
+    }
+   ]
+  }
+ ],
+ "artifacts": [],
+ "tests": [
+  {
+   "name": "/home/user/hermes-agent/.venv/bin/python -m pytest -q",
+   "status": "passed",
+   "summary": "12 passed"
+  },
+  {
+   "name": "/home/user/hermes-agent/.venv/bin/python -c \"import inspect, calc; print(inspect.signature(calc.add_percent)); print(calc.add_percent(50, 7.",
+   "status": "passed",
+   "summary": "53.75 1.0 -110.0"
+  }
+ ],
+ "anchor_assessments": [],
+ "holds": [],
+ "blocked_operations": [],
+ "human_requests": [],
+ "progress_book": {
+  "vector": [
+   1,
+   0,
+   2,
+   0,
+   4,
+   1,
+   7
+  ],
+  "cycles_flat": 0,
+  "spend_at_mark": 10.474901500000001,
+  "calls_at_mark": 22,
+  "detail": {
+   "criteria_with_receipts": 1,
+   "verified_artifacts": 0,
+   "passing_tests": 2,
+   "resolved_blockers": 0,
+   "resolved_unknowns": 4,
+   "settled_contradictions": 1,
+   "completed_tasks": 7
+  }
+ },
+ "controller_history": [
+  {
+   "cycle": 1,
+   "progress": 0.0,
+   "completed": 0,
+   "stalled_cycles": 0,
+   "uncertainty": 1.0,
+   "contradiction": 0,
+   "p_wrong": 0.1
+  },
+  {
+   "cycle": 2,
+   "progress": 0.062,
+   "completed": 1,
+   "stalled_cycles": 0,
+   "uncertainty": 0.333,
+   "contradiction": 0,
+   "p_wrong": 0.1
+  },
+  {
+   "cycle": 3,
+   "progress": 0.2,
+   "completed": 4,
+   "stalled_cycles": 0,
+   "uncertainty": 0.6,
+   "contradiction": 0.35,
+   "p_wrong": 0.17
+  },
+  {
+   "cycle": 4,
+   "progress": 0.154,
+   "completed": 4,
+   "stalled_cycles": 1,
+   "uncertainty": 0.6,
+   "contradiction": 0.35,
+   "p_wrong": 0.17
+  },
+  {
+   "cycle": 5,
+   "progress": 0.105,
+   "completed": 4,
+   "stalled_cycles": 2,
+   "uncertainty": 0.6,
+   "contradiction": 0.35,
+   "p_wrong": 0.17
+  },
+  {
+   "cycle": 6,
+   "progress": 0.232,
+   "completed": 5,
+   "stalled_cycles": 0,
+   "uncertainty": 0.6,
+   "contradiction": 0.35,
+   "p_wrong": 0.17
+  },
+  {
+   "cycle": 7,
+   "progress": 0.258,
+   "completed": 6,
+   "stalled_cycles": 0,
+   "uncertainty": 0.6,
+   "contradiction": 0.35,
+   "p_wrong": 0.17
+  },
+  {
+   "cycle": 8,
+   "progress": 0.236,
+   "completed": 6,
+   "stalled_cycles": 1,
+   "uncertainty": 0.6,
+   "contradiction": 0.35,
+   "p_wrong": 0.17
+  },
+  {
+   "cycle": 9,
+   "progress": 0.22,
+   "completed": 6,
+   "stalled_cycles": 2,
+   "uncertainty": 0.714,
+   "contradiction": 1.0,
+   "p_wrong": 0.3
+  },
+  {
+   "cycle": 10,
+   "progress": 0.235,
+   "completed": 7,
+   "stalled_cycles": 0,
+   "uncertainty": 0.429,
+   "contradiction": 1.0,
+   "p_wrong": 0.3
+  },
+  {
+   "cycle": 10,
+   "progress": 0.235,
+   "completed": 7,
+   "stalled_cycles": 1,
+   "uncertainty": 0.429,
+   "contradiction": 1.0,
+   "p_wrong": 0.3
+  }
+ ],
+ "falsified": [
+  "clm_1m26h8dnbad0a72e0"
+ ],
+ "task_replans": {
+  "task_1m26hpxfw06de9490": 2,
+  "task_1m26hpxfwd22f225e": 2
+ },
+ "contradictions": [
+  {
+   "id": "ctr_1m26hpxfs3bc06b35",
+   "severity": 0.35,
+   "resolved": true,
+   "claim_ids": [],
+   "description": "The same probe reports 'No module named pytest' for python and python3 yet 'pytest 9.0.2' for the bare pytest command \u2014 the question 'is pytest installed' is simultaneously answered false and true. [unresolved claim ids: In the runtime shell, pytest 9.0.2 is available only as a PATH executable: `pyt"
+  },
+  {
+   "id": "ctr_1m26j7cwdac879085",
+   "severity": 0.3,
+   "resolved": false,
+   "claim_ids": [
+    "clm_1m26h8dnbad0a72e0"
+   ],
+   "description": "Claim says feature scope is 'exactly three test cases' while verification ev_1m26hwf9eb1bd01fd reports 12 passing tests and REQUIREMENTS.md only requires coverage of three percent categories."
+  },
+  {
+   "id": "ctr_1m26j7cwd6aa00b46",
+   "severity": 0.7,
+   "resolved": false,
+   "claim_ids": [
+    "clm_1m26h8dna316a5403",
+    "clm_1m26hpxfrb733e108"
+   ],
+   "description": "Verification ev_1m26hwf9eb1bd01fd reports 12 passed; verification ev_1m26hx9re2506435b reports PASS with 0 passed/0 failed/0 errors (nothing collected). Both cannot describe the same command from the same cwd."
+  },
+  {
+   "id": "ctr_1m26jsch00beec295",
+   "severity": 0.15,
+   "resolved": false,
+   "claim_ids": [
+    "clm_1m26hpxfr826f0514",
+    "clm_1m26hpxfr6ccf34da"
+   ],
+   "description": "PATH pytest 9.0.2 runs while `python -m pytest` / `python3 -m pytest` fail with 'No module named pytest' under /usr/local/bin/python 3.11.15 \u2014 which interpreter/environment backs the pytest executable?"
+  }
+ ],
+ "cognition_calls": [
+  {
+   "cycle": 1,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2223,
+   "input_tokens": 7940,
+   "output_tokens": 1271
+  },
+  {
+   "cycle": 1,
+   "kind": "interpret",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.468,
+   "input_tokens": 10002,
+   "output_tokens": 5359
+  },
+  {
+   "cycle": 2,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.7008,
+   "input_tokens": 9164,
+   "output_tokens": 11571
+  },
+  {
+   "cycle": 2,
+   "kind": "interpret",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 1.6358,
+   "input_tokens": 10393,
+   "output_tokens": 30779
+  },
+  {
+   "cycle": 3,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2188,
+   "input_tokens": 9724,
+   "output_tokens": 1707
+  },
+  {
+   "cycle": 3,
+   "kind": "verify",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.1263,
+   "input_tokens": 4666,
+   "output_tokens": 659
+  },
+  {
+   "cycle": 3,
+   "kind": "replan",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2758,
+   "input_tokens": 6214,
+   "output_tokens": 3030
+  },
+  {
+   "cycle": 4,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2653,
+   "input_tokens": 9934,
+   "output_tokens": 2554
+  },
+  {
+   "cycle": 4,
+   "kind": "verify",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.1095,
+   "input_tokens": 4605,
+   "output_tokens": 893
+  },
+  {
+   "cycle": 4,
+   "kind": "replan",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2851,
+   "input_tokens": 6059,
+   "output_tokens": 4089
+  },
+  {
+   "cycle": 5,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2296,
+   "input_tokens": 10025,
+   "output_tokens": 1803
+  },
+  {
+   "cycle": 6,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2406,
+   "input_tokens": 10040,
+   "output_tokens": 2016
+  },
+  {
+   "cycle": 7,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2369,
+   "input_tokens": 10010,
+   "output_tokens": 1955
+  },
+  {
+   "cycle": 7,
+   "kind": "verify",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.1267,
+   "input_tokens": 4715,
+   "output_tokens": 1193
+  },
+  {
+   "cycle": 7,
+   "kind": "replan",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2713,
+   "input_tokens": 6933,
+   "output_tokens": 3464
+  },
+  {
+   "cycle": 8,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.2621,
+   "input_tokens": 10041,
+   "output_tokens": 2447
+  },
+  {
+   "cycle": 8,
+   "kind": "challenge",
+   "ok": false,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "claude reported an error without a message; subtype=error_max_turns, stop_reason=tool_use, terminal_reason=max_turns, num_turns=2, output_tokens=2152 but struct",
+   "cost_usd": 0.2599,
+   "input_tokens": 7614,
+   "output_tokens": 2152
+  },
+  {
+   "cycle": 8,
+   "kind": "interpret",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.6736,
+   "input_tokens": 19531,
+   "output_tokens": 7881
+  },
+  {
+   "cycle": 8,
+   "kind": "replan",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.3305,
+   "input_tokens": 7378,
+   "output_tokens": 4469
+  },
+  {
+   "cycle": 9,
+   "kind": "select",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 0.8633,
+   "input_tokens": 10186,
+   "output_tokens": 14412
+  },
+  {
+   "cycle": 9,
+   "kind": "interpret",
+   "ok": true,
+   "models_used": [
+    "claude-fable-5-1"
+   ],
+   "residency_ok": true,
+   "error": "",
+   "cost_usd": 1.9701,
+   "input_tokens": 16957,
+   "output_tokens": 34840
+  },
+  {
+   "cycle": 10,
+   "kind": "select",
+   "ok": false,
+   "models_used": [],
+   "residency_ok": true,
+   "error": "You're out of usage credits. Switch to another model to continue.",
+   "cost_usd": 0,
+   "input_tokens": 0,
+   "output_tokens": 0
+  }
+ ],
+ "escalation": [
+  {
+   "cycle": 1,
+   "tier": "L2_FULL",
+   "reasons": [
+    "untrusted content must be assessed, never absorbed",
+    "the task was chosen to resolve an open unknown"
+   ],
+   "operation": "inspect_files",
+   "seq": 11
+  },
+  {
+   "cycle": 2,
+   "tier": "L2_FULL",
+   "reasons": [
+    "1 tool call(s) failed: calculate",
+    "untrusted content must be assessed, never absorbed"
+   ],
+   "operation": "execute_code",
+   "seq": 27
+  },
+  {
+   "cycle": 8,
+   "tier": "L2_FULL",
+   "reasons": [
+    "operation 'falsify' exists to produce judgment"
+   ],
+   "operation": "falsify",
+   "seq": 106
+  },
+  {
+   "cycle": 9,
+   "tier": "L2_FULL",
+   "reasons": [
+    "untrusted content must be assessed, never absorbed",
+    "1 unresolved contradiction(s) above severity 0.5 may bear on this",
+    "the task was chosen to resolve an open unknown"
+   ],
+   "operation": "execute_code",
+   "seq": 124
+  },
+  {
+   "cycle": 10,
+   "tier": "L2_FULL",
+   "reasons": [
+    "operation 'direct_reasoning' exists to produce judgment"
+   ],
+   "operation": "direct_reasoning",
+   "seq": 138
+  }
+ ],
+ "assessments": [
+  {
+   "cycle": 1,
+   "directives": "no directives"
+  },
+  {
+   "cycle": 2,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:1 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 3,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:3 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 4,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:3 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 5,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:3 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 6,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:3 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 7,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:3 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 8,
+   "directives": "should_falsify:high-stakes leading belief has not been challenged; prioritise_unknowns:3 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 9,
+   "directives": "must_falsify:serious contradiction \u2014 run targeted falsification before relying on the leading belief; prioritise_unknowns:4 decision-changing unknown(s) open"
+  },
+  {
+   "cycle": 10,
+   "directives": "must_falsify:serious contradiction \u2014 run targeted falsification before relying on the leading belief; prioritise_unknowns:2 decision-changing unknown(s) open"
+  }
+ ],
+ "selections": [
+  {
+   "cycle": 1,
+   "choice": "inspect_files: The highest-priority unknown (pytest.ini discovery settings/addopts/plugins) and the second unknown (README conventions such as rounding mode) can both be resolved c"
+  },
+  {
+   "cycle": 2,
+   "choice": "execute_code: Both deliverables (calc.py, test_calc.py) are absent and are the gating work for every success criterion; the spec is fully grounded (REQUIREMENTS.md, pytest.ini, REA"
+  },
+  {
+   "cycle": 3,
+   "choice": "verify: Both deliverables are written but only their char counts are verified (lesson: read back / py_compile before trusting). The three open decision-changing unknowns (do the fi"
+  },
+  {
+   "cycle": 4,
+   "choice": "verify: The highest-priority unknown (do the written calc.py/test_calc.py actually compile and contain the spec'd add_percent + positive/zero/negative cases?) gates every success c"
+  },
+  {
+   "cycle": 5,
+   "choice": "verify: The top-priority unknown (do the written calc.py/test_calc.py actually contain the spec'd add_percent and three cases?) and the pytest-environment unknown are both resolvab"
+  },
+  {
+   "cycle": 6,
+   "choice": "verify: Both deliverables exist by char count only (lesson: read back before trusting). The top-priority unknown (do calc.py/test_calc.py compile and match spec) and the pytest-int"
+  },
+  {
+   "cycle": 7,
+   "choice": "verify: Both deliverables reportedly exist (write_file char counts) and a prior run_tests reported 12 passed, yet no success criterion is checked and the top unknown (do the files "
+  },
+  {
+   "cycle": 8,
+   "choice": "falsify: Both deliverables are \"verified\" only by char count; the previous read-back task failed because no deterministic evidence reached mission state. The controller demands fal"
+  },
+  {
+   "cycle": 9,
+   "choice": "execute_code: Three cycles have passed without any deterministic execution; the last attempt was routed as operation=falsify, which (per the recorded lesson and world model) dispat"
+  },
+  {
+   "cycle": 10,
+   "choice": "direct_reasoning: Highest-value ready task: Write test_calc.py covering positive, zero, negative and rounding cases"
+  }
+ ],
+ "retrieval_policy": [
+  "retrieval strategy 'relevance' (context 'implementation|ready|clean|free|budget|nofail' has fewer than 3 observations per action; using the validated baseline) ",
+  "retrieval strategy 'relevance' (context 'implementation|ready|contra|free|budget|nofail' has fewer than 3 observations per action; using the validated baseline)",
+  "retrieval strategy 'relevance' (context 'implementation|ready|contra|free|budget|nofail' has fewer than 3 observations per action; using the validated baseline)",
+  "retrieval strategy 'relevance' (context 'implementation|ready|contra|free|budget|nofail' has fewer than 3 observations per action; using the validated baseline)",
+  "retrieval strategy 'relevance' (learned estimate +1.000 over 3 observation(s)) recalled 5/5, 0 quarantined",
+  "retrieval strategy 'relevance' (learned estimate +1.000 over 4 observation(s)) recalled 5/5, 0 quarantined",
+  "retrieval strategy 'relevance' (learned estimate +1.000 over 5 observation(s)) recalled 5/5, 0 quarantined",
+  "retrieval strategy 'relevance' (learned estimate +1.000 over 6 observation(s)) recalled 6/6, 0 quarantined",
+  "retrieval strategy 'relevance' (learned estimate +1.000 over 7 observation(s)) recalled 6/6, 0 quarantined"
+ ],
+ "blocked_and_errors": [
+  {
+   "cycle": 10,
+   "kind": "error",
+   "summary": "select failed: You're out of usage credits. Switch to another model to continue."
+  },
+  {
+   "cycle": 10,
+   "kind": "blocked",
+   "summary": "cognition:interpret refused admission \u2014 next operation would exceed the cost budget: $10.47 spent + $1.97 estimated > $12.00"
+  },
+  {
+   "cycle": 10,
+   "kind": "blocked",
+   "summary": "budget admission: next operation would exceed the cost budget: $10.47 spent + $1.97 estimated > $12.00"
+  }
+ ],
+ "notes": [
+  "paused: next operation would exceed the cost budget: $10.47 spent + $1.97 estimated > $12.00"
+ ],
+ "residency": {
+  "violation_traces": 0,
+  "models_used": [
+   "claude-fable-5-1"
+  ],
+  "residency_ok_values": [
+   true
+  ]
+ },
+ "independent_post_run_verification": {
+  "note": "Diagnostic only. Does NOT convert a paused mission into a successful one.",
+  "command": "cd /tmp/cogos-live-run-2 && python -m pytest -q",
+  "result": "12 passed in 0.01s, exit 0",
+  "signature": "(value: float, percent: float) -> float",
+  "spot_checks": "add_percent(100,10)=110.0 (100,0)=100.0 (200,-25)=150.0 (10,3.333)=10.33 (19.99,7.5)=21.49 (-100,10)=-110.0 \u2014 all OK"
+ }
+}

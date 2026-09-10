@@ -195,6 +195,32 @@ them:
 3. whether the learned retrieval policy improves real missions — it stayed on its validated
    baseline for all five live decisions, correctly, being below the data-support threshold.
 
+### Live Run #2 — controlled validation of the repairs
+
+A second live run against the same adapter and model, on a frozen commit with a pre-run gate,
+is recorded in [`evidence/LIVE_RUN_2.md`](evidence/LIVE_RUN_2.md) (raw data:
+`evidence/live-run-2.json`). It updates three of the statements above:
+
+* **The budget-guard limitation is repaired and the repair is validated live.** Admission control
+  refused the next call *before* starting it and the mission stopped at **$10.47 against a $12.00
+  cap**, where Live Run #1 overshot ($20.51 against $19.00). The nominal cap is still not proven
+  to be a mathematically hard ceiling — the provider-side per-call `--max-budget-usd` was passed
+  on every call but never binding — so the honest claim is "prevented the overshoot", not
+  "hard cap".
+* **Point 3 above is now partly answered.** The learned retrieval policy *did* cross its
+  data-support threshold live, at cycle 6, and drove the remaining decisions
+  (`learned estimate +1.000 over 3 observation(s)`, rising to 7 observations by cycle 10).
+  Whether that *improves* missions remains unestablished — one run, one context.
+* **Point 1 is unchanged.** R1 still never ran live: Live Run #2 also never reached a completion
+  attempt, so the anchor is recorded as `NOT EXERCISED`, not passed.
+
+Live Run #2 also produced the first success criterion ever bound to a passing verification
+receipt under a real frontier model (1 of 5), and found three further defects that block
+completion rather than merely cost money: executive-written files are never registered as
+artifacts, operation routing can send tool-shaped work to a non-tool-executing operation, and a
+zero-collection command run is recorded as a passing check. Its verdict is **partial**, not
+strong, validation: the mission still ended `paused`.
+
 ## 8. Learning: what actually changed
 
 - **Experience stored:** yes. Versioned records with pre-action features, receipts and lineage.
