@@ -30,7 +30,7 @@ from cogos.memory import MemoryManager
 from cogos.observability import CalibrationTracker, DecisionJournal, ResourceLedger, Tracer
 from cogos.persistence import StateStore
 from cogos.planner import Planner
-from cogos.schemas.beliefs import Claim, Contradiction, Evidence, EvidenceKind
+from cogos.schemas.beliefs import Claim, ClaimStatus, Contradiction, Evidence, EvidenceKind
 from cogos.schemas.cognition import (
     EvidenceSpec,
     ObservationInterpretation,
@@ -59,6 +59,7 @@ from cogos.schemas.mission import (
 from cogos.schemas.tools import ToolCall, ToolResult
 from cogos.simulation import simulate
 from cogos.tools import ToolFabric
+from cogos.schemas.verification import VerificationCheck, cite
 from cogos.verification import VerificationEngine, VerificationResult
 from cogos.workspace import GlobalWorkspace
 from cogos.world_model import WorldModelManager
@@ -317,7 +318,7 @@ class Executive:
     def _verification_pending(self, state: MissionState) -> list[str]:
         out = []
         for t in state.tasks:
-            if t.status == TaskStatus.DONE and not t.verification_ids:
+            if t.status == TaskStatus.DONE and not t.verification_attempt_ids:
                 p = t.parameters
                 if p.get("commands") or p.get("test_command") or p.get("verify_commands") or t.artifact_ids or p.get("research"):
                     out.append(t.id)
@@ -565,7 +566,9 @@ class Executive:
             out.waited_for = kind
             self.tracer.emit("blocked", f"waiting for event '{kind}'")
         elif op == OperationKind.COMPLETE_MISSION:
-            gate = VerificationEngine(self.fabric, state).mission_completion_check(state)
+            engine = VerificationEngine(self.fabric, state)
+            self._refresh_changed_artifacts(state, engine)
+            gate = engine.mission_completion_check(state)
             self.tracer.emit("verify", f"completion gate: {gate.status.value} — {gate.summary[:200]}", data=gate.model_dump(mode="json"))
             if gate.status == VerificationStatus.PASSED:
                 out.completed = True
@@ -643,8 +646,56 @@ class Executive:
                 state.human_requests.append(HumanRequest(kind="authorization", question=f"Authorize {res.verdict.action_class.value} operation: {blocked.operation}", why_not_inferable="the action class requires explicit human authorization by policy", options=["authorize", "deny"], independent_work_remaining=True))
         return res
 
+    def _refresh_changed_artifacts(self, state: MissionState, engine: VerificationEngine) -> list[str]:
+        """Re-verify artifacts whose bytes no longer match what was verified.
+
+        Detecting a change is the completion gate's job; *responding* to one is the loop's.
+        A regenerated file (a fix applied over a buggy first attempt) has to be checked again
+        rather than accepted on its stale receipt or left to block the mission forever. A file
+        that was deleted fails re-verification, which is the correct outcome.
+        """
+        from cogos.verification.engine import artifact_integrity
+
+        refreshed: list[str] = []
+        for a in state.artifacts:
+            if not a.verified:
+                continue
+            ok, detail = artifact_integrity(a)
+            if ok:
+                continue
+            self.tracer.emit("verify", f"artifact '{a.name}' changed since verification: {detail}", data={"artifact_id": a.id})
+            engine.verify_artifact(a)
+            refreshed.append(a.id)
+            self._invalidate_criteria_resting_on(state, a)
+        return refreshed
+
+    def _invalidate_criteria_resting_on(self, state: MissionState, artifact: Any) -> None:
+        """Un-satisfy criteria that were satisfied against an artifact that has since changed.
+
+        Re-verifying the file establishes the *new* bytes. It says nothing about whether the
+        criterion those old bytes satisfied is still met, so that judgement is withdrawn and has
+        to be made again.
+        """
+        from cogos.verification.engine import TOKEN_OVERLAP_THRESHOLD, token_overlap
+
+        for c in state.success_criteria:
+            if not c.satisfied:
+                continue
+            method = (c.verification_method or "").lower()
+            relates = token_overlap(c.description, f"{artifact.name} {artifact.summary}") >= TOKEN_OVERLAP_THRESHOLD
+            if "artifact" not in method and not relates:
+                continue
+            c.satisfied = False
+            c.verification_ids.clear()
+            self.tracer.emit(
+                "verify",
+                f"criterion '{c.description[:80]}' withdrawn: it rested on artifact '{artifact.name}', which changed",
+                data={"criterion_id": c.id, "artifact_id": artifact.id},
+            )
+
     def _verify(self, state: MissionState, task: Optional[Task], decision: StepDecision) -> VerificationResult:
         engine = VerificationEngine(self.fabric, state)
+        self._refresh_changed_artifacts(state, engine)
         result: Optional[VerificationResult] = None
         if task is not None:
             p = task.parameters
@@ -671,14 +722,16 @@ class Executive:
                         rec.summary = "(reproduction) " + rec.summary
             elif p.get("research"):
                 relevant = [c.id for c in state.claims if c.decision_relevance >= 0.5]
-                result = engine.verify_research(relevant or None)
+                result = engine.verify_research(relevant or None, task_id=task.id)
             elif task.artifact_ids:
                 result = engine.verify_task(task)
             else:
                 # Verify the most recent completed-but-unverified task instead.
                 result = engine.verify_task(task)
-            if result is not None and result.id not in task.verification_ids:
-                task.verification_ids.append(result.id)
+            if result is not None:
+                if result.id not in task.verification_attempt_ids:
+                    task.verification_attempt_ids.append(result.id)
+                cite(task.verification_ids, result, task.id)
         if result is None and not self._criteria_pass_useful(state, Planner(state), self._verification_pending(state)):
             # Nothing has changed since the last pass, or every open criterion is already
             # recorded undecidable: re-running it would only add dead records.
@@ -764,6 +817,27 @@ class Executive:
         judgment = self._judge(state, f"success criterion '{criterion.description}'", f"VERIFICATION METHOD: {criterion.verification_method or '(unspecified)'}", result, extra)
         controller = state.resources.setdefault("controller", {})
         undecidable: list[str] = controller.setdefault("undecidable_criteria", [])
+        grounding = self._judgment_grounding(state, criterion)
+        if judgment is not None and judgment.status == "passed" and not grounding:
+            # F2: a judgement is an opinion about material, not a substitute for it. With no
+            # artifact, test record, evidenced claim or tool call the runtime can point at,
+            # a confident "I checked everything" attests to nothing and is not accepted.
+            self.tracer.emit(
+                "verify",
+                f"ungrounded judgement rejected for criterion: {criterion.description[:100]}",
+                data={"criterion_id": criterion.id, "checked": list(judgment.checked)[:5], "confidence": judgment.confidence},
+            )
+            result.status = VerificationStatus.INCONCLUSIVE
+            result.checks.append(
+                VerificationCheck(
+                    name="judgement_grounding",
+                    status=VerificationStatus.INCONCLUSIVE,
+                    detail="executive reported the criterion met, but no artifact, test record, evidenced claim or tool call in mission state supports it",
+                )
+            )
+            if criterion.id not in undecidable:
+                undecidable.append(criterion.id)
+            return result
         if judgment is None or judgment.status == "inconclusive" or (judgment.status == "passed" and not judgment.checked):
             if criterion.id in undecidable:
                 result.summary = f"criterion '{criterion.description[:80]}' is not decidable from available evidence (recorded; will not be re-verified)"
@@ -774,17 +848,57 @@ class Executive:
         if judgment.status == "passed" and judgment.confidence >= 0.7:
             criterion.satisfied = True
             result.status = VerificationStatus.PASSED
-            result.summary = f"criterion satisfied by executive judgement ({judgment.confidence:.2f}): {judgment.summary[:160]}; checked: {', '.join(judgment.checked[:5])}"
+            result.summary = f"criterion satisfied by executive judgement ({judgment.confidence:.2f}): {judgment.summary[:160]}; checked: {', '.join(judgment.checked[:5])}; grounded in: {'; '.join(grounding[:3])}"
+            result.checks.append(VerificationCheck(name="judgement_grounding", status=VerificationStatus.PASSED, detail="; ".join(grounding[:5])))
             if criterion.id in undecidable:
                 undecidable.remove(criterion.id)
             engine.record(result)
-            if result.id not in criterion.verification_ids:
-                criterion.verification_ids.append(result.id)
+            cite(criterion.verification_ids, result, criterion.id, target_type="criterion")
         elif judgment.status == "failed":
             criterion.satisfied = False
             result.status = VerificationStatus.FAILED
             result.summary = f"criterion not met: {judgment.summary[:160]}; issues: {'; '.join(judgment.issues[:3])}"
         return result
+
+    def _judgment_grounding(self, state: MissionState, criterion: Any) -> list[str]:
+        """Material in mission state that an executive judgement about this criterion can rest on.
+
+        Only things the runtime can independently re-check count: an artifact whose verified
+        bytes are still on disk, a passed test record produced after the criterion existed, a
+        supported claim carrying at least one evidence item, or a task addressing the criterion that
+        carries its own passing receipt. Model text about its own diligence is not material.
+        """
+        from cogos.verification.engine import _id_timestamp_ms, _iso_to_ms, artifact_integrity, token_overlap
+
+        found: list[str] = []
+        created_ms = _id_timestamp_ms(criterion.id) or 0
+
+        for a in state.artifacts:
+            if not a.verified:
+                continue
+            ok, _ = artifact_integrity(a)
+            if ok:
+                found.append(f"artifact '{a.name}' at {a.path}")
+
+        for t in state.tests:
+            if t.status == VerificationStatus.PASSED and not t.expected_failure and (_iso_to_ms(t.ran_at) or -1) >= created_ms:
+                found.append(f"passed test record '{t.name}'")
+
+        for c in state.claims:
+            if c.status not in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED):
+                continue
+            if not any(state.evidence_item(eid) is not None for eid in c.evidence_for):
+                continue
+            if token_overlap(criterion.description, c.proposition) >= 0.2:
+                found.append(f"evidenced claim {c.id}")
+
+        for t in state.tasks:
+            if criterion.id not in t.addresses_criterion_ids or t.status != TaskStatus.DONE:
+                continue
+            if state.passing_verifications(t.verification_ids, target_id=t.id):
+                found.append(f"independently verified task '{t.title}'")
+
+        return found
 
     def _runtime_criterion_evidence(self, state: MissionState, criterion: Any) -> Optional[bool]:
         """Deterministic checks the runtime can make on a criterion without a model.

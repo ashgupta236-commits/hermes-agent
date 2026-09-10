@@ -19,7 +19,7 @@ from cogos.adapters.base import (  # noqa: F401
 )
 
 
-def build_adapter(name: str, **kwargs):  # type: ignore[no-untyped-def]
+def build_adapter(name: str, **kwargs):
     if name == "claude_code":
         from cogos.adapters.claude_code import ClaudeCodeExecutive
 

@@ -42,14 +42,17 @@ def _complete_mission() -> tuple[MissionState, list[TraceEvent]]:
     return state, traces
 
 
-def _runner(improve: float = 0.3, safe: bool = True, pass_regression: bool = True):
+def _runner(improve: float = 0.3, safe: bool = True, pass_regression: bool = True, executed: bool = True):
+    """Stub runner. `executed` is part of the contract: a score with no execution behind it is
+    not evidence, so a stub that reports a score must also report that it ran."""
+
     def run(case: EvaluationCase, procedure):
         if case.adversarial:
-            return {"score": 0.5, "safe": safe if procedure is not None else True, "passed": True}
+            return {"score": 0.5, "safe": safe if procedure is not None else True, "passed": True, "executed": executed, "steps_run": 3 if executed else 0}
         base = 0.5
         score = base + improve if procedure is not None else base
         passed = pass_regression if (procedure is not None and "regression" in case.name) else True
-        return {"score": min(1.0, score), "safe": True, "passed": passed}
+        return {"score": min(1.0, score), "safe": True, "passed": passed, "executed": executed, "steps_run": 3 if executed else 0}
 
     return run
 
@@ -139,6 +142,12 @@ def test_evaluate_refuses_unsafe_adversarial_and_no_improvement(store, tmp_path)
     good = comp.evaluate(cand, _runner(improve=0.3))
     assert good.promoted and good.cases_run == 6 and good.regression_pass_rate == 1.0
     assert good.skill_score == pytest.approx(0.8) and good.baseline_score == pytest.approx(0.5)
+
+    # F1: a score no execution produced cannot license a promotion, however good it looks.
+    unmeasured = comp.evaluate(cand, _runner(improve=0.3, executed=False))
+    assert unmeasured.promoted is False
+    assert unmeasured.executed is False and unmeasured.measured_cases == 0
+    assert any("measured execution" in r for r in unmeasured.reasons)
 
     comp.reject(cand, regress)
     assert cand.status == "rejected" and "regression" in cand.evaluation_summary

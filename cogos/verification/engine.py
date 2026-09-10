@@ -26,7 +26,7 @@ from cogos.schemas.common import VerificationStatus
 from cogos.schemas.decisions import Decision
 from cogos.schemas.mission import Artifact, MissionState, SuccessCriterion, Task, TaskStatus, TestRecord
 from cogos.schemas.tools import ToolCall
-from cogos.schemas.verification import VerificationCheck, VerificationResult
+from cogos.schemas.verification import VerificationCheck, VerificationResult, cite
 from cogos.tools.fabric import ToolFabric
 
 PASSED = VerificationStatus.PASSED
@@ -122,6 +122,43 @@ def _iso_to_ms(stamp: Optional[str]) -> Optional[int]:
         return None
 
 
+def file_sha256(path: Path) -> Optional[str]:
+    """sha256 of a file's bytes, or None when it cannot be read."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def artifact_integrity(artifact: Artifact) -> tuple[bool, str]:
+    """Re-check a *previously verified* artifact against the filesystem, now.
+
+    `verified` is a claim about the past. This answers the question the completion gate
+    actually needs answered: are those exact bytes still there?
+    """
+    if not artifact.verified:
+        return False, "not verified"
+    if not artifact.verified_hash:
+        return False, "verified without a recorded content hash"
+    if not artifact.path:
+        return False, "declares no path"
+    path = Path(artifact.path).expanduser()
+    if not path.exists():
+        return False, f"{path} no longer exists"
+    if not path.is_file():
+        return False, f"{path} is no longer a regular file"
+    current = file_sha256(path)
+    if current is None:
+        return False, f"{path} could not be read"
+    if current != artifact.verified_hash:
+        return False, f"content changed since verification (sha256 {current[:12]}… != {artifact.verified_hash[:12]}…)"
+    return True, f"sha256 {artifact.verified_hash[:12]}… unchanged"
+
+
 def _type_ok(value: Any, expected: Any) -> bool:
     names = expected if isinstance(expected, list) else [expected]
     for name in names:
@@ -146,7 +183,10 @@ class VerificationEngine:
         self.state = state
         self.results: list[VerificationResult] = []
 
-    MAX_DURABLE_VERIFICATIONS = 500
+    #: Soft cap on *unreferenced* records. Referenced receipts are never evicted: a gate that
+    #: cannot resolve the receipt a criterion cites cannot tell a forged citation from a
+    #: truncated store, so the store must be durable for anything still pointed at.
+    MAX_UNREFERENCED_VERIFICATIONS = 500
 
     def record(self, result: VerificationResult) -> VerificationResult:
         """Persist a verification record into mission state so gates can resolve it later."""
@@ -154,8 +194,20 @@ class VerificationEngine:
         if self.state is not None:
             if not any(v.id == result.id for v in self.state.verifications):
                 self.state.verifications.append(result)
-            del self.state.verifications[: -self.MAX_DURABLE_VERIFICATIONS]
+            self.prune()
         return result
+
+    def prune(self) -> int:
+        """Drop the oldest records that nothing references. Returns how many were dropped."""
+        records = self.state.verifications
+        referenced = self.state.referenced_verification_ids()
+        droppable = [i for i, v in enumerate(records) if v.id not in referenced]
+        excess = len(droppable) - self.MAX_UNREFERENCED_VERIFICATIONS
+        if excess <= 0:
+            return 0
+        drop = set(droppable[:excess])
+        self.state.verifications = [v for i, v in enumerate(records) if i not in drop]
+        return len(drop)
 
     # -- code -----------------------------------------------------------------------
 
@@ -253,7 +305,7 @@ class VerificationEngine:
         else:
             checks.append(VerificationCheck(name=f"{cid}:contradictions", status=PASSED, detail="no unresolved contradictions"))
 
-    def verify_research(self, claim_ids: Optional[list[str]] = None) -> VerificationResult:
+    def verify_research(self, claim_ids: Optional[list[str]] = None, task_id: Optional[str] = None) -> VerificationResult:
         checks: list[VerificationCheck] = []
         evidence_ids: list[str] = []
         if claim_ids is None:
@@ -275,7 +327,7 @@ class VerificationEngine:
         if failed:
             summary += "; failing: " + "; ".join(f"{c.name} ({c.detail})" for c in failed[:5])
         return self.record(
-            VerificationResult(target_type="claim", target_id=",".join(ids) if ids else "claims", status=status, summary=summary, checks=checks, evidence_ids=sorted(set(evidence_ids)))
+            VerificationResult(target_type="claim", target_id=task_id or (",".join(ids) if ids else "claims"), status=status, summary=summary, checks=checks, evidence_ids=sorted(set(evidence_ids)))
         )
 
     # -- data -----------------------------------------------------------------------
@@ -374,23 +426,29 @@ class VerificationEngine:
                 checks.append(VerificationCheck(name="non_empty", status=FAILED, detail="file is empty"))
             else:
                 checks.append(VerificationCheck(name="non_empty", status=PASSED, detail=f"{size} bytes"))
-            digest = hashlib.sha256()
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(65536), b""):
-                    digest.update(chunk)
-            content_hash = digest.hexdigest()
-            previous = artifact.content_hash
+            content_hash = file_sha256(path) or ""
+            # The comparison that matters is against the hash this artifact last *passed* on.
+            # A re-check of changed bytes is a real check of the bytes that are there now, so it
+            # passes and records the change; it is the completion gate that refuses to accept
+            # the stale receipt in between.
+            previous = artifact.verified_hash
             artifact.content_hash = content_hash
             if previous and previous != content_hash:
-                checks.append(VerificationCheck(name="hash", status=INCONCLUSIVE, detail=f"sha256 {content_hash[:12]}… differs from previously recorded {previous[:12]}…"))
+                checks.append(VerificationCheck(name="hash", status=PASSED, detail=f"sha256 {content_hash} (changed since it was verified at {previous[:12]}…; re-checked)"))
             else:
                 checks.append(VerificationCheck(name="hash", status=PASSED, detail=f"sha256 {content_hash}"))
         status = _aggregate(checks)
         artifact.verified = status == PASSED
+        # The hash the artifact was verified *at* is what later integrity checks compare against,
+        # so a file that is deleted or edited after this point stops counting as verified.
+        artifact.verified_hash = artifact.content_hash if artifact.verified else None
+        artifact.verified_at = iso_now() if artifact.verified else None
         stored = next((a for a in self.state.artifacts if a.id == artifact.id), None)
         if stored is not None and stored is not artifact:
             stored.content_hash = artifact.content_hash
             stored.verified = artifact.verified
+            stored.verified_hash = artifact.verified_hash
+            stored.verified_at = artifact.verified_at
         summary = f"artifact '{artifact.name}': {_counts(checks)}"
         return self.record(VerificationResult(target_type="artifact", target_id=artifact.id, status=status, summary=summary, checks=checks))
 
@@ -450,8 +508,7 @@ class VerificationEngine:
         # Only a passing record is citable evidence. A failed or inconclusive attempt is still
         # persisted (see record()), but citing it would turn the completion gate into a
         # has-this-been-attempted check.
-        if status == PASSED and result.id not in criterion.verification_ids:
-            criterion.verification_ids.append(result.id)
+        cite(criterion.verification_ids, result, criterion.id, target_type="criterion")
         return self.record(result)
 
     # -- decisions ------------------------------------------------------------------
@@ -531,7 +588,9 @@ class VerificationEngine:
             summary = "no verifiable output declared"
         status = _aggregate(checks)
         result = VerificationResult(target_type="task", target_id=task.id, status=status, summary=summary, checks=checks, evidence_ids=evidence_ids)
-        task.verification_ids.append(result.id)
+        if result.id not in task.verification_attempt_ids:
+            task.verification_attempt_ids.append(result.id)
+        cite(task.verification_ids, result, task.id)
         return self.record(result)
 
     # -- mission gate ---------------------------------------------------------------
@@ -547,12 +606,17 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
 
     # A criterion counts as verified only when an id on it resolves to a PASSED record in
     # durable state. A non-empty id list is not evidence of anything.
-    unverified = [c for c in state.success_criteria if not (c.satisfied and state.passing_verifications(c.verification_ids))]
+    def receipts(c: SuccessCriterion) -> list[VerificationResult]:
+        # F4: the receipt must have been produced *against this criterion*. A passing record
+        # for some unrelated artifact is not evidence, however it came to be cited.
+        return state.passing_verifications(c.verification_ids, target_type="criterion", target_id=c.id)
+
+    unverified = [c for c in state.success_criteria if not (c.satisfied and receipts(c))]
     if not state.success_criteria:
         checks.append(VerificationCheck(name="success_criteria", status=INCONCLUSIVE, detail="mission declares no success criteria"))
         missing.append("no success criteria declared")
     elif unverified:
-        detail = "; ".join(f"'{c.description}'" + (" (no passing verification record)" if not state.passing_verifications(c.verification_ids) else " (not satisfied)") for c in unverified)
+        detail = "; ".join(f"'{c.description}'" + (" (no passing verification record bound to it)" if not receipts(c) else " (not satisfied)") for c in unverified)
         checks.append(VerificationCheck(name="success_criteria", status=FAILED, detail=detail))
         missing.append(f"{len(unverified)} of {len(state.success_criteria)} success criteria not verified: {detail}")
     else:
@@ -602,15 +666,35 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
     else:
         checks.append(VerificationCheck(name="human_requests", status=PASSED, detail="no blocking unanswered human requests"))
 
+    # F3: `verified` is a claim about the past. Re-hash every artifact the mission still
+    # presents as verified, so a file deleted or edited after verification cannot pass the gate.
+    intact: dict[str, Artifact] = {}
+    broken: list[str] = []
+    for a in state.artifacts:
+        if not a.verified:
+            continue
+        ok, detail = artifact_integrity(a)
+        if ok:
+            intact[a.id] = a
+        else:
+            broken.append(f"'{a.name}' ({detail})")
+    if broken:
+        checks.append(VerificationCheck(name="artifact_integrity", status=FAILED, detail="; ".join(broken[:5])))
+        missing.append(f"{len(broken)} verified artifact(s) no longer match what was verified: " + "; ".join(broken[:5]))
+    elif intact:
+        checks.append(VerificationCheck(name="artifact_integrity", status=PASSED, detail=f"all {len(intact)} verified artifacts still match their recorded hash"))
+    else:
+        checks.append(VerificationCheck(name="artifact_integrity", status=SKIPPED, detail="no verified artifacts to re-check"))
+
     required = list(state.resources.get("required_artifacts", []) or [])
     if required:
-        verified_keys = {a.id for a in state.artifacts if a.verified} | {a.name for a in state.artifacts if a.verified}
+        verified_keys = set(intact) | {a.name for a in intact.values()}
         absent = [r for r in required if str(r) not in verified_keys]
         if absent:
             checks.append(VerificationCheck(name="required_artifacts", status=FAILED, detail="missing or unverified: " + ", ".join(map(str, absent))))
             missing.append("required artifacts missing or unverified: " + ", ".join(map(str, absent)))
         else:
-            checks.append(VerificationCheck(name="required_artifacts", status=PASSED, detail=f"all {len(required)} required artifacts verified"))
+            checks.append(VerificationCheck(name="required_artifacts", status=PASSED, detail=f"all {len(required)} required artifacts verified and intact"))
     else:
         checks.append(VerificationCheck(name="required_artifacts", status=SKIPPED, detail="no required artifacts declared"))
 

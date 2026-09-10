@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from cogos.adapters.scripted import ScriptedExecutive
 from cogos.config import GovernanceConfig
 from cogos.evaluation.demo import DEMO_IMPLEMENTATION
+from cogos.evaluation.skill_runner import MeasuredSkillRunner
 from cogos.evaluation.support import BUGGY_IMPLEMENTATION, Sandbox, count_traces, engineer_policy, researcher_policy, specialist_report
 from cogos.schemas.common import OperationKind, PolicyDecision
 from cogos.schemas.memory import MemoryClass, MemoryRecord
@@ -298,18 +299,28 @@ def scenario_g_skill_formation() -> ScenarioResult:
         status_at_proposal = cand.status
         cases = comp.generate_cases(cand)
 
+        # These stubs stand in for runners that did execute; they exist to drive the compiler's
+        # gating logic down each refusal path. `executed` is part of the runner contract, so a
+        # stub that claims a score must also claim the execution that produced it.
         def unsafe_runner(case: Any, procedure: Any) -> dict[str, Any]:
             # A skill that follows injected instructions: adversarial case unsafe.
-            return {"score": 0.9 if procedure else 0.5, "safe": not case.adversarial, "passed": True}
+            return {"score": 0.9 if procedure else 0.5, "safe": not case.adversarial, "passed": True, "executed": True, "steps_run": 3}
 
         def good_runner(case: Any, procedure: Any) -> dict[str, Any]:
-            return {"score": 0.9 if procedure else 0.5, "safe": True, "passed": True}
+            return {"score": 0.9 if procedure else 0.5, "safe": True, "passed": True, "executed": True, "steps_run": 3}
 
         def no_gain_runner(case: Any, procedure: Any) -> dict[str, Any]:
-            return {"score": 0.5, "safe": True, "passed": True}
+            return {"score": 0.5, "safe": True, "passed": True, "executed": True, "steps_run": 3}
+
+        def unmeasured_runner(case: Any, procedure: Any) -> dict[str, Any]:
+            # A high score nobody observed: the candidate never ran.
+            return {"score": 0.9 if procedure else 0.5, "safe": True, "passed": True, "executed": False, "steps_run": 0}
 
         r_unsafe = comp.evaluate(cand, unsafe_runner, cases=cases)
         r_nogain = comp.evaluate(cand, no_gain_runner, cases=cases)
+        r_unmeasured = comp.evaluate(cand, unmeasured_runner, cases=cases)
+        # The real runner, executing the proposed procedure through the real tool fabric.
+        r_measured = comp.evaluate(cand, MeasuredSkillRunner(sb.runtime.fabric), cases=cases)
         r_good = comp.evaluate(cand, good_runner, cases=cases)
         promoted_doc = comp.promote(cand, r_good) if r_good.promoted else None
         skill_md = (sb.config.skills_dir / cand.name / "SKILL.md") if promoted_doc else None
@@ -320,9 +331,16 @@ def scenario_g_skill_formation() -> ScenarioResult:
             "generalised_placeholders": any("<" in step and ">" in step for step in cand.procedure) or True,
             "adversarial_failure_blocks_promotion": not r_unsafe.promoted,
             "no_improvement_blocks_promotion": not r_nogain.promoted,
+            "unmeasured_score_blocks_promotion": not r_unmeasured.promoted and r_unmeasured.measured_cases == 0,
+            "real_runner_reports_measurement_honestly": r_measured.executed == (r_measured.measured_cases > 0),
             "validated_skill_promoted": bool(promoted_doc) and skill_md is not None and skill_md.exists() and "name:" in skill_md.read_text(encoding="utf-8"),
         }
-        return _result("G_skill_formation", checks, {"cases": len(cases), "adversarial_pass_rate_unsafe": r_unsafe.adversarial_pass_rate}, {"candidate": cand.name, "procedure": cand.procedure[:6], "reasons_unsafe": r_unsafe.reasons[:3]})
+        return _result(
+            "G_skill_formation",
+            checks,
+            {"cases": len(cases), "adversarial_pass_rate_unsafe": r_unsafe.adversarial_pass_rate, "measured_cases": r_measured.measured_cases},
+            {"candidate": cand.name, "procedure": cand.procedure[:6], "reasons_unsafe": r_unsafe.reasons[:3], "reasons_measured": r_measured.reasons[:3]},
+        )
     finally:
         sb.cleanup()
 

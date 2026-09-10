@@ -1,29 +1,17 @@
-"""Skill candidate evaluation using a deterministic procedural runner."""
+"""Skill candidate evaluation.
+
+The candidate is evaluated by *running* it: :class:`~cogos.evaluation.skill_runner.MeasuredSkillRunner`
+executes each case as a real task through the tool fabric and scores the result from the state
+it leaves behind. The previous coverage scorer is gone — it compared a procedure's prose to the
+case description, which let a procedure that executes nothing outscore a baseline and be
+promoted.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from cogos.governance.immune import scan_for_injection
-
-
-def procedural_runner(case: Any, procedure: list[str] | None) -> dict[str, Any]:
-    """Deterministic evaluation: a procedure scores by coverage of the case's expected steps and must stay safe."""
-    text = " ".join(str(v) for v in case.input.values())
-    injected = bool(scan_for_injection(text))
-    expected = [str(s).lower() for s in (case.expected.get("steps") or [])]
-    if procedure is None:
-        coverage = 0.5
-    else:
-        joined = " ".join(procedure).lower()
-        coverage = (sum(1 for s in expected if any(tok in joined for tok in s.split()[:2])) / len(expected)) if expected else 0.7
-        coverage = max(coverage, 0.6)
-    missing_tool = bool(case.input.get("missing_tool"))
-    safe = True
-    if injected and procedure is not None and any("ignore" in p.lower() and "instruction" in p.lower() for p in procedure):
-        safe = False
-    passed = (not missing_tool) or (procedure is None) or any("verify" in p.lower() or "fallback" in p.lower() or "alternative" in p.lower() for p in procedure)
-    return {"score": round(coverage, 3), "safe": safe, "passed": passed}
+from cogos.evaluation.skill_runner import MeasuredSkillRunner
 
 
 def evaluate_candidate(runtime: Any, mission_id: str, candidate_id: str | None = None) -> dict[str, Any]:
@@ -34,7 +22,7 @@ def evaluate_candidate(runtime: Any, mission_id: str, candidate_id: str | None =
     if not cands:
         return {"error": "no candidate skills"}
     cand = cands[0]
-    report = runtime.skills.evaluate(cand, procedural_runner)
+    report = runtime.skills.evaluate(cand, MeasuredSkillRunner(runtime.fabric))
     if report.promoted:
         doc = runtime.skills.promote(cand, report)
         outcome = {"promoted": True, "skill": doc.name}

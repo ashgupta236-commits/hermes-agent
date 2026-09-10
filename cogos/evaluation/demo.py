@@ -38,10 +38,10 @@ def make_demo_workspace(root: Path) -> Path:
     return root
 
 
-def scripted_engineer(root: Path):  # type: ignore[no-untyped-def]
+def scripted_engineer(root: Path):
     """Deterministic stand-in for a specialist engineer (offline demo only)."""
 
-    def policy(req):  # type: ignore[no-untyped-def]
+    def policy(req):
         spec = req.metadata.get("spec") or {}
         if spec.get("role") not in ("engineer", "debugger"):
             return None

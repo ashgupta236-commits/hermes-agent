@@ -12,7 +12,7 @@ from cogos.config import load_config
 from cogos.schemas.mission import Budget
 
 
-def _runtime(args: argparse.Namespace):  # type: ignore[no-untyped-def]
+def _runtime(args: argparse.Namespace):
     from cogos.runtime import Runtime
 
     overrides: dict[str, Any] = {}
@@ -219,7 +219,9 @@ def cmd_eval(args: argparse.Namespace) -> int:
             print(f"{'PASS' if r['passed'] else 'FAIL'}  {r['name']:<28} {r['summary'][:100]}")
         print(f"\n{report['passed']}/{report['total']} passed; metrics: {json.dumps(report['metrics'], default=str)}")
     if args.write:
-        Path(args.write).write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
+        out = Path(args.write)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
     return 0 if report["passed"] == report["total"] else 1
 
 

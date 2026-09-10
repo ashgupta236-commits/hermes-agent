@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from typing import Any, Optional
 
 from cogos.adapters.base import (
+    AttemptRecord,
     CognitionRequest,
     CognitionResponse,
     ExecutiveUnavailable,
+    ResidencyStatus,
     Timer,
     render_untrusted,
 )
@@ -51,6 +54,48 @@ _TRANSIENT_MARKERS = (
     "ECONNRESET",
     "Authentication error · This may be a temporary",
 )
+
+
+_MODEL_SUFFIX = re.compile(r"-(\d{6,8}|latest|v\d+)$")
+
+
+def _canonical_model(name: str) -> str:
+    """Strip the vendor prefix and a trailing date/version stamp: 'claude-fable-5-1-20260901' -> 'fable-5-1'."""
+    n = (name or "").strip().lower()
+    n = _MODEL_SUFFIX.sub("", n)
+    if n.startswith("claude-"):
+        n = n[len("claude-") :]
+    return n
+
+
+def _is_same_model(requested: str, used: str) -> bool:
+    """True when `used` is the requested model, or the concrete resolution of a requested alias."""
+    if not requested or not used:
+        return False
+    if requested == used:
+        return True
+    # 'fable' (alias) resolved to 'fable-5-1' is the same model; the reverse is a downgrade.
+    return used.startswith(requested + "-")
+
+
+def _with_attempts(resp: CognitionResponse, attempts: list[AttemptRecord]) -> CognitionResponse:
+    """Attach every billed attempt and roll its usage into the response totals.
+
+    ``cost_usd``/token counts become what the whole call actually consumed, so a caller that
+    only reads the totals still cannot undercount a retried call.
+    """
+    if not attempts:
+        return resp
+    return resp.model_copy(
+        update={
+            "attempts": len(attempts),
+            "attempt_records": attempts,
+            "cost_usd": round(sum(a.cost_usd for a in attempts), 10),
+            "input_tokens": sum(a.input_tokens for a in attempts),
+            "output_tokens": sum(a.output_tokens for a in attempts),
+            "duration_ms": sum(a.duration_ms for a in attempts),
+        }
+    )
 
 
 def _is_transient(text: str) -> bool:
@@ -134,6 +179,9 @@ class ClaudeCodeExecutive:
         cmd = self.build_command(req)
         last_err = ""
         delay = 2.0
+        # F7: every subprocess launch is a billed attempt. The returned response carries all of
+        # them, so a retried call is never accounted for as one call at the last attempt's cost.
+        attempts: list[AttemptRecord] = []
         for attempt in range(self.max_retries + 1):
             with Timer() as t:
                 try:
@@ -149,14 +197,30 @@ class ClaudeCodeExecutive:
                     )
                 except subprocess.TimeoutExpired:
                     last_err = f"claude timed out after {req.timeout_seconds}s"
+                    ms = t.ms if hasattr(t, "ms") else 0
+                    attempts.append(AttemptRecord(index=attempt, ok=False, error_kind="timeout", error=last_err[:400], duration_ms=ms))
                     if attempt < self.max_retries:
                         time.sleep(delay)
                         delay *= 2
                         continue
-                    return CognitionResponse(ok=False, model_requested=req.model, error=last_err, error_kind="timeout", duration_ms=t.ms if hasattr(t, "ms") else 0)
+                    return _with_attempts(CognitionResponse(ok=False, model_requested=req.model, error=last_err, error_kind="timeout", duration_ms=ms), attempts)
             resp = self._parse(proc, req, t.ms)
+            attempts.append(
+                AttemptRecord(
+                    index=attempt,
+                    ok=resp.ok,
+                    error_kind=resp.error_kind,
+                    error=resp.error[:400],
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                    cost_usd=resp.cost_usd,
+                    duration_ms=resp.duration_ms,
+                    models_used=list(resp.models_used),
+                    residency_status=resp.residency_status,
+                )
+            )
             if resp.ok:
-                return resp
+                return _with_attempts(resp, attempts)
             last_err = resp.error
             if resp.error_kind == "transient" and attempt < self.max_retries:
                 time.sleep(delay)
@@ -167,8 +231,8 @@ class ClaudeCodeExecutive:
                 # input. We never reshape the request to evade it.
                 time.sleep(delay)
                 continue
-            return resp
-        return CognitionResponse(ok=False, model_requested=req.model, error=last_err, error_kind="transient")
+            return _with_attempts(resp, attempts)
+        return _with_attempts(CognitionResponse(ok=False, model_requested=req.model, error=last_err, error_kind="transient"), attempts)
 
     # -- parsing ------------------------------------------------------------------------
 
@@ -194,7 +258,7 @@ class ClaudeCodeExecutive:
         usage = data.get("usage") or {}
         model_usage = data.get("modelUsage") or {}
         models_used = list(model_usage.keys())
-        residency_ok = self._residency_ok(req.model, models_used)
+        residency_status = self.residency(req.model, models_used)
         base: dict[str, Any] = dict(
             model_requested=req.model,
             models_used=models_used,
@@ -205,7 +269,10 @@ class ClaudeCodeExecutive:
             turns=int(data.get("num_turns", 0) or 0),
             permission_denials=list(data.get("permission_denials") or []),
             session_id=data.get("session_id"),
-            residency_ok=residency_ok,
+            # UNKNOWN is not a proven violation, so it does not fail the call — but it is
+            # recorded distinctly so an unverifiable run is never reported as a verified one.
+            residency_ok=residency_status is not ResidencyStatus.MISMATCH,
+            residency_status=residency_status,
         )
         if data.get("is_error"):
             err = str(data.get("result", ""))[:2000]
@@ -226,16 +293,31 @@ class ClaudeCodeExecutive:
             return CognitionResponse(ok=False, error="structured output is not an object", error_kind="schema", raw_text=raw[:4000], **base)
         return CognitionResponse(ok=True, parsed=parsed, raw_text=raw[:4000], **base)
 
-    def _residency_ok(self, requested: str, used: list[str]) -> bool:
+    def residency(self, requested: str, used: list[str]) -> ResidencyStatus:
+        """Classify model identity into verified / mismatch / unknown.
+
+        Absent telemetry is UNKNOWN, not VERIFIED: the runtime has not established which model
+        served the call, and recording that honestly is the point. A model in the same family
+        but of a different generation (``fable-5`` for a requested ``fable-5-1``) is a
+        MISMATCH — a downgrade is exactly what residency exists to detect. An alias request
+        resolved to a more specific id (``fable`` served by ``fable-5-1``) is VERIFIED.
+        """
         if not used:
-            return True  # nothing recorded (e.g. cached); cannot prove a violation
-        # Auxiliary models (title generation, summarisation) do not serve cognition; ignore them.
-        used = [m for m in used if not any(m.lower().startswith(a) for a in self.auxiliary_models_ok)] or used
-        req_key = requested.lower()
-        for m in used:
-            ml = m.lower()
-            if ml == req_key or ml.startswith(req_key) or req_key in ml:
-                return True
-        # Aliases: 'fable' -> 'claude-fable-*'
-        alias = req_key.replace("claude-", "").split("-")[0]
-        return any(alias and alias in m.lower() for m in used)
+            return ResidencyStatus.UNKNOWN
+        # Auxiliary models (title generation, summarisation) do not serve cognition.
+        aux = tuple(_canonical_model(a) for a in self.auxiliary_models_ok)
+        cognition = [m for m in used if not _canonical_model(m).startswith(aux)]
+        if not cognition:
+            # Only auxiliary models are recorded: nothing establishes who did the reasoning.
+            return ResidencyStatus.MISMATCH if used else ResidencyStatus.UNKNOWN
+        req = _canonical_model(requested)
+        if all(_is_same_model(req, _canonical_model(m)) for m in cognition):
+            return ResidencyStatus.VERIFIED
+        return ResidencyStatus.MISMATCH
+
+    def _residency_ok(self, requested: str, used: list[str]) -> Optional[bool]:
+        """Tri-state view of :meth:`residency`: True verified, False mismatch, None unknown."""
+        status = self.residency(requested, used)
+        if status is ResidencyStatus.UNKNOWN:
+            return None
+        return status is ResidencyStatus.VERIFIED

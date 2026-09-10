@@ -107,6 +107,12 @@ class Task(BaseModel):
     failure_signature: str = Field(default="", description="Structural signature of the last failure to avoid identical retries")
     artifact_ids: list[str] = Field(default_factory=list)
     verification_ids: list[str] = Field(default_factory=list)
+    verification_attempt_ids: list[str] = Field(
+        default_factory=list,
+        description="Every verification run against this task, passing or not. Distinct from "
+        "verification_ids (passing receipts only) so 'was it checked?' and 'did it pass?' "
+        "stay separate questions.",
+    )
     created_at: str = Field(default_factory=iso_now)
     updated_at: str = Field(default_factory=iso_now)
     resolves_unknown_ids: list[str] = Field(default_factory=list)
@@ -149,6 +155,12 @@ class Artifact(BaseModel):
     summary: str = ""
     produced_by_task_id: Optional[str] = None
     verified: bool = False
+    verified_hash: Optional[str] = Field(
+        default=None,
+        description="sha256 of the bytes that were actually verified. The completion gate re-hashes "
+        "the file and refuses to accept an artifact whose content no longer matches this value.",
+    )
+    verified_at: Optional[str] = None
     created_at: str = Field(default_factory=iso_now)
 
 
@@ -289,14 +301,39 @@ class MissionState(BaseModel):
                 return v
         return None
 
-    def passing_verifications(self, ids: list[str]) -> list[VerificationResult]:
-        """Resolve ids to records that actually passed. Unknown ids resolve to nothing."""
+    def passing_verifications(
+        self,
+        ids: list[str],
+        target_type: Optional[str] = None,
+        target_id: Optional[str] = None,
+    ) -> list[VerificationResult]:
+        """Resolve ids to records that actually passed *for the stated target*.
+
+        Unknown ids resolve to nothing. When `target_type`/`target_id` are supplied the record
+        must also be bound to that exact target: a passing receipt for some other artifact is
+        not evidence that this criterion was verified, however it came to be cited.
+        """
         out = []
         for vid in ids:
             v = self.verification(vid)
-            if v is not None and v.status == VerificationStatus.PASSED:
-                out.append(v)
+            if v is None or v.status != VerificationStatus.PASSED:
+                continue
+            if target_type is not None and v.target_type != target_type:
+                continue
+            if target_id is not None and v.target_id != target_id:
+                continue
+            out.append(v)
         return out
+
+    def referenced_verification_ids(self) -> set[str]:
+        """Every verification id some part of durable state still points at (F5 retention)."""
+        referenced: set[str] = set()
+        for c in self.success_criteria:
+            referenced.update(c.verification_ids)
+        for t in self.tasks:
+            referenced.update(t.verification_ids)
+            referenced.update(t.verification_attempt_ids)
+        return referenced
 
     def evidence_item(self, evidence_id: str) -> Optional[Evidence]:
         for e in self.evidence:

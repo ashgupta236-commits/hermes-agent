@@ -14,15 +14,33 @@ _NETWORK_TOOLS = ("web_fetch", "web_search")
 class ResourceLedger:
     def __init__(self, usage: ResourceUsage):
         self.usage = usage
+        self.reserved_calls = 0
+        self.reserved_cost_usd = 0.0
 
     # -- accounting -----------------------------------------------------------------
 
     def add_model_call(self, resp: CognitionResponse) -> None:
-        self.usage.model_calls += 1
-        self.usage.input_tokens += int(resp.input_tokens or 0)
-        self.usage.output_tokens += int(resp.output_tokens or 0)
-        self.usage.estimated_cost_usd += float(resp.cost_usd or 0.0)
-        self.usage.wall_clock_seconds += float(resp.duration_ms or 0) / 1000.0
+        """Account for a cognition call *and every retry behind it*.
+
+        A response that took three attempts cost three attempts. Charging the budget for one
+        makes the ledger optimistic exactly when the run is going badly, which is when an
+        accurate remaining-budget figure matters most.
+        """
+        attempts = max(1, int(getattr(resp, "attempts", 1) or 1))
+        records = list(getattr(resp, "attempt_records", []) or [])
+        self.usage.model_calls += attempts
+        self.usage.retries += attempts - 1
+        if records:
+            self.usage.input_tokens += sum(int(a.input_tokens or 0) for a in records)
+            self.usage.output_tokens += sum(int(a.output_tokens or 0) for a in records)
+            self.usage.estimated_cost_usd += sum(float(a.cost_usd or 0.0) for a in records)
+            self.usage.wall_clock_seconds += sum(float(a.duration_ms or 0) for a in records) / 1000.0
+        else:
+            self.usage.input_tokens += int(resp.input_tokens or 0)
+            self.usage.output_tokens += int(resp.output_tokens or 0)
+            self.usage.estimated_cost_usd += float(resp.cost_usd or 0.0)
+            self.usage.wall_clock_seconds += float(resp.duration_ms or 0) / 1000.0
+        self.release()
 
     def add_tool_call(self, res: ToolResult) -> None:
         self.usage.tool_calls += 1
@@ -38,6 +56,23 @@ class ResourceLedger:
     def add_cycle(self) -> None:
         self.usage.cycles += 1
 
+    # -- reservation ------------------------------------------------------------------
+
+    def reserve(self, calls: int = 1, cost_usd: float = 0.0) -> None:
+        """Hold budget for a call that is about to be made but has not been accounted yet.
+
+        Without this, a call in flight is invisible to :meth:`over_budget`, so a run can
+        authorise work it can no longer pay for. The reservation is released when the call is
+        accounted (:meth:`add_model_call`) or abandoned (:meth:`release`).
+        """
+        self.reserved_calls += max(0, int(calls))
+        self.reserved_cost_usd += max(0.0, float(cost_usd))
+
+    def release(self) -> None:
+        """Drop any outstanding reservation; the real usage has now been recorded."""
+        self.reserved_calls = 0
+        self.reserved_cost_usd = 0.0
+
     def add_wall_clock(self, seconds: float) -> None:
         self.usage.wall_clock_seconds += float(seconds)
 
@@ -46,14 +81,17 @@ class ResourceLedger:
     def over_budget(self, budget: Budget) -> Optional[str]:
         """Return a human-readable breach reason, or None when within budget."""
         u = self.usage
+        calls = u.model_calls + self.reserved_calls
+        cost = u.estimated_cost_usd + self.reserved_cost_usd
         if u.cycles >= budget.max_cycles:
             return f"cycle budget exhausted: {u.cycles}/{budget.max_cycles} cycles used"
-        if u.model_calls >= budget.max_model_calls:
-            return f"model-call budget exhausted: {u.model_calls}/{budget.max_model_calls} calls used"
+        if calls >= budget.max_model_calls:
+            held = f" ({self.reserved_calls} reserved)" if self.reserved_calls else ""
+            return f"model-call budget exhausted: {calls}/{budget.max_model_calls} calls used{held}"
         if u.subagents_spawned >= budget.max_subagents:
             return f"subagent budget exhausted: {u.subagents_spawned}/{budget.max_subagents} specialists spawned"
-        if budget.max_cost_usd is not None and u.estimated_cost_usd >= budget.max_cost_usd:
-            return f"cost budget exhausted: ${u.estimated_cost_usd:.2f} of ${budget.max_cost_usd:.2f} spent"
+        if budget.max_cost_usd is not None and cost >= budget.max_cost_usd:
+            return f"cost budget exhausted: ${cost:.2f} of ${budget.max_cost_usd:.2f} committed"
         if budget.max_wall_clock_seconds is not None and u.wall_clock_seconds >= budget.max_wall_clock_seconds:
             return (
                 f"wall-clock budget exhausted: {u.wall_clock_seconds:.0f}s of "
@@ -65,11 +103,11 @@ class ResourceLedger:
         u = self.usage
         out: dict[str, Any] = {
             "cycles": budget.max_cycles - u.cycles,
-            "model_calls": budget.max_model_calls - u.model_calls,
+            "model_calls": budget.max_model_calls - u.model_calls - self.reserved_calls,
             "subagents": budget.max_subagents - u.subagents_spawned,
         }
         if budget.max_cost_usd is not None:
-            out["cost_usd"] = round(budget.max_cost_usd - u.estimated_cost_usd, 4)
+            out["cost_usd"] = round(budget.max_cost_usd - u.estimated_cost_usd - self.reserved_cost_usd, 4)
         if budget.max_wall_clock_seconds is not None:
             out["wall_clock_seconds"] = round(budget.max_wall_clock_seconds - u.wall_clock_seconds, 1)
         return out
@@ -77,4 +115,6 @@ class ResourceLedger:
     def snapshot(self) -> dict[str, Any]:
         d = self.usage.model_dump()
         d["total_tokens"] = self.usage.input_tokens + self.usage.output_tokens
+        d["reserved_calls"] = self.reserved_calls
+        d["reserved_cost_usd"] = round(self.reserved_cost_usd, 6)
         return d

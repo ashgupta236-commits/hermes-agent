@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from enum import Enum
 from typing import Any, Optional, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -45,6 +46,29 @@ class CognitionRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResidencyStatus(str, Enum):
+    """Three distinct states, because "we could not tell" is not "we checked and it was fine"."""
+
+    VERIFIED = "verified"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
+class AttemptRecord(BaseModel):
+    """One billed provider attempt. Retries are separate attempts, each with its own cost."""
+
+    index: int
+    ok: bool = False
+    error_kind: str = ""
+    error: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    duration_ms: int = 0
+    models_used: list[str] = Field(default_factory=list)
+    residency_status: ResidencyStatus = ResidencyStatus.UNKNOWN
+
+
 class CognitionResponse(BaseModel):
     ok: bool
     parsed: dict[str, Any] = Field(default_factory=dict)
@@ -61,13 +85,22 @@ class CognitionResponse(BaseModel):
     permission_denials: list[dict[str, Any]] = Field(default_factory=list)
     session_id: Optional[str] = None
     residency_ok: bool = True
+    residency_status: ResidencyStatus = ResidencyStatus.UNKNOWN
+    attempts: int = Field(default=1, description="Billed provider attempts behind this response, including retries")
+    attempt_records: list[AttemptRecord] = Field(default_factory=list)
+
+    def billed_cost_usd(self) -> float:
+        """Total cost of every attempt, not just the one that happened to succeed."""
+        if self.attempt_records:
+            return sum(a.cost_usd for a in self.attempt_records)
+        return float(self.cost_usd or 0.0)
 
 
 @runtime_checkable
 class ExecutiveModel(Protocol):
     name: str
 
-    def call(self, request: CognitionRequest) -> CognitionResponse: ...
+    def call(self, request: CognitionRequest, /) -> CognitionResponse: ...
 
 
 class Timer:
