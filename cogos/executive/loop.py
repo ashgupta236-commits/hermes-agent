@@ -958,44 +958,104 @@ class Executive:
                 # Boundary parity with the firewall: a destination the write rules would not treat
                 # as local workspace never enters the ledger, whatever the tool returned.
                 continue
-            existing = next((a for a in state.artifacts if a.path and Path(a.path) == p), None)
-            version = ArtifactVersion(content_hash=digest, size_bytes=size, task_id=task.id if task else None, action_id=res.call_id)
-            if existing is None:
-                art = Artifact(
-                    name=p.name,
-                    kind="code" if p.suffix in (".py", ".ts", ".js", ".go", ".rs", ".java") else "file",
-                    path=str(p),
-                    content_hash=digest,
-                    summary=f"written by {call.tool} during this mission",
-                    produced_by_task_id=task.id if task else None,
-                    origin=ArtifactOrigin.MISSION_WRITE,
-                    mission_id=state.mission_id,
-                    produced_by_action_id=res.call_id,
-                    producer=call.tool,
-                    size_bytes=size,
-                    observed_at=iso_now(),
-                    versions=[version],
-                )
-                state.artifacts.append(art)
-                if task is not None and art.id not in task.artifact_ids:
-                    task.artifact_ids.append(art.id)
-                self.tracer.emit("artifact", f"candidate registered: {p.name} ({size} bytes, sha256 {digest[:12]}…)", data={"artifact_id": art.id, "path": str(p), "content_hash": digest, "origin": art.origin.value, "task_id": art.produced_by_task_id, "action_id": res.call_id, "verified": False})
-            else:
-                # A rewrite is a new version identity. History is appended, never replaced, and a
-                # verified status earned by the previous bytes does not carry over to these.
-                existing.versions.append(version)
-                existing.content_hash = digest
-                existing.size_bytes = size
-                existing.observed_at = iso_now()
-                existing.produced_by_action_id = res.call_id
-                if task is not None:
-                    existing.produced_by_task_id = task.id
-                    if existing.id not in task.artifact_ids:
-                        task.artifact_ids.append(existing.id)
-                existing.verified = False
-                existing.verified_hash = None
-                existing.verified_at = None
-                self.tracer.emit("artifact", f"candidate updated: {p.name} -> sha256 {digest[:12]}… (verification cleared)", data={"artifact_id": existing.id, "path": str(p), "content_hash": digest, "versions": len(existing.versions), "task_id": existing.produced_by_task_id, "action_id": res.call_id, "verified": False})
+            self._register_artifact_candidate(
+                state,
+                p,
+                origin=ArtifactOrigin.MISSION_WRITE,
+                producer=call.tool,
+                task=task,
+                action_id=res.call_id,
+                summary=f"written by {call.tool} during this mission",
+                known_digest=digest,
+                known_size=size,
+            )
+
+    def _register_artifact_candidate(
+        self,
+        state: MissionState,
+        path: Path,
+        *,
+        origin: ArtifactOrigin,
+        producer: str,
+        task: Optional[Task],
+        action_id: Optional[str],
+        summary: str,
+        known_digest: Optional[str] = None,
+        known_size: Optional[int] = None,
+    ) -> Optional[Artifact]:
+        """Record (or update) one artifact candidate with full provenance.
+
+        The single place a path enters the ledger, so every route carries the same guarantees:
+        the file exists and is readable, it lies inside the writable roots, its bytes are hashed,
+        and an update creates a new version identity rather than overwriting history. Identity is
+        the *resolved* path, so two spellings of the same file are one artifact and the gate
+        cannot later hash a different file than the one that was verified.
+        """
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        writable = getattr(self.fabric.firewall, "writable_roots", None) or []
+        if writable and not _path_within(resolved, list(writable)):
+            return None
+        try:
+            if not resolved.is_file():
+                return None
+            digest = known_digest if known_digest is not None else (file_sha256(resolved) or "")
+            size = known_size if known_size is not None else resolved.stat().st_size
+        except OSError:
+            return None
+        if not digest:
+            return None
+
+        existing = next((a for a in state.artifacts if a.path and self._same_path(a.path, resolved)), None)
+        version = ArtifactVersion(content_hash=digest, size_bytes=size, task_id=task.id if task else None, action_id=action_id)
+        if existing is None:
+            art = Artifact(
+                name=resolved.name,
+                kind="code" if resolved.suffix in (".py", ".ts", ".js", ".go", ".rs", ".java") else "file",
+                path=str(resolved),
+                content_hash=digest,
+                summary=summary,
+                produced_by_task_id=task.id if task else None,
+                origin=origin,
+                mission_id=state.mission_id,
+                produced_by_action_id=action_id,
+                producer=producer,
+                size_bytes=size,
+                observed_at=iso_now(),
+                versions=[version],
+            )
+            state.artifacts.append(art)
+            if task is not None and art.id not in task.artifact_ids:
+                task.artifact_ids.append(art.id)
+            self.tracer.emit("artifact", f"candidate registered: {resolved.name} ({size} bytes, sha256 {digest[:12]}…)", data={"artifact_id": art.id, "path": str(resolved), "content_hash": digest, "origin": origin.value, "producer": producer, "task_id": art.produced_by_task_id, "action_id": action_id, "verified": False})
+            return art
+        if existing.content_hash == digest:
+            return existing  # same bytes: nothing new to record
+        # A rewrite is a new version identity. History is appended, never replaced, and a verified
+        # status earned by the previous bytes does not carry over to these.
+        existing.versions.append(version)
+        existing.content_hash = digest
+        existing.size_bytes = size
+        existing.observed_at = iso_now()
+        existing.produced_by_action_id = action_id
+        if task is not None:
+            existing.produced_by_task_id = task.id
+            if existing.id not in task.artifact_ids:
+                task.artifact_ids.append(existing.id)
+        existing.verified = False
+        existing.verified_hash = None
+        existing.verified_at = None
+        self.tracer.emit("artifact", f"candidate updated: {resolved.name} -> sha256 {digest[:12]}… (verification cleared)", data={"artifact_id": existing.id, "path": str(resolved), "content_hash": digest, "versions": len(existing.versions), "task_id": existing.produced_by_task_id, "action_id": action_id, "verified": False})
+        return existing
+
+    @staticmethod
+    def _same_path(recorded: str, resolved: Path) -> bool:
+        try:
+            return Path(recorded).resolve() == resolved
+        except OSError:
+            return str(recorded) == str(resolved)
 
     # -- tool-backed verification and falsification (F1) -------------------------------
 
@@ -1395,8 +1455,19 @@ class Executive:
                 found.append(f"artifact '{a.name}' at {a.path}")
 
         for t in state.tests:
-            if t.status == VerificationStatus.PASSED and not t.expected_failure and (_iso_to_ms(t.ran_at) or -1) >= created_ms:
-                found.append(f"passed test record '{t.name}'")
+            if t.status != VerificationStatus.PASSED or t.expected_failure or (_iso_to_ms(t.ran_at) or -1) < created_ms:
+                continue
+            # Same scope rule as criterion verification: a green run grounds a judgement about the
+            # criteria it was run *for*. Without this, one passing record anywhere in the mission
+            # grounded a confident judgement about every criterion, including ones it says nothing
+            # about — which is the "model confidence as a receipt" shortcut by another route.
+            producing = state.task(t.task_id) if t.task_id else None
+            bound = criterion.id in (t.criterion_ids or []) or (producing is not None and criterion.id in (producing.addresses_criterion_ids or []))
+            if not bound:
+                continue
+            if t.counts and t.executed <= 0:
+                continue  # a run that executed nothing grounds nothing
+            found.append(f"passed test record '{t.name}'")
 
         for c in state.claims:
             if c.status not in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED):
@@ -1738,11 +1809,20 @@ class Executive:
                 p = Path(str(a))
                 if not p.is_absolute():
                     p = Path(self.config.repo_root) / p
-                if p.exists() and p.is_file():
-                    art = Artifact(name=p.name, kind="file", path=str(p), produced_by_task_id=task.id if task else None, summary=f"produced by specialist {rep.get('role')}")
-                    state.artifacts.append(art)
-                    if task is not None:
-                        task.artifact_ids.append(art.id)
+                # A specialist *asserting* a path is a claim, not an observed write, so it goes
+                # through the same registration discipline as everything else: hashed, bounded to
+                # the writable roots, and marked with where it came from. Without that a report
+                # could name any existing file — /etc/passwd included — and have it enter the
+                # ledger with no content identity at all.
+                self._register_artifact_candidate(
+                    state,
+                    p,
+                    origin=ArtifactOrigin.SPECIALIST_REPORT,
+                    producer=f"specialist:{rep.get('role')}",
+                    task=task,
+                    action_id=None,
+                    summary=f"asserted by specialist {rep.get('role')}",
+                )
         beliefs.recompute()
         beliefs.detect_contradictions()
 

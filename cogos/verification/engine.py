@@ -244,21 +244,28 @@ class VerificationEngine:
         """
         out: list[tuple[Path, Optional[str]]] = []
         seen: set[str] = set()
-        for raw in input_paths or []:
+
+        def _add(raw: str, artifact_id: Optional[str]) -> None:
             p = Path(raw)
             if not p.is_absolute() and cwd:
                 p = Path(cwd) / p
-            if str(p) not in seen:
-                seen.add(str(p))
-                out.append((p, None))
-        for art in self.state.artifacts:
-            if not art.path:
-                continue
-            p = Path(art.path)
+            # Canonical identity: a symlinked component or a different spelling of the same file
+            # must not be recorded as a different input, or the gate would later hash something
+            # other than what was verified.
+            try:
+                p = p.resolve()
+            except OSError:
+                pass
             if str(p) in seen:
-                continue
+                return
             seen.add(str(p))
-            out.append((p, art.id))
+            out.append((p, artifact_id))
+
+        for raw in input_paths or []:
+            _add(str(raw), None)
+        for art in self.state.artifacts:
+            if art.path:
+                _add(art.path, art.id)
         return out
 
     def verify_code(
@@ -339,8 +346,11 @@ class VerificationEngine:
                 )
             )
 
-        moved = set(guard.changed_since(before))
+        # One post-run read, used both to detect movement and to record the version. Taking two
+        # separate snapshots would leave a window in which bytes could change between "did it
+        # move?" and "what is it now?", and be recorded as verified without being flagged.
         after = guard.snapshot()
+        moved = {k for k in set(before) | set(after) if before.get(k, "") != after.get(k, "")}
         input_versions = [
             InputVersion(path=str(p), content_hash=after.get(str(p), ""), artifact_id=aid, changed_during_verification=str(p) in moved)
             for p, aid in relevant

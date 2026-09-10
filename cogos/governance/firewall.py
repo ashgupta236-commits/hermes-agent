@@ -131,7 +131,12 @@ class CapabilityFirewall:
         from cogos.tools.fabric import normalise_arguments
 
         args = normalise_arguments(call.tool, dict(call.arguments))
-        if spec.substrate == "shell":
+        # The `tests` substrate runs its command string through a shell exactly as `shell` does,
+        # so it is classified identically. Without this it was an unclassified execution
+        # primitive: the same `rm -rf ... && curl ... > /etc/passwd` was DENIED as `shell` and
+        # ALLOWED as `run_tests`, because an unmatched substrate falls through to the spec's
+        # default class. Intent ("this is verification") is not a capability.
+        if spec.substrate in ("shell", "tests"):
             command = str(args.get("command", ""))
             base = classify_shell_command(command)
             # A destination denied to write_file must be denied on this route too, so the shell
@@ -185,7 +190,9 @@ class CapabilityFirewall:
             return FirewallVerdict(decision=PolicyDecision.DENY, action_class=action_class, reason=f"tool unavailable: {spec.unavailable_reason or 'not configured'}")
         if action_class.value in cfg.denied_action_classes:
             return FirewallVerdict(decision=PolicyDecision.DENY, action_class=action_class, reason=f"action class '{action_class.value}' is denied by policy")
-        if spec.substrate == "shell" and not cfg.allow_shell:
+        if spec.substrate in ("shell", "tests") and not cfg.allow_shell:
+            # `tests` spawns a shell too. A policy that disables shell execution must not be
+            # circumventable by routing the same command through the test runner.
             return FirewallVerdict(decision=PolicyDecision.DENY, action_class=action_class, reason="shell execution disabled by policy")
         if spec.network:
             if not cfg.allow_network:

