@@ -78,6 +78,32 @@ def _is_same_model(requested: str, used: str) -> bool:
     return used.startswith(requested + "-")
 
 
+_DIAGNOSTIC_FIELDS = ("subtype", "api_error_status", "stop_reason", "terminal_reason", "num_turns", "permission_denials")
+
+
+def _diagnostic_from(data: dict[str, Any]) -> str:
+    """Describe a failure the CLI reported without a message.
+
+    Everything here comes from the result envelope the CLI already returned, so this reports
+    what was actually observed rather than guessing a cause. It says explicitly when the model
+    produced output that could not be used, because that is the case a bare "structural error"
+    hides most expensively.
+    """
+    parts: list[str] = []
+    for field in _DIAGNOSTIC_FIELDS:
+        value = data.get(field)
+        if value not in (None, "", [], 0):
+            parts.append(f"{field}={value}")
+    usage = data.get("usage") or {}
+    produced = int(usage.get("output_tokens", 0) or 0)
+    if produced:
+        has_structured = data.get("structured_output") is not None
+        parts.append(f"output_tokens={produced} but structured_output={'present' if has_structured else 'absent'}")
+    if not parts:
+        parts.append("the CLI reported is_error with no result, subtype or usage detail")
+    return "claude reported an error without a message; " + ", ".join(parts)
+
+
 def _with_attempts(resp: CognitionResponse, attempts: list[AttemptRecord]) -> CognitionResponse:
     """Attach every billed attempt and roll its usage into the response totals.
 
@@ -275,7 +301,12 @@ class ClaudeCodeExecutive:
             residency_status=residency_status,
         )
         if data.get("is_error"):
-            err = str(data.get("result", ""))[:2000]
+            err = str(data.get("result", "") or "")[:2000]
+            if not err.strip():
+                # A billed failure with no message is the worst kind of trace: it costs money
+                # and explains nothing. Reconstruct a diagnostic from the fields the CLI does
+                # return, so `error` is never empty on a failed call.
+                err = _diagnostic_from(data)
             if _is_refusal(err):
                 return CognitionResponse(ok=False, error=err, error_kind="refused", raw_text=err, **base)
             kind = "transient" if _is_transient(err) else "structural"

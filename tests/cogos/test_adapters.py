@@ -432,3 +432,29 @@ def test_heuristic_interpret_maps_failed_tool_results():
     # a failed verification marks the task failed with implementation failure kind
     ver = interpret([], verification={"status": "failed", "summary": "tests red"})
     assert ver.task_updates[0].failure_kind == "implementation" and ver.task_updates[0].failure_reason == "tests red"
+
+
+def test_a_billed_failure_is_never_recorded_without_a_message():
+    """Found live: the CLI reported is_error with an empty result, and cogos recorded a
+    structural failure with an empty error string — after billing $0.25 and 1903 output
+    tokens. A trace that costs money and explains nothing is the one that matters most."""
+    ex = ClaudeCodeExecutive("claude-fable-5-1")
+    payload = _cli_result(
+        is_error=True,
+        result="",
+        subtype="error_max_turns",
+        num_turns=4,
+        usage={"input_tokens": 7536, "output_tokens": 1903},
+        structured_output=None,
+    )
+    resp = ex._parse(_proc(json.dumps(payload)), _req(), 1)
+
+    assert resp.ok is False
+    assert resp.error.strip(), "a failed call must never carry an empty error"
+    assert "error_max_turns" in resp.error
+    assert "output_tokens=1903" in resp.error and "structured_output=absent" in resp.error
+
+    # Nothing at all to go on: still not an empty error.
+    bare = ex._parse(_proc(json.dumps({"type": "result", "is_error": True, "result": ""})), _req(), 1)
+    assert bare.ok is False and bare.error.strip()
+    assert "no result, subtype or usage detail" in bare.error
