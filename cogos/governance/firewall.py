@@ -153,12 +153,18 @@ class CapabilityFirewall:
             if base == ActionClass.REVERSIBLE_LOCAL and self._writes_outside_roots(joined):
                 return ActionClass.CONSEQUENTIAL_SHARED
             return base
-        if spec.substrate == "filesystem" and spec.name in ("write_file", "delete_file", "append_file"):
+        if spec.substrate == "filesystem":
             target = Path(str(args.get("path", "")))
             if not target.is_absolute():
                 target = self.repo_root / target
+            # Credential sensitivity is a property of the file, not of the verb. `cat .env` through
+            # the shell requires human authorization, so reading the same path through `read_file`
+            # must too — otherwise the boundary is decided by which tool the caller happened to
+            # pick. This applies to reads and writes alike; the write-specific rules follow.
             if _CREDENTIAL.search(str(target)):
                 return ActionClass.CREDENTIAL_SENSITIVE
+            if spec.name not in ("write_file", "delete_file", "append_file"):
+                return spec.default_action_class
             if spec.name == "delete_file":
                 return ActionClass.DESTRUCTIVE if not _path_within(target, self.writable_roots) else ActionClass.REVERSIBLE_LOCAL
             return ActionClass.REVERSIBLE_LOCAL if _path_within(target, self.writable_roots) else ActionClass.CONSEQUENTIAL_SHARED

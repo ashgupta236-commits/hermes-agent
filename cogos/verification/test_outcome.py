@@ -120,18 +120,33 @@ def detect_framework(command: str) -> str:
     return "pytest"
 
 
+def summary_lines(output: str) -> list[str]:
+    """Every runner-summary-shaped line in the output.
+
+    More than one means the result is not attributable. The code under test writes to the same
+    stream the runner does, so a ``conftest.py`` that prints ``3 passed in 0.12s`` puts a second
+    summary in front of the real one — verified: a suite whose only test was *skipped* reported
+    three passing tests that way.
+    """
+    return [m.group("summary").strip("= ") for m in _PYTEST_SUMMARY.finditer(output or "")]
+
+
 def parse_test_output(output: str) -> dict[str, int]:
     """Counts from a runner's summary line.
 
     Isolated here (rather than inline in the subprocess handler) so it can be tested against
     representative outputs, and anchored on the runner's ``N <kind> in <duration>s`` summary form
     so that a stray "5 passed" elsewhere in a log is not mistaken for a result line.
+
+    When the output carries more than one summary line the counts are not attributable to the
+    runner, so nothing is reported: :func:`classify_test_run` turns that into INCONCLUSIVE rather
+    than picking one of them.
     """
     counts = {k: 0 for k in COUNT_KEYS}
-    m = _PYTEST_SUMMARY.search(output or "")
-    if not m:
+    lines = summary_lines(output)
+    if len(lines) != 1:
         return counts
-    for num, kind in _PYTEST_COUNTS.findall(m.group("summary")):
+    for num, kind in _PYTEST_COUNTS.findall(lines[0]):
         key = "error" if kind.startswith("error") else kind
         if key in counts:
             counts[key] += int(num)
@@ -160,6 +175,7 @@ def classify_test_run(
     """
     c = {k: int((counts or {}).get(k, 0) or 0) for k in COUNT_KEYS}
     framework = detect_framework(command)
+    ambiguous = len(summary_lines(output or "")) > 1
     collected_m = _COLLECTED.search(output or "")
     collected = int(collected_m.group(1)) if collected_m else None
     collection_error = bool(_COLLECTION_ERROR.search(output or ""))
@@ -184,6 +200,14 @@ def classify_test_run(
     # is a defect in the thing under test rather than an absence of evidence about it.
     if collection_error:
         return outcome(FAILED, "tests could not be collected")
+    if ambiguous:
+        # Two or more summary lines: something besides the runner wrote one of them, and there is
+        # no honest way to pick. A real failure still fails below on the exit code; what cannot
+        # happen is reading this as a pass.
+        c["passed"] = c["failed"] = c["error"] = c["skipped"] = 0
+        if exit_code not in (0, None):
+            return outcome(FAILED, f"command exited {exit_code}; output carries multiple runner summaries")
+        return outcome(INCONCLUSIVE, "output carries more than one runner summary: the result is not attributable")
     if c["failed"] or c["error"]:
         return outcome(FAILED, f"{c['failed']} failed, {c['error']} error(s)")
 
