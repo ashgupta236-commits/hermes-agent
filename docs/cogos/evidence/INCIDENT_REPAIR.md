@@ -14,9 +14,9 @@ AUTHORIZED ACTION -> OBSERVABLE RESULT -> STRUCTURED EVIDENCE -> ARTIFACT/VERSIO
 | | |
 | --- | --- |
 | Starting commit | `957c858` (clean tree) |
-| Ending commit | see `git log`; the repair is `a0aacf4` → `9f8e255` and follow-ups |
+| Ending commit | see `git log`; the repair runs `a0aacf4` → HEAD |
 | Baseline gate at start | 471 tests, 20/20 evals, ruff clean, ty clean, demo completes |
-| Gate at end | **528 tests, 20/20 evals, ruff clean, ty clean, demo completes** |
+| Gate at end | **544 tests, 20/20 evals, ruff clean, ty clean, demo completes** |
 | Live Run #3 | **not executed** — protocol prepared in [`LIVE_RUN_3_PROTOCOL.md`](LIVE_RUN_3_PROTOCOL.md) |
 
 Repository-wide `pytest` also collects `tests/integration/test_ha_integration.py` and siblings,
@@ -124,7 +124,7 @@ materially blocked Live Run #2" — is **confirmed**, with one correction and on
 | --- | --- | --- |
 | `loop.py` | `_execute_task_plan` runs a VERIFY/FALSIFY task's declared plan through the ordinary `_tool` funnel; `_verification_from_observations` turns the results into the verification | Tool-backed verification executes and its real result reaches the verifier |
 | `loop.py` | verdict comes from `res.ok` / `error_kind` only; output is recorded as detail | A file's contents cannot argue the verifier into a verdict |
-| `verification/test_outcome.py` | `classify_test_run` decides from structured evidence; `parse_test_output` is anchored on the runner's summary line; `detect_framework` reads the **command** | Execution is observed, not inferred, and a process cannot report its own test results |
+| `verification/test_outcome.py` | `classify_test_run` decides from structured evidence; counts are read only from an **unambiguous** runner summary; `detect_framework` reads the command and rejects composed commands | Execution is observed, not inferred, and the subject cannot write its own verdict |
 | `engine.py` | `verify_code` records exit code, counts, executed, framework, cwd and criterion scope | "Did the required tests run?" is answerable from state |
 | `engine.py` | `verify_criterion` requires criterion binding **and** observed execution | An unrelated or zero-execution run proves nothing |
 | `loop.py` | `_register_artifact_candidate` is the single registration site, used by the write path and the specialist path | Candidates are hashed, bounded to writable roots, versioned, and never verified on registration |
