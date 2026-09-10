@@ -102,6 +102,7 @@ class AnchorChannel(BaseModel):
     verdict: str = ""
     hold_id: Optional[str] = None
     disagreement_kinds: list[str] = Field(default_factory=list)
+    max_materiality: float = Field(default=0.0, ge=0.0, le=1.0, description="How much the difference bears on the decision")
 
 
 class Discrepancy(BaseModel):

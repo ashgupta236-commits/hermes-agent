@@ -125,6 +125,7 @@ class ChannelRecorder:
             verdict=str(getattr(getattr(getattr(outcome, "assessment", None), "verdict", ""), "value", "")),
             hold_id=getattr(getattr(outcome, "hold", None), "id", None),
             disagreement_kinds=[str(getattr(d.kind, "value", d.kind)) for d in getattr(outcome, "disagreements", [])],
+            max_materiality=max((float(d.materiality) for d in getattr(outcome, "disagreements", [])), default=0.0),
         )
 
     # -- reconciliation ---------------------------------------------------------------
@@ -195,11 +196,16 @@ def reconcile(rec: DecisionRecord) -> list[Discrepancy]:
             )
 
     if rec.anchor.hold_id or rec.anchor.disagreement_kinds:
+        # Severity follows materiality: an anchor that *refutes* the position is a
+        # high-priority conflict, while one that merely could not corroborate what the runtime
+        # verified deterministically is a recorded limitation, not an alarm.
+        material = bool(rec.anchor.hold_id) or rec.anchor.max_materiality >= 0.5
         out.append(
             Discrepancy(
                 kind=DiscrepancyKind.ANCHOR_CONFLICT,
-                detail="blind assessment disagreed: " + ", ".join(rec.anchor.disagreement_kinds[:4]),
-                severity=1.0,
+                detail=("blind assessment disagreed: " if material else "blind assessment could not corroborate: ")
+                + ", ".join(rec.anchor.disagreement_kinds[:4]),
+                severity=1.0 if material else 0.3,
                 channels=[ChannelName.DECLARED, ChannelName.ANCHOR],
             )
         )
