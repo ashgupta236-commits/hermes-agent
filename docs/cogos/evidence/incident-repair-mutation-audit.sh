@@ -12,11 +12,20 @@ run_case() {
   rm -rf "$WORK"
   mkdir -p "$WORK"
   cp -r "$SRC/cogos" "$SRC/tests" "$SRC/pyproject.toml" "$WORK/" 2>/dev/null
+  # A replacement whose target string has drifted silently does nothing, and the test then
+  # "passes" for the most misleading reason available. Checksum the tree and refuse a no-op.
+  local before after
+  before=$(cd "$WORK" && find cogos -name '*.py' -exec cat {} + | md5sum)
   ( cd "$WORK" && "$PY" - <<PYEOF
 import pathlib
 $pyedit
 PYEOF
-  ) || { printf '  %-52s %s\n' "$name" "EDIT-FAILED"; return; }
+  ) || { printf '  %-52s %s\n' "$name" "EDIT-ERROR"; return; }
+  after=$(cd "$WORK" && find cogos -name '*.py' -exec cat {} + | md5sum)
+  if [ "$before" = "$after" ]; then
+    printf '  %-52s %s\n' "$name" "MUTATION DID NOT APPLY  <-- fix the harness, not the test"
+    return
+  fi
   local out
   out=$(cd "$WORK" && PYTHONPATH="$WORK" "$PY" -m pytest "tests/cogos/test_incident_pipeline.py::$test" -q 2>&1 | tail -3)
   if echo "$out" | grep -q "1 passed"; then
@@ -34,8 +43,23 @@ echo "--------------------------------------------------------------------------
 run_case "composed-command detection" "test_ver1_a_composed_command_cannot_forge_test_evidence" \
 'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    if _COMPOSED.search(text):\n        return \"unknown\"\n","",1);p.write_text(s)'
 
-run_case "ambiguous-summary detection" "test_a_conftest_cannot_forge_the_runner_summary" \
-'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    ambiguous = len(summary_lines(output or \"\")) > 1","    ambiguous = False",1);s=s.replace("    if len(lines) != 1:\n        return counts","    if not lines:\n        return counts",1);p.write_text(s)'
+run_case "ambiguous-summary detection" "test_rule_ambiguous_output_is_inconclusive_without_a_report" \
+'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    ambiguous = (not report_backed) and len(summary_lines(output or \"\")) > 1","    ambiguous = False",1);p.write_text(s)'
+
+run_case "runner-report requirement" "test_a_shadowing_module_cannot_impersonate_the_test_runner" \
+'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    if report_required and not report_backed and framework != \"unknown\":","    if False:",1);p.write_text(s)'
+
+run_case "report-path canonicalisation" "test_r7_two_spellings_of_the_same_file_are_one_artifact" \
+'p=pathlib.Path("cogos/executive/loop.py");s=p.read_text();s=s.replace("        try:\n            resolved = path.resolve()\n        except OSError:\n            return None","        resolved = path",1);p.write_text(s)'
+
+run_case "workspace input binding" "test_the_working_tree_a_test_ran_in_is_bound_to_its_receipt" \
+'p=pathlib.Path("cogos/verification/engine.py");s=p.read_text();s=s.replace("        if cwd and include_workspace:","        if False:",1);p.write_text(s)'
+
+run_case "run outputs are not inputs" "test_files_the_run_itself_rewrites_are_outputs_not_inputs" \
+'p=pathlib.Path("cogos/verification/engine.py");s=p.read_text();s=s.replace("            if key in moved and key not in declared_paths:","            if False:",1);p.write_text(s)'
+
+run_case "vacuous-uncertainty guard" "test_a_mission_that_did_nothing_cannot_satisfy_an_uncertainty_criterion" \
+'p=pathlib.Path("cogos/executive/loop.py");s=p.read_text();s=s.replace("            if not state.unknowns and not (state.synthesis or {}).get(\"conclusion\"):\n                return None","            pass",1);p.write_text(s)'
 
 run_case "tests-substrate writable-roots enforcement" "test_fw1_the_test_runner_is_enforced_against_writable_roots_not_only_classified" \
 'p=pathlib.Path("cogos/governance/firewall.py");s=p.read_text();s=s.replace("(\"filesystem\", \"shell\", \"git\", \"tests\")","(\"filesystem\", \"shell\", \"git\")",1);p.write_text(s)'

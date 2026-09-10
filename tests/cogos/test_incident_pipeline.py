@@ -1037,10 +1037,20 @@ def test_r7_two_spellings_of_the_same_file_are_one_artifact():
         ex = sb.runtime.executive
         from cogos.schemas.mission import ArtifactOrigin as _O
 
-        p = _write(sb.root, "calc.py", CALC)
+        import os
+
+        pkg = sb.root / "pkg"
+        pkg.mkdir()
+        p = _write(pkg, "calc.py", CALC)
+        # A symlinked directory component: pathlib does NOT normalise this away, so the code under
+        # test has to resolve it. (An earlier version of this test used `root / "." / "calc.py"`,
+        # which pathlib collapses before the code ever sees it — the test could not fail.)
+        os.symlink(pkg, sb.root / "alias")
+        aliased = sb.root / "alias" / "calc.py"
+        assert str(aliased) != str(p), "precondition: the two spellings really differ"
+
         a1 = ex._register_artifact_candidate(state, p, origin=_O.MISSION_WRITE, producer="write_file", task=None, action_id="a1", summary="v1")
-        weird = Path(str(sb.root)) / "." / "calc.py"
-        a2 = ex._register_artifact_candidate(state, weird, origin=_O.MISSION_WRITE, producer="write_file", task=None, action_id="a2", summary="v1 again")
+        a2 = ex._register_artifact_candidate(state, aliased, origin=_O.MISSION_WRITE, producer="write_file", task=None, action_id="a2", summary="v1 again")
 
         assert a1 is not None and a2 is not None and a1.id == a2.id, "same file, one artifact"
         assert len(state.artifacts) == 1
@@ -1428,19 +1438,25 @@ def test_the_working_tree_a_test_ran_in_is_bound_to_its_receipt(tmp_path):
     assert mission_completion_check(state).status != PASSED, "an unregistered implementation swap must still be caught"
 
 
-def test_files_the_run_itself_wrote_are_outputs_not_inputs(tmp_path):
-    """A cache or state file the run creates must not be bound as an input, or every verification
-    would report its own by-products as inputs that changed underneath it."""
+def test_files_the_run_itself_rewrites_are_outputs_not_inputs(tmp_path):
+    """A file that existed before the run and that the run *modifies* is a by-product — a cache, a
+    log, a state store. Binding it would make every verification report its own output as an input
+    that changed underneath it, and turn a perfectly good run inconclusive.
+
+    Note this must be a file that exists *before* the run: one created during it was never a
+    candidate in the first place, so it exercises nothing.
+    """
     _write(tmp_path, "calc.py", CALC)
     _write(tmp_path, "test_calc.py", TEST_CALC)
-    _write(tmp_path, "conftest.py", "def pytest_sessionfinish(session, exitstatus):\n    open('run_output.txt', 'w').write('written during the run')\n")
+    _write(tmp_path, "run_state.txt", "before the run\n")
+    _write(tmp_path, "conftest.py", "def pytest_sessionfinish(session, exitstatus):\n    open('run_state.txt', 'w').write('rewritten during the run')\n")
     state = MissionState(objective="outputs are not inputs")
 
     res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path))
 
     assert res.status == PASSED, f"a by-product must not make a good run incoherent: {res.summary}"
     bound = {Path(iv.path).name for iv in res.input_versions}
-    assert "run_output.txt" not in bound, "a file the run wrote is its output"
+    assert "run_state.txt" not in bound, "a file the run rewrote is its output, not its input"
     assert "calc.py" in bound
 
 
@@ -1542,3 +1558,83 @@ def test_junit_counts_reads_a_report_and_rejects_a_missing_or_broken_one(tmp_pat
     empty = tmp_path / "empty.xml"
     empty.write_text("", encoding="utf-8")
     assert junit_counts(empty) is None
+
+
+# --------------------------------------------------------------------------------------
+# Direct coverage of every classify_test_run branch.
+#
+# The end-to-end tests above each exercise a whole pipeline, so several classification rules
+# were only incidentally covered: deleting one left the suite green because a different rule in
+# the same function produced the same verdict. These pin each rule on its own.
+# --------------------------------------------------------------------------------------
+
+_PYTEST_CMD = "python -m pytest -q"
+
+
+def _classify(**kw):
+    from cogos.verification.test_outcome import classify_test_run
+
+    kw.setdefault("command", _PYTEST_CMD)
+    kw.setdefault("exit_code", 0)
+    return classify_test_run(**kw)
+
+
+def test_rule_failures_and_errors_fail():
+    assert _classify(report_counts={"passed": 1, "failed": 1, "error": 0, "skipped": 0}).status == FAILED
+    assert _classify(report_counts={"passed": 1, "failed": 0, "error": 2, "skipped": 0}).status == FAILED
+
+
+def test_rule_collection_error_fails():
+    out = _classify(counts={"passed": 3}, output="ERROR collecting test_x.py\n3 passed in 0.1s")
+    assert out.status == FAILED and "collect" in out.reason
+
+
+def test_rule_all_skipped_is_inconclusive():
+    out = _classify(report_counts={"passed": 0, "failed": 0, "error": 0, "skipped": 4})
+    assert out.status == INCONCLUSIVE and "skipped" in out.reason
+
+
+def test_rule_ambiguous_output_is_inconclusive_without_a_report():
+    """Defence in depth for runners that produce no machine-readable report."""
+    out = _classify(command="python -m unittest discover", counts={"passed": 3},
+                    output="3 passed in 0.12s\n...\n1 skipped in 0.01s")
+    assert out.status == INCONCLUSIVE and "more than one runner summary" in out.reason
+    assert out.executed == 0
+
+
+def test_rule_a_report_outranks_ambiguous_stdout():
+    """With a report, stdout no longer decides anything — including its ambiguity."""
+    out = _classify(report_counts={"passed": 2, "failed": 0, "error": 0, "skipped": 0},
+                    output="3 passed in 0.12s\n...\n2 passed in 0.01s")
+    assert out.status == PASSED and out.passed == 2
+
+
+def test_rule_nonzero_exit_with_nothing_executed_fails():
+    out = _classify(command="python -m unittest discover", exit_code=2, counts={}, output="boom")
+    assert out.status == FAILED and "exited 2" in out.reason
+
+
+def test_rule_pytest_exit_five_is_inconclusive_not_failed():
+    from cogos.verification.test_outcome import PYTEST_NO_TESTS_COLLECTED
+
+    out = _classify(command="python -m unittest discover", exit_code=PYTEST_NO_TESTS_COLLECTED,
+                    counts={}, output="no tests ran in 0.01s")
+    assert out.status == INCONCLUSIVE and "no tests were collected" in out.reason
+
+
+def test_rule_last_resort_zero_execution_is_inconclusive():
+    """Exit 0, a recognised runner, no report required, nothing parsed and no explicit no-tests
+    marker. The command succeeded at being a command; that is not evidence about tests."""
+    out = _classify(command="python -m unittest discover", exit_code=0, counts={}, output="done.")
+    assert out.status == INCONCLUSIVE and out.executed == 0
+    assert out.status != PASSED
+
+
+def test_rule_nonzero_exit_with_passing_counts_still_fails():
+    out = _classify(exit_code=1, report_counts={"passed": 3, "failed": 0, "error": 0, "skipped": 0})
+    assert out.status == FAILED and "exited 1" in out.reason
+
+
+def test_rule_a_clean_report_backed_pass():
+    out = _classify(report_counts={"passed": 3, "failed": 0, "error": 0, "skipped": 1})
+    assert out.status == PASSED and out.executed == 3

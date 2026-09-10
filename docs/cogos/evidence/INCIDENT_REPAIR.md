@@ -16,7 +16,7 @@ AUTHORIZED ACTION -> OBSERVABLE RESULT -> STRUCTURED EVIDENCE -> ARTIFACT/VERSIO
 | Starting commit | `957c858` (clean tree) |
 | Ending commit | see `git log`; the repair runs `a0aacf4` → HEAD |
 | Baseline gate at start | 471 tests, 20/20 evals, ruff clean, ty clean, demo completes |
-| Gate at end | **544 tests, 20/20 evals, ruff clean, ty clean, demo completes** |
+| Gate at end | **562 tests, 20/20 evals, ruff clean, ty clean, demo completes** |
 | Live Run #3 | **not executed** — protocol prepared in [`LIVE_RUN_3_PROTOCOL.md`](LIVE_RUN_3_PROTOCOL.md) |
 
 Repository-wide `pytest` also collects `tests/integration/test_ha_integration.py` and siblings,
@@ -183,6 +183,17 @@ of the repair itself. All are fixed and regression-tested.
 | A7 | `run_tests` output was `VERIFIED_TOOL`, so the stdout of an arbitrary command was never scanned for injection | final adversarial review |
 | A8 | untrusted excerpts reached the judge's prompt beside genuinely deterministic checks with nothing marking them | final adversarial review |
 | A9 | `cat credentials.json` required human authorization but `read_file` on the same path did not | final adversarial review |
+| A10 | **a workspace module named `pytest.py` shadows the real runner** under `python -m pytest`: the command genuinely names pytest, the output holds exactly one summary line, and a mission whose real suite failed completed with two fabricated tests | final adversarial review |
+| A11 | an implementation written by an interpreter one-liner is invisible to the write-target extractor, so it was never bound to the receipt and could be swapped after verification | final adversarial review |
+| A12 | **a mission that had done nothing passed the gate**: for an uncertainty-shaped criterion, "no decision-changing unknowns are open" was read as satisfaction, and a mission with no tasks, no evidence and no synthesis has no unknowns either | final adversarial review |
+
+A10 is where the F2 repair finally ran out of road. Each earlier fix was a better way of reading a
+stream the code under test writes to — anchor the parser, detect the runner from the command,
+refuse ambiguous output — and each was defeated by a slightly better forgery. Counts now come from
+a JUnit report the runner writes to a path **the runtime chooses**, fresh per run: a runner that
+never ran cannot produce one, and a command that picks its own report path is not attributable
+either. Stdout parsing survives only as the display summary. That is a change of foundation rather
+than another patch, and it is what the earlier "remaining weakness" note said was needed.
 
 A1 is the one that matters most, because it defeats the stated basis of the F2 repair.
 "Detect the runner from the command, not the output" defends only against a *non-runner*
@@ -211,7 +222,9 @@ suite was audited by mutation: revert each guard in a scratch copy, run the test
 require that the test fails. The harness is checked in as
 `incident-repair-mutation-audit.sh`.
 
-Twelve guards, twelve tests. On the first run **eleven failed as expected and one did not**:
+Seventeen guards, seventeen tests. Two rounds were needed, and both found something.
+
+**Round one — eleven of twelve failed as expected and one did not**:
 `test_ver1_a_composed_command_cannot_forge_test_evidence` used a command containing `> /dev/null`,
 which the firewall denies as a write outside the workspace — so the command never ran and the
 assertion was satisfied by the write-target rule rather than by the composed-command guard. The
@@ -219,8 +232,21 @@ test now uses `echo pytest && echo "7 passed in 0.42s"`: it names a runner, it i
 output holds exactly one summary line and it writes nowhere, so no other rule can account for the
 outcome. All twelve now fail when their guard is reverted.
 
-Two lessons worth keeping: a test that asserts the right outcome is not necessarily testing the
-thing it is named for, and the cheapest way to find out is to break the guard on purpose.
+**Round two**, after the later fixes, found two more: `test_r7_two_spellings_of_the_same_file_are_one_artifact`
+was outright vacuous — it compared `root / "." / "calc.py"` against `root / "calc.py"`, which
+pathlib normalises to the same string before the code under test ever sees it, so the
+canonicalisation guard could be deleted with the test still green. It now uses a symlinked
+directory component, which pathlib does *not* collapse. And the outputs-are-not-inputs test used a
+file created *during* the run, which was never a binding candidate in the first place; it now uses
+a file that exists beforehand and is rewritten, which is the case the guard actually handles.
+
+The harness itself needed a guard. Twice a mutation silently failed to apply — the target string
+had drifted — and the test then "passed" for the most misleading reason available. It now
+checksums the tree and reports `MUTATION DID NOT APPLY` rather than a false clean bill.
+
+Three lessons worth keeping: a test that asserts the right outcome is not necessarily testing the
+thing it is named for; the cheapest way to find out is to break the guard on purpose; and an audit
+that can silently no-op is no better than the suite it is auditing.
 
 ---
 
@@ -239,6 +265,8 @@ established by a controlled live run.
 | Verification produced from an empty result | ✓ (the defect) | **✗** |
 | Zero-test false passes | **3 of 4** | **0 of 4** |
 | Forged-runner-summary false passes | **1 of 2** | **0 of 2** |
+| Shadowed-runner false pass (`pytest.py` in the workspace) | **✓ (gate passed)** | **✗ (inconclusive)** |
+| Mission that did nothing satisfies an uncertainty criterion | **✓** | **✗** |
 | Unrelated suite satisfies a differently scoped criterion | ✓ (the defect) | **✗** |
 | Artifact candidates registered from 2 authorized writes | 0 | **2** |
 | Candidates carrying version identity | 0 | **2** |
@@ -302,9 +330,12 @@ Honest limits of this repair.
 2. **Covered write mechanisms are `write_file`, `append_file` and shell writes the firewall's own
    extractor identifies.** Writes by a spawned process the extractor cannot see, and writes through
    the `git` tool, are not registered.
-3. **Version binding is bounded to the verification contract**: declared `input_paths` plus the
-   artifact ledger. It is not a dependency graph. A test whose behaviour depends on an unregistered,
-   undeclared file is not bound to that file.
+3. **Version binding covers declared `input_paths`, the artifact ledger, and the working tree the
+   command ran in** — bounded to that directory, skipping caches, vendored trees and runtime
+   state, and abandoning the binding past 500 files rather than truncating it. It is still not a
+   dependency graph: a test that depends on a file outside its own working tree is not bound to
+   that file, and a tree too large to bind honestly gets no binding at all (which the gate then
+   refuses, rather than accepting silently).
 4. **`input_paths` is model-supplied.** A model that declares nothing binds nothing — which the
    gate now refuses rather than silently accepting, but the *choice* of what to bind still sits
    with the party being verified unless artifacts carry it.
@@ -315,14 +346,12 @@ Honest limits of this repair.
    summaries. It now arrives explicitly framed as untrusted and carrying its injection flags, and
    it cannot change a deterministic status — that is what `authoritative` enforces — but the judge
    is not immune to it.
-9. **Test evidence rests on parsing a stream the subject can write to.** Requiring an unambiguous
-   summary closes the forgery route that was reproduced, and the exit code independently catches a
-   genuinely failing suite, but this is a mitigation rather than a proof. A machine-readable report
-   the code under test cannot author — a JUnit XML file written by the runner to a path chosen by
-   the runtime, say — would be a stronger foundation and is the obvious next step. A consequence
-   of the current rule worth knowing: a *genuinely passing* suite is reported INCONCLUSIVE if
-   anything else in the tree also prints a summary-shaped line. That is the conservative direction,
-   and the mission can re-run, but it is a real false-negative.
+9. **Test evidence now rests on a runner-written report, not on stdout** — but only for pytest.
+   A `unittest` or `nose` command still falls back to summary-line parsing, which the reproduced
+   attacks show is forgeable; those runners are simply not used here. Even for pytest the guarantee
+   is bounded: a conftest that reads `--junitxml` out of its own argv could write the file itself.
+   That requires arbitrary code execution in the tree under test, which the attacker already has,
+   so it raises the bar rather than closing the class.
 10. **`shell` write-target extraction remains best-effort**, and four ordinary spellings were
     reproduced escaping it: an environment variable target, an in-command `cd`, backtick
     substitution, and an interpreter one-liner (`python -c "open('/outside','w')"`). These are
