@@ -468,9 +468,18 @@ producing no evidence:
 c3  verify  task_…w06de9490 failed — "RESULT SUMMARY is empty — no artifact to evaluate."
 c4  verify  task_…c77b43f130 failed — "Result summary is empty: no COGOS_PROBE_OK line present"
 c7  verify  task_…wd22f225e failed — "RESULT SUMMARY is empty: no cat -n output …"
-c8  falsify task_…          failed — "Operation routing: task carried MUST run as
-                                      operation=execute_code … but was routed as falsify"
+c8  falsify task_…9dbb02731 failed — "Operation routing: task carried execute_code parameters
+                                      but was run as operation=falsify, which yields specialist
+                                      reasoning rather than tool execution; no deterministic
+                                      evidence …"
 ```
+
+> **Correction (see [§ Corrections](#corrections-to-earlier-claims), item 5).** An earlier revision
+> of this section quoted the c8 failure as *"task carried MUST run as operation=execute_code … but
+> was routed as falsify"*. That conflated the failure text above with the descriptions of the
+> **successor** tasks, which the executive created afterwards with a `MUST run as
+> operation=execute_code via the shell tool, not falsify` prefix. The text above is verbatim from
+> the trace.
 
 Cost: cycles 3, 4, 7 (select + verify + replan each) ≈ **$1.92**, plus cycle 8's mis-routed
 falsify chain ≈ **$1.53** — together **≈ $3.44, 33% of the run**. The executive eventually
@@ -482,7 +491,16 @@ a frontier model had to invent a prompt-level workaround for a dispatch bug is t
 
 `ver_1m26hx9rc493b844d` records `1/1 commands passed … tests: 0 passed, 0 failed, 0 errors` for a
 `python -c` command — a command that collects no tests at all — and the task-level verification
-recorded it as `passed`. (The criterion-level verifications for the same task were correctly
+recorded it as `passed`.
+
+> **Correction (see [§ Corrections](#corrections-to-earlier-claims), item 6).** The heading of this
+> finding originally read "the verification engine reports a 0-collected run as `passed`", which
+> misidentifies the mechanism. A genuine *pytest* zero-collection run exits 5, so it was recorded
+> FAILED, not passed. The real defect is broader: `verify_code` set the status from the process
+> exit code alone (`if res.ok: status = PASSED`), so **any** exit-0 command was a passing test
+> verification — a `python -c`, a shell script, anything. Measured on the frozen baseline, 3 of 4
+> zero-execution probes passed (exit-0 zero-collection, program-output forgery, all-skipped);
+> pytest exit 5 was the one that did not. (The criterion-level verifications for the same task were correctly
 `inconclusive`, so no criterion was satisfied on this basis; the defect is the `passed` status on
 a zero-collection run and the `tests: 0 passed` evidence it emitted.) The executive noticed and
 raised a severity-0.7 contradiction against its own verifier
@@ -564,3 +582,16 @@ superseded, not deleted.
    from fewer full-interpretation cycles, not from cheaper tiers.
 4. **The follow-up implied the temporal settler addressed the live failure.** It may; this run
    provides no live evidence either way, because no current-state claim was ever emitted.
+5. **The c8 failure quotation in §11 F1 was wrong.** It conflated the recorded failure text with
+   the descriptions of the successor tasks. Corrected in place above; the substance of F1 — that
+   operation routing sent tool-shaped work to an operation that executes no tools — is unchanged
+   and is if anything better supported by the verbatim text.
+6. **F2's mechanism was misstated.** "The verification engine reports a 0-collected run as
+   `passed`" is not what happened: pytest's zero-collection exit 5 was recorded FAILED. The defect
+   is that the status came from the exit code alone, so any exit-0 command counted as a passing
+   test run. Corrected in place above.
+7. **§11 F3's code reference is now historical.** `state.artifacts.append(...)` appeared exactly
+   once, at `cogos/executive/loop.py:1505`, *at the frozen run commit `03f0595`*. That is still the
+   correct account of the incident; it no longer describes the current tree, where registration is
+   funnelled through `Executive._register_artifact_candidate`. See
+   [`INCIDENT_REPAIR.md`](INCIDENT_REPAIR.md).

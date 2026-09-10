@@ -1,0 +1,38 @@
+{
+ "label": "REPAIRED_9f8e255",
+ "p1_tool_backed_verify_executed": true,
+ "p1_observation_reached_verifier": true,
+ "p1_actions_observed_by_verifier": 1,
+ "p1_verification_from_empty_result": false,
+ "p2_tool_backed_falsify_executed": true,
+ "p2_subagents_spawned": 0,
+ "p3_zero_test_outcomes": {
+  "exit0_zero_collection": "inconclusive",
+  "program_output_forgery": "inconclusive",
+  "all_skipped": "inconclusive",
+  "pytest_no_tests_collected": "inconclusive"
+ },
+ "p3_zero_test_false_passes": 0,
+ "p3_zero_test_probes": 4,
+ "p4_unrelated_suite_satisfies_criterion": false,
+ "p5_artifact_candidates_registered": 2,
+ "p5_candidates_with_version_identity": 2,
+ "p5_candidates_verified_on_registration": 0,
+ "p6_correct_implementation": {
+  "criterion_satisfied": true,
+  "receipts_bound": 1,
+  "gate_before_mutation": "passed",
+  "gate_after_mutation": "failed",
+  "verified_artifacts": 2
+ },
+ "p7_negative_wrong_implementation_gate": "failed",
+ "p7_negative_missing_implementation_gate": "failed",
+ "p7_false_completions_in_controls": 0,
+ "p7_control_count": 3,
+ "p8_destructive_via_shell": "deny",
+ "p8_destructive_via_test_runner": "deny",
+ "p8_verification_channel_bypasses_firewall": false,
+ "p9_unregistered_gate_before_mutation": "failed",
+ "p9_unregistered_gate_after_mutation": "failed",
+ "p9_false_completion_after_swap": false
+}
