@@ -18,8 +18,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from pydantic import BaseModel, Field
+
 from cogos.governance.firewall import CapabilityFirewall
 from cogos.governance.immune import scan_for_injection
+from cogos.ids import iso_now
 from cogos.schemas.common import ActionClass, PolicyDecision, TrustLevel
 from cogos.schemas.tools import ToolCall, ToolResult, ToolSpec
 from cogos.tools.safe_calc import safe_eval
@@ -54,6 +57,10 @@ class ToolFabric:
     def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
         self._specs[spec.name] = spec
         self._handlers[spec.name] = handler
+
+    def available_tool_names(self) -> list[str]:
+        """Effective permission surface at this moment, for the attempted channel (R2)."""
+        return [s.name for s in self._specs.values() if s.available]
 
     def specs(self, include_unavailable: bool = False) -> list[ToolSpec]:
         return [s for s in self._specs.values() if include_unavailable or s.available]
@@ -389,3 +396,92 @@ def build_default_fabric(firewall: CapabilityFirewall, context: ToolContext) -> 
     fab.register(ToolSpec(name="memory_search", description="Relevance-ranked retrieval from long-term memory (content is scanned as untrusted)", substrate="memory", parameters_schema=_params(query={"type": "string"}, limit={"type": "integer"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL), _memory_search)
     fab.register(ToolSpec(name="read_document", description="Read a document (text/markdown/json/csv) with light parsing", substrate="documents", parameters_schema=_params(path={"type": "string"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL), _read_document)
     return fab
+
+
+# -- capability discovery (R4) ---------------------------------------------------------------
+
+
+class DiscoveredTool(BaseModel):
+    """A capability *candidate*. Discovery is not authorization: the firewall still decides."""
+
+    name: str
+    description: str = ""
+    substrate: str = ""
+    parameters_schema: dict[str, Any] = Field(default_factory=dict)
+    available: bool = True
+    environment_requirements: list[str] = Field(default_factory=list)
+    expected_action_class: str = ""
+    permission_scope: str = Field(default="", description="What authorizing this would allow")
+    relevance: float = 0.0
+    provenance: str = ""
+    discovered_at: str = Field(default_factory=iso_now)
+    expires_at: str = ""
+
+
+class ToolDiscovery:
+    """Local registry search over the fabric, with cached, expiring, provenanced results.
+
+    Where a provider offers native deferred tool loading, that mechanism separates catalog
+    discovery from loading definitions into context and should be configured through the
+    adapter contract; this is the local fallback for when it is not available. Either way the
+    result is a candidate list, never a grant.
+    """
+
+    def __init__(self, fabric: "ToolFabric", ttl_seconds: int = 900):
+        self.fabric = fabric
+        self.ttl_seconds = ttl_seconds
+        self._cache: dict[str, tuple[float, list[DiscoveredTool]]] = {}
+
+    def search(self, need: str, limit: int = 5, include_unavailable: bool = True) -> list[DiscoveredTool]:
+        key = f"{need.strip().lower()}|{limit}|{include_unavailable}"
+        now = time.time()
+        hit = self._cache.get(key)
+        if hit is not None and now - hit[0] < self.ttl_seconds:
+            return list(hit[1])
+
+        want = _discovery_tokens(need)
+        found: list[DiscoveredTool] = []
+        for spec in self.fabric.specs(include_unavailable=include_unavailable):
+            haystack = _discovery_tokens(f"{spec.name} {spec.description} {spec.substrate}")
+            overlap = (len(want & haystack) / len(want)) if want else 0.0
+            if overlap <= 0.0:
+                continue
+            found.append(
+                DiscoveredTool(
+                    name=spec.name,
+                    description=spec.description,
+                    substrate=spec.substrate,
+                    parameters_schema=dict(spec.parameters_schema or {}),
+                    available=bool(spec.available),
+                    environment_requirements=[] if spec.available else [f"tool '{spec.name}' is registered but unavailable in this environment"],
+                    expected_action_class=str(getattr(spec.default_action_class, "value", spec.default_action_class or "")),
+                    permission_scope=f"{spec.substrate}: {getattr(spec.default_action_class, 'value', '')}",
+                    relevance=round(overlap, 4),
+                    provenance=f"local registry search of {self.fabric.__class__.__name__}",
+                    expires_at=iso_now(),
+                )
+            )
+        found.sort(key=lambda d: (-d.relevance, not d.available, d.name))
+        found = found[:limit]
+        self._cache[key] = (now, list(found))
+        return found
+
+    def alternatives(self, unavailable_tool: str, need: str, limit: int = 3) -> list[DiscoveredTool]:
+        """Candidates for a plan that no longer has its primary tool.
+
+        This exists so an unavailable tool produces a different plan, not a stalled one. It
+        never returns a route around a *denied* operation: a denial is a decision about the
+        action, and the alternatives are filtered to available tools of the same substrate.
+        """
+        target = next((s for s in self.fabric.specs(include_unavailable=True) if s.name == unavailable_tool), None)
+        out = [d for d in self.search(need, limit=limit * 3, include_unavailable=False) if d.name != unavailable_tool]
+        if target is not None:
+            out.sort(key=lambda d: (d.substrate != target.substrate, -d.relevance))
+        return out[:limit]
+
+
+_DISCOVERY_STOP = frozenset("the a an and or of to in for with by from at is are use using need needs".split())
+
+
+def _discovery_tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9_]+", (text or "").lower()) if len(w) >= 3 and w not in _DISCOVERY_STOP}

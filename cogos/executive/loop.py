@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from cogos.adapters.base import CognitionRequest, CognitionResponse, ExecutiveModel, ExecutiveUnavailable, UntrustedBlock
+from cogos.adapters.continuity import detect as detect_continuity, handoff
 from cogos.adapters.schema_utils import schema_for
 from cogos.agent_foundry import AgentFoundry
 from cogos.beliefs import BeliefGraph
@@ -28,6 +29,7 @@ from cogos.governance.immune import scan_for_injection, wrap_untrusted
 from cogos.ids import iso_now, new_id
 from cogos.memory import MemoryManager
 from cogos.observability import CalibrationTracker, DecisionJournal, ResourceLedger, Tracer
+from cogos.observability.channels import ChannelRecorder
 from cogos.persistence import StateStore
 from cogos.planner import Planner
 from cogos.executive.anchor_service import AnchorService
@@ -89,6 +91,7 @@ class OperationOutcome:
     errors: list[str] = field(default_factory=list)
     untrusted: list[UntrustedBlock] = field(default_factory=list)
     disagreements: list[dict[str, Any]] = field(default_factory=list)
+    anchor: Optional[Any] = None
 
 
 @dataclass
@@ -127,6 +130,9 @@ class Executive:
         self.calibration = CalibrationTracker(store)
         self.workspace = GlobalWorkspace(config.workspace_max_chars)
         self.anchors = AnchorService(self)
+        self.channels = ChannelRecorder(store, run_id=new_id("run"))
+        self.continuity = detect_continuity(adapter)
+        self._cognition_log: list[tuple[str, CognitionResponse]] = []
         self._sleep = sleep_fn
         self._tool_history: list[bool] = []
 
@@ -213,6 +219,11 @@ class Executive:
             self._journal_decision(state, decision, assessment)
 
         # 5. perform ------------------------------------------------------------------
+        # R2: from here to the end of the cycle, the four channels are recorded separately.
+        record = self.channels.begin(state, decision, cycle_no, branch=decision.task_id or "mission")
+        marks = (len(state.observations), len(state.tests), len(state.verifications))
+        fabric_mark = len(self.fabric.call_log)
+        record.attempted.effective_permissions = sorted(self.fabric.available_tool_names())
         task = state.task(decision.task_id) if decision.task_id else None
         if task is not None:
             task.status = TaskStatus.ACTIVE
@@ -224,6 +235,19 @@ class Executive:
             if task is not None:
                 task.status = TaskStatus.PENDING
             return self._block_on_executive(state, assessment, str(exc), cycle_no)
+
+        for res in self.fabric.call_log[fabric_mark:]:
+            self.channels.record_tool_call(record, res)
+        for kind, resp in self._cognition_log:
+            self.channels.record_model_call(record, kind, resp)
+        self._cognition_log.clear()
+        self.channels.record_environment(record, state, *marks)
+        if outcome.anchor is not None:
+            self.channels.record_anchor(record, outcome.anchor)
+        self.channels.finish(record, state)
+        for d in record.discrepancies:
+            if d.severity >= 0.8:
+                self.tracer.emit("discrepancy", f"{d.kind.value}: {d.detail[:200]}", cycle=cycle_no, data=d.model_dump(mode="json"))
 
         # 6/7. observe + interpret ---------------------------------------------------
         interp = self._interpret(state, decision, outcome, task, beliefs, assessment)
@@ -581,7 +605,7 @@ class Executive:
                 # mission is declared done, a blind assessment of the same raw evidence has to
                 # agree — and an open hold blocks completion regardless of what either side
                 # would prefer. A passing anchor is additional evidence, never an action grant.
-                blocked = self._anchor_before_completion(state)
+                blocked = self._anchor_before_completion(state, out)
                 if blocked:
                     out.completion_refusal = blocked
                 else:
@@ -658,7 +682,7 @@ class Executive:
                 state.human_requests.append(HumanRequest(kind="authorization", question=f"Authorize {res.verdict.action_class.value} operation: {blocked.operation}", why_not_inferable="the action class requires explicit human authorization by policy", options=["authorize", "deny"], independent_work_remaining=True))
         return res
 
-    def _anchor_before_completion(self, state: MissionState) -> str:
+    def _anchor_before_completion(self, state: MissionState, out: Optional[OperationOutcome] = None) -> str:
         """Run (or honour) the reality anchor on the mission's headline position.
 
         Returns a refusal reason, or "" when nothing is holding completion. A hold from an
@@ -687,6 +711,8 @@ class Executive:
             branch="mission",
             propositions=[c.description for c in state.success_criteria],
         )
+        if out is not None:
+            out.anchor = outcome
         if outcome.held:
             return f"completion held by reality anchor: {outcome.summary()}"
         state.resources.setdefault("anchor", {})["completion_assessment_id"] = outcome.assessment.id
@@ -1514,6 +1540,7 @@ class Executive:
             state.capability_state[f"cognition:{req.kind}"] = {"last_verdict": "refused", "reason": resp.error[:300], "executive_model": state.executive_model}
             self.tracer.emit("blocked", f"cognition:{req.kind} declined by provider safety classification (model residency preserved)", data={"kind": req.kind, "error": resp.error[:300], "executive_model": state.executive_model})
         if req.kind in EXECUTIVE_KINDS:
+            self._cognition_log.append((req.kind, resp))
             self._check_residency(state, resp, req.kind)
             if resp.ok and not resp.residency_ok:
                 # Never accept a silently downgraded executive: treat as a failed call.
@@ -1604,6 +1631,13 @@ class Executive:
             self._checkpoint(state)
 
     def _checkpoint(self, state: MissionState, final: bool = False) -> None:
+        # R3: the versioned handoff travels with every checkpoint, so a resumed run reconciles
+        # against pointers into durable state rather than trusting a prose summary of it.
+        try:
+            state.resources["handoff"] = handoff(state, next_action=state.resources.get("next_action", ""))
+            state.resources["continuity"] = self.continuity.model_dump(mode="json")
+        except Exception as exc:  # noqa: BLE001 - a handoff failure must not kill the run
+            self.tracer.emit("error", f"handoff export failed: {exc}")
         try:
             path = self.store.export_snapshot(state.mission_id, self.config.snapshots_dir)
             state.timestamps.last_checkpoint_at = iso_now()

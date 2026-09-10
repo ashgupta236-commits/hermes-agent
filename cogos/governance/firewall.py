@@ -53,6 +53,54 @@ def classify_shell_command(command: str) -> ActionClass:
     return ActionClass.REVERSIBLE_LOCAL
 
 
+#: Shell constructs that write somewhere. Argument analysis is *supplementary*: an allowed
+#: interpreter can write wherever the process can, so this narrows the obvious routes and the
+#: residual risk is stated rather than papered over. Real containment needs filesystem and
+#: network boundaries enforced in the worker environment itself.
+_REDIRECT_RE = re.compile(r"(?<![0-9<>])>>?\s*(?P<target>(?:\"[^\"]+\")|(?:'[^']+')|[^\s;&|)]+)")
+_WRITER_RE = re.compile(
+    r"\b(?:cp|mv|install|ln|touch|mkdir|rmdir|rm|truncate|tee|unzip|tar|rsync|chmod|chown)\b(?P<rest>[^;&|]*)",
+    re.IGNORECASE,
+)
+_DD_OF_RE = re.compile(r"\bdd\b[^;&|]*?\bof=(?P<target>[^\s;&|]+)")
+_SED_INPLACE_RE = re.compile(r"\bsed\b[^;&|]*?\s-i(?:\.[^\s]*)?\s+(?:[^\s;&|]+\s+)?(?P<target>[^\s;&|]+)")
+
+
+def _unquote(token: str) -> str:
+    t = token.strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        return t[1:-1]
+    return t
+
+
+def shell_write_targets(command: str) -> list[str]:
+    """Best-effort extraction of paths a shell command would write to.
+
+    Deliberately over-inclusive: a path that turns out to be harmless costs an extra
+    classification, while a missed path costs a boundary. Options (tokens starting with `-`)
+    and obvious non-paths are skipped.
+    """
+    targets: list[str] = []
+
+    def add(raw: str) -> None:
+        t = _unquote(raw)
+        if not t or t.startswith("-") or t in ("&1", "&2") or t.startswith("$"):
+            return
+        if t not in targets:
+            targets.append(t)
+
+    for m in _REDIRECT_RE.finditer(command):
+        add(m.group("target"))
+    for m in _DD_OF_RE.finditer(command):
+        add(m.group("target"))
+    for m in _SED_INPLACE_RE.finditer(command):
+        add(m.group("target"))
+    for m in _WRITER_RE.finditer(command):
+        for token in m.group("rest").split():
+            add(token)
+    return targets
+
+
 def _path_within(path: Path, roots: list[Path]) -> bool:
     try:
         rp = path.resolve()
@@ -84,11 +132,20 @@ class CapabilityFirewall:
 
         args = normalise_arguments(call.tool, dict(call.arguments))
         if spec.substrate == "shell":
-            return classify_shell_command(str(args.get("command", "")))
+            command = str(args.get("command", ""))
+            base = classify_shell_command(command)
+            # A destination denied to write_file must be denied on this route too, so the shell
+            # command's own write targets are classified by the same rule.
+            if base == ActionClass.REVERSIBLE_LOCAL and self._writes_outside_roots(command):
+                return ActionClass.CONSEQUENTIAL_SHARED
+            return base
         if spec.substrate == "git":
             argv = args.get("args") or []
             joined = "git " + (" ".join(map(str, argv)) if isinstance(argv, list) else str(argv))
-            return classify_shell_command(joined)
+            base = classify_shell_command(joined)
+            if base == ActionClass.REVERSIBLE_LOCAL and self._writes_outside_roots(joined):
+                return ActionClass.CONSEQUENTIAL_SHARED
+            return base
         if spec.substrate == "filesystem" and spec.name in ("write_file", "delete_file", "append_file"):
             target = Path(str(args.get("path", "")))
             if not target.is_absolute():
@@ -104,6 +161,15 @@ class CapabilityFirewall:
                 return ActionClass.CONSEQUENTIAL_SHARED
             return ActionClass.REVERSIBLE_EXTERNAL
         return spec.default_action_class
+
+    def _writes_outside_roots(self, command: str) -> bool:
+        for raw in shell_write_targets(command):
+            target = Path(raw)
+            if not target.is_absolute():
+                target = self.repo_root / target
+            if not _path_within(target, self.writable_roots):
+                return True
+        return False
 
     # -- policy ----------------------------------------------------------------------
 
@@ -137,8 +203,10 @@ class CapabilityFirewall:
                 action_class=action_class,
                 reason=f"action class '{action_class.value}' requires explicit human authorization",
             )
-        # Filesystem writes outside writable roots are consequential/shared: deny unless granted.
-        if spec.substrate == "filesystem" and action_class == ActionClass.CONSEQUENTIAL_SHARED and "consequential_shared" not in self.human_grants:
+        # Writes outside writable roots are consequential/shared: deny unless granted. This
+        # covers every execution route the firewall can classify, not just the filesystem tools —
+        # a denied destination reached through a shell is the same denied destination.
+        if spec.substrate in ("filesystem", "shell", "git") and action_class == ActionClass.CONSEQUENTIAL_SHARED and "consequential_shared" not in self.human_grants:
             return FirewallVerdict(decision=PolicyDecision.DENY, action_class=action_class, reason="write outside writable roots")
         return FirewallVerdict(decision=PolicyDecision.ALLOW, action_class=action_class, reason="within policy")
 
