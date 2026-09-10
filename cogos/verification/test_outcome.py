@@ -109,6 +109,10 @@ def detect_framework(command: str) -> str:
     text = command or ""
     if _COMPOSED.search(text):
         return "unknown"
+    if "--junitxml" in text or "--report-log" in text:
+        # The report path is the one thing the runtime must choose. A command that picks its own
+        # could pre-write it, so its output is not attributable either.
+        return "unknown"
     m = _RUNNER_IN_COMMAND.search(text)
     if not m:
         return "unknown"
@@ -118,6 +122,40 @@ def detect_framework(command: str) -> str:
     if "nose" in found:
         return "nose"
     return "pytest"
+
+
+def junit_counts(report: Path) -> Optional[dict[str, int]]:
+    """Counts from a JUnit XML report the runner wrote, or None when there is no usable report.
+
+    This is the only *attributable* source of test counts. Everything else is stdout, which the
+    code under test writes to: a module named ``pytest.py`` in the workspace shadows the real
+    runner under ``python -m pytest``, prints one convincing summary line and exits 0 — the command
+    genuinely names pytest, the output holds exactly one summary, and nothing about the text can
+    give it away. A report at a path *the engine chose* cannot be produced by a runner that never
+    ran.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        if not report.is_file() or report.stat().st_size == 0:
+            return None
+        root = ET.parse(report).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    if not suites:
+        return None
+    total = failures = errors = skipped = 0
+    for suite in suites:
+        try:
+            total += int(suite.get("tests", 0) or 0)
+            failures += int(suite.get("failures", 0) or 0)
+            errors += int(suite.get("errors", 0) or 0)
+            skipped += int(suite.get("skipped", 0) or 0)
+        except ValueError:
+            return None
+    passed = max(0, total - failures - errors - skipped)
+    return {"passed": passed, "failed": failures, "error": errors, "skipped": skipped}
 
 
 def summary_lines(output: str) -> list[str]:
@@ -168,14 +206,19 @@ def classify_test_run(
     output: str = "",
     command: str = "",
     expect_zero: bool = False,
+    report_counts: Optional[Mapping[str, int]] = None,
+    report_required: bool = False,
 ) -> TestRunOutcome:
     """Decide what a single test-command run proves.
 
     ``expect_zero`` must come from the verification contract as declared before execution.
     """
-    c = {k: int((counts or {}).get(k, 0) or 0) for k in COUNT_KEYS}
+    # A runner-written report at an engine-chosen path outranks anything printed to stdout.
+    report_backed = report_counts is not None
+    source: Mapping[str, int] = report_counts if report_counts is not None else (counts or {})
+    c = {k: int(source.get(k, 0) or 0) for k in COUNT_KEYS}
     framework = detect_framework(command)
-    ambiguous = len(summary_lines(output or "")) > 1
+    ambiguous = (not report_backed) and len(summary_lines(output or "")) > 1
     collected_m = _COLLECTED.search(output or "")
     collected = int(collected_m.group(1)) if collected_m else None
     collection_error = bool(_COLLECTION_ERROR.search(output or ""))
@@ -211,6 +254,13 @@ def classify_test_run(
     if c["failed"] or c["error"]:
         return outcome(FAILED, f"{c['failed']} failed, {c['error']} error(s)")
 
+    if report_required and not report_backed and framework != "unknown":
+        # The runner was asked for a machine-readable report and produced none, so whatever wrote
+        # that stdout was not the runner we asked for.
+        c["passed"] = c["failed"] = c["error"] = c["skipped"] = 0
+        if expect_zero and exit_code in (0, None):
+            return outcome(PASSED, "zero executed tests, explicitly authorized by the verification contract")
+        return outcome(INCONCLUSIVE, "no machine-readable report was produced: the output is not attributable to the runner")
     if framework == "unknown":
         # Either the command invoked no recognised runner, or it was composed so that something
         # other than the runner could have written the output. Whatever it printed is program

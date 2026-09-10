@@ -226,6 +226,11 @@ class TestRecord(BaseModel):
     counts: dict[str, int] = Field(default_factory=dict)
     executed: int = Field(default=0, description="Tests that ran a body. Skipped tests are collected, not executed.")
     outcome_reason: str = Field(default="", description="Why the run was classified the way it was")
+    report_backed: bool = Field(
+        default=False,
+        description="Counts came from a machine-readable report the runner wrote at a path the "
+        "runtime chose, rather than from stdout the code under test can also write to.",
+    )
     expected_zero: bool = Field(
         default=False,
         description="The verification contract authorized a zero-execution run before it ran.",

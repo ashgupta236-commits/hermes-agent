@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import statistics
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -29,7 +30,7 @@ from cogos.schemas.mission import Artifact, MissionState, SuccessCriterion, Task
 from cogos.schemas.tools import ToolCall
 from cogos.schemas.verification import InputVersion, VerificationCheck, VerificationResult, cite
 from cogos.tools.fabric import ToolFabric
-from cogos.verification.test_outcome import InputVersionGuard, TestRunOutcome, classify_test_run
+from cogos.verification.test_outcome import InputVersionGuard, TestRunOutcome, classify_test_run, detect_framework, junit_counts
 
 PASSED = VerificationStatus.PASSED
 FAILED = VerificationStatus.FAILED
@@ -372,9 +373,30 @@ class VerificationEngine:
         action_ids: list[str] = []
 
         for cmd in commands:
+            # Ask a recognised runner for a machine-readable report at a path *we* choose. Stdout
+            # is written by the code under test — a workspace module named `pytest.py` shadows the
+            # real runner under `python -m pytest` and prints whatever it likes — so a report the
+            # runner had to actually run to produce is the only attributable evidence. The path is
+            # fresh per run, so it cannot be pre-written.
+            framework = detect_framework(cmd)
+            report: Optional[Path] = None
+            run_cmd = cmd
+            if framework == "pytest":
+                report = Path(tempfile.gettempdir()) / f"cogos-junit-{new_id('rep')}.xml"
+                run_cmd = f"{cmd} --junitxml={shlex.quote(str(report))}"
+            # Recorded as declared: the report argument is runtime instrumentation pointing at a
+            # temp path that will not exist later, and `report_backed` answers the question it
+            # would otherwise be standing in for.
             shell_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}" if cwd else cmd
-            res = self.fabric.execute(ToolCall(tool="run_tests", arguments={"command": shell_cmd}, task_id=task_id, purpose="verification"))
+            executed = f"cd {shlex.quote(str(cwd))} && {run_cmd}" if cwd else run_cmd
+            res = self.fabric.execute(ToolCall(tool="run_tests", arguments={"command": executed}, task_id=task_id, purpose="verification"))
             action_ids.append(res.call_id)
+            report_counts = junit_counts(report) if report is not None else None
+            if report is not None:
+                try:
+                    report.unlink()
+                except OSError:
+                    pass
             # Totals come from the *classified* outcome below, not from the raw parse: a run whose
             # output was unattributable has its counts discarded, and the human-readable summary
             # must not still report the numbers that were thrown away.
@@ -385,6 +407,8 @@ class VerificationEngine:
                 outcome = classify_test_run(
                     exit_code=res.data.get("exit_code"),
                     counts=res.data.get("counts") or {},
+                    report_counts=report_counts,
+                    report_required=framework == "pytest",
                     output=res.output or "",
                     # The declared command, not the shell_cmd: the `cd <cwd> &&` prefix is added by
                     # this runtime and is trusted, while everything in `cmd` came from the plan and
@@ -412,6 +436,7 @@ class VerificationEngine:
                     executed=outcome.executed,
                     outcome_reason=outcome.reason,
                     expected_zero=outcome.expected_zero,
+                    report_backed=report_counts is not None,
                 )
             )
 

@@ -1479,3 +1479,66 @@ def test_the_summary_reports_the_counts_that_were_kept(tmp_path):
     assert res.status != PASSED
     assert "2 passed" not in res.summary, f"discarded counts must not appear in the summary: {res.summary}"
     assert "0 passed" in res.summary
+
+
+def test_a_shadowing_module_cannot_impersonate_the_test_runner(tmp_path):
+    """The last and best forgery: a workspace module named `pytest.py` shadows the real runner
+    under `python -m pytest`. The command genuinely names pytest, the output holds exactly one
+    summary line, and nothing about the text gives it away. Only a report the runner had to
+    actually run to produce — at a path the runtime chose — can tell them apart."""
+    _write(tmp_path, "pytest.py", 'print("2 passed in 0.01s")\n')
+    _write(tmp_path, "test_real.py", "def test_f():\n    assert False\n")
+    state = MissionState(objective="shadowed runner")
+
+    res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path))
+
+    assert res.status != PASSED, f"a shadowed runner produces no report: {res.summary}"
+    rec = state.tests[-1]
+    assert rec.executed == 0 and rec.report_backed is False
+
+
+def test_a_genuine_run_is_report_backed_and_its_counts_come_from_the_report(tmp_path):
+    _write(tmp_path, "test_ok.py", "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n")
+    state = MissionState(objective="report backed")
+
+    res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path))
+
+    assert res.status == PASSED
+    rec = state.tests[-1]
+    assert rec.report_backed is True, "counts must come from the runner's own report"
+    assert rec.counts["passed"] == 2 and rec.executed == 2
+    assert "--junitxml" not in rec.command, "the record keeps the declared command, not runtime plumbing"
+
+
+def test_a_command_that_chooses_its_own_report_path_is_not_attributable(tmp_path):
+    """The report path is the one thing the runtime must choose; a command that picks its own
+    could pre-write it."""
+    _write(tmp_path, "test_ok.py", "def test_a():\n    assert True\n")
+    state = MissionState(objective="own report path")
+
+    res = VerificationEngine(_fabric(tmp_path), state).verify_code(
+        [f"{sys.executable} -m pytest -q --junitxml={tmp_path}/mine.xml"], cwd=str(tmp_path)
+    )
+
+    assert res.status != PASSED
+    assert state.tests[-1].framework == "unknown"
+
+
+def test_junit_counts_reads_a_report_and_rejects_a_missing_or_broken_one(tmp_path):
+    from cogos.verification.test_outcome import junit_counts
+
+    good = tmp_path / "good.xml"
+    good.write_text('<testsuites><testsuite tests="5" failures="1" errors="0" skipped="2"/></testsuites>', encoding="utf-8")
+    assert junit_counts(good) == {"passed": 2, "failed": 1, "error": 0, "skipped": 2}
+
+    flat = tmp_path / "flat.xml"
+    flat.write_text('<testsuite tests="3" failures="0" errors="0" skipped="0"/>', encoding="utf-8")
+    assert junit_counts(flat) == {"passed": 3, "failed": 0, "error": 0, "skipped": 0}
+
+    assert junit_counts(tmp_path / "absent.xml") is None
+    broken = tmp_path / "broken.xml"
+    broken.write_text("<not xml", encoding="utf-8")
+    assert junit_counts(broken) is None
+    empty = tmp_path / "empty.xml"
+    empty.write_text("", encoding="utf-8")
+    assert junit_counts(empty) is None
