@@ -148,3 +148,37 @@ original failure before pinning the fix:
 | Contradiction dedupe bypassed for unresolvable ids | completion permanently blocked; subagent budget drained |
 | Verification records were never persisted | every "requires a record" gate was a non-empty-list check |
 | Invalidating events did not demote a claim | stale claims kept satisfying criteria |
+
+## Real-model validation (not scripted)
+
+The scenarios above run offline with the deterministic executive. The runtime was separately driven
+by the real resident model (`--adapter claude_code`, `claude-fable-5-1`) on the implementation demo.
+Recording it honestly, including what it did not do:
+
+| | |
+|---|---|
+| Mission | "Build the feature described in REQUIREMENTS.md." |
+| Reached | cycle 5 of a 20-cycle cap; stopped by the wall-clock timeout mid-cycle, not by completion |
+| Cost | $10.12 across 14 model calls and 2 specialists |
+| Terminal status | `active` — the mission was **not** completed |
+
+What it demonstrated:
+
+- **Compilation.** From one sentence it produced criteria, unknowns, competing hypotheses and a
+  nine-task DAG that included a mutation check ("confirm tests catch a wrong implementation") and an
+  independent spec-conformance verification — neither of which was prompted.
+- **Deterministic substrate over guessing.** It noticed the requirement's rounding mode was
+  ambiguous, recorded it as a contradiction, and ran an actual `round()` versus `Decimal` comparison
+  rather than assuming. The tests it then wrote say so in their docstring: *"Inputs deliberately
+  avoid 2-decimal midpoint (.xx5) ties so the expected values are identical under built-in round()
+  and decimal half-up rounding."*
+- **Real artifacts.** `calc.py` and `test_calc.py` were written to the workspace; the eight tests it
+  wrote pass.
+- **Recovery from a hard kill.** The process was terminated mid-cycle by the timeout. The store came
+  back `integrity=ok` at version 12 with 33 claims, 18 evidence items and 3 contradictions intact,
+  and `cogos boot` named the correct resume target and the six unresolved tasks without any human
+  input. This is acceptance scenario E validated against a real run rather than a simulated restart.
+
+What it also showed, and what the budget controls exist for: at `effort: high` the frontier model
+costs roughly $1.40 per cycle on this mission and adds tasks faster than it closes them on small
+objectives. Set `budget.max_cycles` and `budget.max_cost_usd` deliberately before a long run.
