@@ -1123,7 +1123,40 @@ class Executive:
             engine.verify_artifact(a)
             refreshed.append(a.id)
             self._invalidate_criteria_resting_on(state, a)
+        self._withdraw_criteria_with_stale_receipts(state)
         return refreshed
+
+    def _withdraw_criteria_with_stale_receipts(self, state: MissionState) -> list[str]:
+        """Withdraw satisfaction whose receipts no longer describe the current inputs.
+
+        This is the exact counterpart of `_invalidate_criteria_resting_on`, which can only guess
+        by name overlap — 'The full test suite passes' shares no tokens with 'calc.py'. A receipt
+        records the versions it ran against, so a criterion resting on bytes that have since moved
+        can be identified precisely and re-verified rather than either blocking the mission
+        forever or standing on evidence about a file that no longer exists in that form.
+        """
+        from cogos.verification.engine import receipt_inputs_intact
+
+        withdrawn: list[str] = []
+        for c in state.success_criteria:
+            if not c.satisfied:
+                continue
+            receipts = state.passing_verifications(c.verification_ids, target_type="criterion", target_id=c.id)
+            if not receipts:
+                continue
+            live = [r for r in receipts if receipt_inputs_intact(r)[0]]
+            if live:
+                continue
+            why = receipt_inputs_intact(receipts[-1])[1]
+            c.satisfied = False
+            c.verification_ids.clear()  # the records stay in state.verifications as history
+            withdrawn.append(c.id)
+            self.tracer.emit(
+                "verify",
+                f"criterion '{c.description[:80]}' withdrawn: its receipts no longer describe the current inputs ({why})",
+                data={"criterion_id": c.id, "reason": why},
+            )
+        return withdrawn
 
     def _invalidate_criteria_resting_on(self, state: MissionState, artifact: Any) -> None:
         """Un-satisfy criteria that were satisfied against an artifact that has since changed.

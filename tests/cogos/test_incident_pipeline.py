@@ -823,3 +823,115 @@ def test_judgement_still_resolves_a_genuine_method_gap():
         assert "not judgeable" not in judged.summary, "judgement must still run where no observation contradicts it"
     finally:
         sb.cleanup()
+
+
+# ======================================================================================
+# Adversarial review of the repair itself (findings G1-G3)
+# ======================================================================================
+
+
+def test_g1_receipt_input_version_check_is_not_vacuous(tmp_path):
+    """The first version of this check iterated criterion receipts, which carried no input
+    versions, so its loop body never ran and it always reported PASSED with an affirmative
+    message. A check that cannot fail is worse than no check."""
+    _write(tmp_path, "calc.py", CALC)
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    state = MissionState(objective="non-vacuous")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    for n in ("calc.py", "test_calc.py"):
+        a = Artifact(name=n, kind="code", path=str(tmp_path / n))
+        state.artifacts.append(a)
+        engine.verify_artifact(a)
+    task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    receipt = engine.verify_criterion(crit)
+
+    assert receipt.input_versions, "the criterion receipt must inherit the version identity it rests on"
+    gate = mission_completion_check(state)
+    check = next(c for c in gate.checks if c.name == "receipt_input_versions")
+    assert check.status == PASSED and "bound input version" in check.detail
+    assert "0 bound input version" not in check.detail, "the check must actually be re-reading something"
+
+
+def test_g2_no_false_completion_when_the_implementation_is_swapped_after_verification(tmp_path):
+    """End-to-end false-completion control: a mission that verified real passing tests and then
+    had its implementation replaced with a wrong body must not complete."""
+    _write(tmp_path, "calc.py", CALC)
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    state = MissionState(objective="swap after verification")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    for n in ("calc.py", "test_calc.py"):
+        a = Artifact(name=n, kind="code", path=str(tmp_path / n))
+        state.artifacts.append(a)
+        engine.verify_artifact(a)
+    task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    engine.verify_criterion(crit)
+    assert mission_completion_check(state).status == PASSED, "precondition: genuine evidence passes"
+
+    (tmp_path / "calc.py").write_text("def add_percent(v, p):\n    return 999.0\n", encoding="utf-8")
+
+    gate = mission_completion_check(state)
+    assert gate.status != PASSED, "a post-verification swap must not complete"
+    assert state.verifications, "historical evidence is retained, not deleted"
+
+
+def test_g2b_a_criterion_proved_by_an_unbindable_run_cannot_complete(tmp_path):
+    """With nothing registered and nothing declared, a test receipt names no inputs. That proof
+    cannot be re-checked, so it cannot close a criterion."""
+    _write(tmp_path, "calc.py", CALC)
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    state = MissionState(objective="unbindable")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id)
+    engine.verify_criterion(crit)
+
+    gate = mission_completion_check(state)
+
+    assert gate.status != PASSED
+    assert "no input versions" in gate.summary
+
+
+def test_stale_proof_is_withdrawn_so_the_mission_can_re_verify_after_a_fix(tmp_path):
+    """Recovery must stay possible: a fix applied over a buggy first attempt is re-verified, not
+    blocked forever. The stale record stays in history."""
+    sb = Sandbox("withdraw-and-recover")
+    try:
+        state = sb.runtime.new_mission("recover after a fix", context=sb.context(has_requirements=False))
+        state.success_criteria[:] = []
+        crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+        state.success_criteria.append(crit)
+        _write(sb.root, "calc.py", CALC)
+        _write(sb.root, "test_calc.py", TEST_CALC)
+        engine = VerificationEngine(sb.runtime.executive.fabric, state)
+        for n in ("calc.py", "test_calc.py"):
+            a = Artifact(name=n, kind="code", path=str(sb.root / n))
+            state.artifacts.append(a)
+            engine.verify_artifact(a)
+        task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+        state.tasks.append(task)
+        engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(sb.root), task_id=task.id)
+        engine.verify_criterion(crit)
+        assert crit.satisfied
+        history_before = len(state.verifications)
+
+        # The implementation is regenerated (a fix over a first attempt).
+        _write(sb.root, "calc.py", CALC.replace("rounded to 2 decimals", "rounded to two decimals"))
+
+        withdrawn = sb.runtime.executive._withdraw_criteria_with_stale_receipts(state)
+
+        assert crit.id in withdrawn and not crit.satisfied, "proof against superseded bytes is withdrawn"
+        assert crit.verification_ids == [], "the stale citation is dropped"
+        assert len(state.verifications) >= history_before, "history is retained, never deleted"
+    finally:
+        sb.cleanup()

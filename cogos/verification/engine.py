@@ -160,6 +160,29 @@ def artifact_integrity(artifact: Artifact) -> tuple[bool, str]:
     return True, f"sha256 {artifact.verified_hash[:12]}… unchanged"
 
 
+def receipt_inputs_intact(receipt: VerificationResult) -> tuple[bool, str]:
+    """Do the inputs this receipt was produced against still hold, right now?
+
+    A receipt describes bytes. Once those bytes move it still records what it saw — history is
+    kept — but it no longer describes what is there, so it cannot close a criterion. A receipt
+    that recorded no input versions has nothing to contradict it and is reported intact; whether
+    that is *sufficient* is the gate's separate question.
+    """
+    for iv in receipt.input_versions:
+        if iv.changed_during_verification:
+            return False, f"inputs changed while it ran ({Path(iv.path).name})"
+        if not iv.content_hash:
+            continue
+        current = file_sha256(Path(iv.path)) if Path(iv.path).is_file() else None
+        if current != iv.content_hash:
+            return False, (
+                f"{Path(iv.path).name} is now "
+                + (f"sha256 {current[:12]}…" if current else "missing")
+                + f", not the {iv.content_hash[:12]}… it was verified against"
+            )
+    return True, ""
+
+
 def _type_ok(value: Any, expected: Any) -> bool:
     names = expected if isinstance(expected, list) else [expected]
     for name in names:
@@ -557,6 +580,41 @@ class VerificationEngine:
 
     # -- criteria -------------------------------------------------------------------
 
+    def _supporting_versions(self, criterion: SuccessCriterion) -> tuple[list[InputVersion], list[str]]:
+        """Input versions and action ids of the evidence this criterion actually rests on.
+
+        A criterion receipt is a summary of other receipts. It has to inherit their version
+        identity, or the chain criterion -> receipt -> evidence -> action breaks at the first hop
+        and the gate re-checks nothing.
+        """
+        paths: dict[str, Optional[str]] = {}
+        actions: list[str] = []
+        task_ids = {t.task_id for t in self.state.tests if t.task_id and self._test_addresses(t, criterion.id)}
+        for res in self.state.verifications:
+            relevant = res.target_type in ("code", "task") and (
+                (res.produced_by_task_id and res.produced_by_task_id in task_ids) or res.target_id in task_ids
+            )
+            # A supporting receipt whose own inputs have since moved is history, not support. It
+            # contributes nothing here, so a fresh conclusion is not born stale by inheriting the
+            # hashes of a superseded run.
+            if not relevant or not receipt_inputs_intact(res)[0]:
+                continue
+            for iv in res.input_versions:
+                paths.setdefault(iv.path, iv.artifact_id)
+            actions.extend(a for a in res.produced_by_action_ids if a not in actions)
+        # Verified artifacts are re-checked independently by artifact_integrity, but binding them
+        # here keeps the criterion's own receipt self-contained for traversal.
+        for art in self.state.artifacts:
+            if art.verified and art.verified_hash and art.path:
+                paths.setdefault(art.path, art.id)
+        # Record the bytes as they are at the moment this conclusion is drawn. That is what the
+        # completion gate later re-reads, so "still true?" is answerable against the conclusion.
+        versions = [
+            InputVersion(path=p, content_hash=(file_sha256(Path(p)) or "") if Path(p).is_file() else "", artifact_id=aid)
+            for p, aid in paths.items()
+        ]
+        return versions, actions
+
     @staticmethod
     def _test_executed_something(record: TestRecord) -> bool:
         """Did this record observe a required test actually run?
@@ -646,6 +704,10 @@ class VerificationEngine:
 
         status = _aggregate(checks)
         criterion.satisfied = status == PASSED
+        # Carry the supporting evidence's version identity onto the criterion receipt. Without
+        # this the receipt names no inputs, so the completion gate has nothing to re-check and a
+        # post-verification swap of the implementation goes unnoticed.
+        supporting, actions = self._supporting_versions(criterion)
         result = VerificationResult(
             target_type="criterion",
             target_id=criterion.id,
@@ -653,6 +715,8 @@ class VerificationEngine:
             summary=f"criterion '{criterion.description}': {_counts(checks)}",
             checks=checks,
             evidence_ids=sorted(set(evidence_ids)),
+            input_versions=supporting,
+            produced_by_action_ids=actions,
         )
         # Only a passing record is citable evidence. A failed or inconclusive attempt is still
         # persisted (see record()), but citing it would turn the completion gate into a
@@ -874,26 +938,49 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
     # criterion. Records written before version binding carry no input_versions at all; that is
     # "unknown", and unknown is not re-interpreted as "unchanged".
     stale: list[str] = []
+    unbound: list[str] = []
     for c in state.success_criteria:
-        for receipt in receipts(c):
-            for iv in receipt.input_versions:
-                if iv.changed_during_verification:
-                    stale.append(f"'{c.description[:60]}' receipt {receipt.id}: inputs changed while it ran ({Path(iv.path).name})")
-                    continue
-                if not iv.content_hash:
-                    continue
-                current = file_sha256(Path(iv.path)) if Path(iv.path).is_file() else None
-                if current != iv.content_hash:
-                    stale.append(
-                        f"'{c.description[:60]}' receipt {receipt.id}: {Path(iv.path).name} is now "
-                        + (f"sha256 {current[:12]}…" if current else "missing")
-                        + f", not the {iv.content_hash[:12]}… it was verified against"
-                    )
-    if stale:
-        checks.append(VerificationCheck(name="receipt_input_versions", status=FAILED, detail="; ".join(stale[:5])))
-        missing.append(f"{len(stale)} receipt(s) no longer describe the current inputs: " + "; ".join(stale[:3]))
+        crs = receipts(c)
+        if not crs:
+            continue
+        # A criterion proved by a test run the current engine produced must name the inputs that
+        # run was about, or nothing can be re-checked later. Records with no structured counts
+        # predate version binding and keep the older, weaker guarantee rather than being
+        # retroactively failed.
+        producing_tasks = {t.id for t in state.tasks if c.id in (t.addresses_criterion_ids or [])}
+        engine_backed = any(
+            t.status == PASSED and t.counts and (c.id in (t.criterion_ids or []) or (t.task_id in producing_tasks))
+            for t in state.tests
+        )
+        judged = [(receipt_inputs_intact(r), r) for r in crs]
+        live = [r for (ok, _why), r in judged if ok and (r.input_versions or not engine_backed)]
+        if live:
+            # A later receipt that still matches supersedes an earlier one that no longer does.
+            # Re-verifying after a fix is exactly how a mission is meant to recover; the stale
+            # record stays in history rather than blocking forever.
+            continue
+        broken_reasons = [why for (ok, why), _r in judged if not ok]
+        if broken_reasons:
+            stale.append(f"'{c.description[:60]}': no receipt still matches the current inputs — " + "; ".join(broken_reasons[:2]))
+        elif engine_backed:
+            unbound.append(f"'{c.description[:60]}' is proved by a test run that names no input versions, so it cannot be re-checked")
+    if stale or unbound:
+        detail = "; ".join((stale + unbound)[:5])
+        checks.append(VerificationCheck(name="receipt_input_versions", status=FAILED, detail=detail, authoritative=True))
+        if stale:
+            missing.append(f"{len(stale)} receipt(s) no longer describe the current inputs: " + "; ".join(stale[:3]))
+        if unbound:
+            missing.append(f"{len(unbound)} criterion receipt(s) name no input versions: " + "; ".join(unbound[:3]))
     else:
-        checks.append(VerificationCheck(name="receipt_input_versions", status=PASSED, detail="every accepted receipt still matches the inputs it was produced against"))
+        bound = sum(len(r.input_versions) for c in state.success_criteria for r in receipts(c))
+        checks.append(
+            VerificationCheck(
+                name="receipt_input_versions",
+                status=PASSED,
+                detail=f"{bound} bound input version(s) re-read and still matching",
+                authoritative=True,
+            )
+        )
 
     status = _aggregate(checks)
     if status == PASSED:
