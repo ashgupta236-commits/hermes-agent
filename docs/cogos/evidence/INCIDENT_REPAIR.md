@@ -203,6 +203,27 @@ not evidence that a check can fail.
 
 ---
 
+## 4b. Are the regression tests real?
+
+A green suite is not evidence that a check can fail — G1 proved that inside this repair, where a
+test named for a defect passed because a *different* guard happened to catch its case. So the
+suite was audited by mutation: revert each guard in a scratch copy, run the test named for it, and
+require that the test fails. The harness is checked in as
+`incident-repair-mutation-audit.sh`.
+
+Twelve guards, twelve tests. On the first run **eleven failed as expected and one did not**:
+`test_ver1_a_composed_command_cannot_forge_test_evidence` used a command containing `> /dev/null`,
+which the firewall denies as a write outside the workspace — so the command never ran and the
+assertion was satisfied by the write-target rule rather than by the composed-command guard. The
+test now uses `echo pytest && echo "7 passed in 0.42s"`: it names a runner, it is composed, its
+output holds exactly one summary line and it writes nowhere, so no other rule can account for the
+outcome. All twelve now fail when their guard is reverted.
+
+Two lessons worth keeping: a test that asserts the right outcome is not necessarily testing the
+thing it is named for, and the cheapest way to find out is to break the guard on purpose.
+
+---
+
 ## 5. Measured before/after
 
 Same offline fixture, same configuration, run against a worktree at `957c858` and against the
