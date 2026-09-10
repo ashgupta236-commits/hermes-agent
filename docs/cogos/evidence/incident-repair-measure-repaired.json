@@ -1,5 +1,5 @@
 {
- "label": "REPAIRED_9f8e255",
+ "label": "REPAIRED_FINAL",
  "p1_tool_backed_verify_executed": true,
  "p1_observation_reached_verifier": true,
  "p1_actions_observed_by_verifier": 1,
@@ -34,5 +34,11 @@
  "p8_verification_channel_bypasses_firewall": false,
  "p9_unregistered_gate_before_mutation": "failed",
  "p9_unregistered_gate_after_mutation": "failed",
- "p9_false_completion_after_swap": false
+ "p9_false_completion_after_swap": false,
+ "p10_forged_summary_outcomes": {
+  "forged_over_skipped": "inconclusive",
+  "forged_over_failing": "failed"
+ },
+ "p10_forged_summary_false_passes": 0,
+ "p10_forged_summary_probes": 2
 }

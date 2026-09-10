@@ -174,6 +174,27 @@ of the repair itself. All are fixed and regression-tested.
 | R5 | a specialist could launder any existing path into the ledger with no hash, origin or boundary check | adversarial review |
 | R6 | two separate post-run reads left a window for an undetected mid-verification change | adversarial review |
 | R7 | `InputVersion` identity was a path string, not a resolved path | adversarial review |
+| A1 | **a `conftest.py` in the tree under test forged the runner summary**: the command was a genuine pytest invocation, so command-based detection did not help, and the parser took the first summary-shaped line. A suite whose only test was SKIPPED reported three passing tests and its mission completed | final adversarial review |
+| A2 | a composed command (`pytest -q > /dev/null 2>&1; echo "1 passed in 0.02s"`) named a real runner, discarded its real failing output and printed a convincing summary | final adversarial review |
+| A3 | a receipt bound to a path that does not exist got an empty hash, which the re-read skipped, so it stayed "intact" forever while the implementation was swapped | final adversarial review |
+| A4 | **a successful `read_file` counted as a verified task** and therefore as judgement grounding, so a successful call plus a model opinion could close a criterion | final adversarial review |
+| A5 | `classify` learned about the `tests` substrate but `_decide`'s writable-roots clause did not, so a denied write was classified and then allowed | final adversarial review |
+| A6 | a relative write under a `cwd` outside the writable roots resolved against the repo root instead | final adversarial review |
+| A7 | `run_tests` output was `VERIFIED_TOOL`, so the stdout of an arbitrary command was never scanned for injection | final adversarial review |
+| A8 | untrusted excerpts reached the judge's prompt beside genuinely deterministic checks with nothing marking them | final adversarial review |
+| A9 | `cat credentials.json` required human authorization but `read_file` on the same path did not | final adversarial review |
+
+A1 is the one that matters most, because it defeats the stated basis of the F2 repair.
+"Detect the runner from the command, not the output" defends only against a *non-runner*
+command printing counts. When the command really is pytest, the code under test writes to the
+same stream the runner does. The fix is not a better parser: counts are now read only from an
+**unambiguous** summary, and more than one runner-summary line means the result is not
+attributable at all. The honest boundary is that parsing a text stream the subject can write to
+can establish "this did not pass"; it cannot, on its own, establish "this passed".
+
+A5 is worth noting for a different reason: it is the *same shape* as the original F1 defect —
+one route through a rule hardened, its sibling left on the old path. Classifying without
+enforcing is not a boundary.
 
 G1 is the one worth dwelling on: the check looked correct, the suite was green, and one of the
 regression tests was named for exactly the defect it failed to catch — it passed because a
@@ -196,6 +217,7 @@ established by a controlled live run.
 | Authorized actions the verifier observed | 0 | **1** |
 | Verification produced from an empty result | ✓ (the defect) | **✗** |
 | Zero-test false passes | **3 of 4** | **0 of 4** |
+| Forged-runner-summary false passes | **1 of 2** | **0 of 2** |
 | Unrelated suite satisfies a differently scoped criterion | ✓ (the defect) | **✗** |
 | Artifact candidates registered from 2 authorized writes | 0 | **2** |
 | Candidates carrying version identity | 0 | **2** |
@@ -269,8 +291,26 @@ Honest limits of this repair.
    (`artifact_integrity`, `required_artifacts`). The receipt-version check now covers the case that
    made this exploitable, but a skip is structurally weaker than a pass.
 6. **Injected content can still reach the executive judge's prompt** as check detail and state
-   summaries. It cannot change a deterministic status — that is what `authoritative` enforces — but
-   the judge is not immune to it.
+   summaries. It now arrives explicitly framed as untrusted and carrying its injection flags, and
+   it cannot change a deterministic status — that is what `authoritative` enforces — but the judge
+   is not immune to it.
+9. **Test evidence rests on parsing a stream the subject can write to.** Requiring an unambiguous
+   summary closes the forgery route that was reproduced, and the exit code independently catches a
+   genuinely failing suite, but this is a mitigation rather than a proof. A machine-readable report
+   the code under test cannot author — a JUnit XML file written by the runner to a path chosen by
+   the runtime, say — would be a stronger foundation and is the obvious next step. A consequence
+   of the current rule worth knowing: a *genuinely passing* suite is reported INCONCLUSIVE if
+   anything else in the tree also prints a summary-shaped line. That is the conservative direction,
+   and the mission can re-run, but it is a real false-negative.
+10. **`shell` write-target extraction remains best-effort**, and four ordinary spellings were
+    reproduced escaping it: an environment variable target, an in-command `cd`, backtick
+    substitution, and an interpreter one-liner (`python -c "open('/outside','w')"`). These are
+    pre-existing, they are not fixable by static analysis of a shell string, and real containment
+    needs filesystem boundaries enforced in the worker environment. The `cwd` case was a genuine
+    resolution bug and is fixed; the rest are stated rather than papered over.
+11. **`verify_artifact` checks existence, regular-file and non-empty**, so a small placeholder at
+    the right path can become a *verified* artifact. Criterion satisfaction still needs the
+    criterion's own method to pass, but the artifact route is weaker than its name suggests.
 7. **A contradiction can still be resolved by executive prose** with no observation attached. Out
    of scope here; it does not bear on F1–F3.
 8. **TOCTOU is bounded, not eliminated.** Inputs are snapshotted before and read once after, and a

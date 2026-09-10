@@ -34,5 +34,11 @@
  "p8_verification_channel_bypasses_firewall": true,
  "p9_unregistered_gate_before_mutation": "passed",
  "p9_unregistered_gate_after_mutation": "passed",
- "p9_false_completion_after_swap": true
+ "p9_false_completion_after_swap": true,
+ "p10_forged_summary_outcomes": {
+  "forged_over_skipped": "passed",
+  "forged_over_failing": "failed"
+ },
+ "p10_forged_summary_false_passes": 1,
+ "p10_forged_summary_probes": 2
 }
