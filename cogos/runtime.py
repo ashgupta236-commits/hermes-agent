@@ -83,6 +83,12 @@ class Runtime:
 
     # -- missions ------------------------------------------------------------------
 
+    def _provenance(self, schema_version: int = 0) -> dict[str, Any]:
+        """Which implementation is producing this mission's trace (area I)."""
+        from cogos.provenance import capture
+
+        return capture(self.config, self.adapter, schema_version).model_dump(mode="json")
+
     def new_mission(self, objective: str, *, human_context: str = "", budget: Optional[Budget] = None, permissions: Optional[dict[str, Any]] = None, context: Optional[dict[str, Any]] = None) -> MissionState:
         memory_lines = []
         try:
@@ -101,6 +107,10 @@ class Runtime:
         compiler = MissionCompiler(self.adapter, self.config)
         state, comp, meta = compiler.compile(objective, context=context, human_context=human_context, memory_lines=memory_lines, skills_text=skills_text, budget=budget, permissions=permissions)
         state.resources["skills_text"] = skills_text
+        # Area I: bind the trace to the implementation that produced it. The live mission ran
+        # while fixes were being committed, so repo HEAD and the loaded code diverged and the
+        # trace could not say which build it came from.
+        state.resources["provenance"] = self._provenance(state.schema_version)
         state.capability_state = {s.name: {"available": s.available, "reason": s.unavailable_reason} for s in self.fabric.specs(include_unavailable=True)}
         state.permission_state = {"always_require_human": list(self.config.governance.always_require_human), "denied_action_classes": list(self.config.governance.denied_action_classes), "allow_network": self.config.governance.allow_network, "allow_shell": self.config.governance.allow_shell, "grants": list((permissions or {}).get("grants", []))}
         self.store.save_mission(state, "mission_compiled", {"used_fallback": meta["used_fallback"], "mission_kind": comp.mission_kind})

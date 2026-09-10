@@ -15,6 +15,15 @@ class ExecutiveUnavailable(RuntimeError):
     """The configured executive model cannot be reached. Never downgrade silently."""
 
 
+class BudgetExhausted(RuntimeError):
+    """The next operation cannot start inside the remaining allowance.
+
+    Distinct from :class:`ExecutiveUnavailable`: the model is reachable and the mission is
+    healthy, there is simply no budget left to spend on it. Raising stops the mission; it is
+    never a route to completion, and it never licenses a cheaper model.
+    """
+
+
 class ResidencyViolation(RuntimeError):
     """A different model than the resident executive served a cognition call."""
 
@@ -43,6 +52,11 @@ class CognitionRequest(BaseModel):
     effort: Optional[str] = None
     timeout_seconds: int = 900
     mission_id: Optional[str] = None
+    max_cost_usd: Optional[float] = Field(
+        default=None,
+        description="Hard ceiling for this single call, derived from the mission's remaining budget. "
+        "Enforced provider-side where the adapter supports it, so one runaway call cannot spend the rest.",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

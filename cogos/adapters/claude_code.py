@@ -194,6 +194,10 @@ class ClaudeCodeExecutive:
         effort = req.effort or self.effort
         if effort:
             cmd += ["--effort", effort]
+        if req.max_cost_usd is not None:
+            # Provider-side enforcement of the per-call ceiling. Argument analysis on our side
+            # bounds what we *ask* for; this bounds what the call can actually spend.
+            cmd += ["--max-budget-usd", f"{max(0.0, req.max_cost_usd):.4f}"]
         cmd += self.extra_args
         return cmd
 

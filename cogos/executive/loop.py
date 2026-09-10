@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from cogos.adapters.base import CognitionRequest, CognitionResponse, ExecutiveModel, ExecutiveUnavailable, UntrustedBlock
+from cogos.adapters.base import BudgetExhausted, CognitionRequest, CognitionResponse, ExecutiveModel, ExecutiveUnavailable, UntrustedBlock
 from cogos.adapters.continuity import detect as detect_continuity, handoff
 from cogos.adapters.schema_utils import schema_for
 from cogos.agent_foundry import AgentFoundry
@@ -26,6 +26,7 @@ from cogos.config import CogosConfig
 from cogos.events import EventBus
 from cogos.executive.controller import Assessment, MetaCognitiveController
 from cogos.executive.escalation import ObservationDigest, Tier, classify, deterministic_interpretation, digest_to_interpretation
+from cogos.executive.progress import FLAT_PROGRESS_CYCLES, track as track_progress
 from cogos.prompts import PROMPTS
 from cogos.governance.immune import scan_for_injection, wrap_untrusted
 from cogos.ids import iso_now, new_id
@@ -74,11 +75,40 @@ from cogos.verification.engine import mission_completion_check
 from cogos.workspace import GlobalWorkspace
 from cogos.world_model import WorldModelManager
 
+def _progress_view(state: MissionState) -> dict[str, Any]:
+    """The verifiable-progress record as the executive sees it (area G).
+
+    Read from durable mission state rather than a cycle local, so it survives resume and reflects
+    the whole mission rather than this process's slice of it.
+    """
+    book = state.resources.get("progress") or {}
+    note = ""
+    cycles_flat = int(book.get("cycles_flat", 0))
+    spend_since = round(float(state.usage.estimated_cost_usd) - float(book.get("spend_at_mark", state.usage.estimated_cost_usd)), 4)
+    if cycles_flat >= FLAT_PROGRESS_CYCLES and spend_since >= 0:
+        note = (
+            f"{cycles_flat} cycles without externally verifiable progress while spending ${spend_since:.2f}. "
+            "Activity is not progress: a criterion with a bound receipt, a verified artifact, a passing test, a "
+            "resolved blocker or a settled contradiction is. Consider whether this approach can produce checkable "
+            "evidence; if it cannot, choose one that can."
+        )
+    return {
+        "measured": book.get("detail") or {},
+        "cycles_without_verifiable_progress": cycles_flat,
+        "spend_since_last_progress_usd": spend_since,
+        "observation": note or None,
+    }
+
+
 #: Only contradictions the controller would actually escalate are worth a settlement probe.
 CONTRADICTION_SETTLE_FLOOR = 0.5
 
 #: How many times one belief may be attacked before the attack itself is the problem.
 MAX_FALSIFICATION_ATTEMPTS = 2
+
+#: Admission floors used until the mission has measured its own calls.
+CALL_COST_FLOOR_USD = 0.05
+CALL_SECONDS_FLOOR = 15.0
 
 EXECUTIVE_KINDS = {"compile", "select", "interpret", "synthesize", "replan", "challenge", "verify"}
 
@@ -164,6 +194,19 @@ class Executive:
             if self.events.pending_for(mission_id) or state.status == MissionStatus.PAUSED:
                 state.status = MissionStatus.ACTIVE
         self._apply_grants(state)
+        # Each run segment stamps its own provenance: a resumed mission may be served by a
+        # different build than the one that started it, which is exactly what happened live.
+        try:
+            from cogos.provenance import capture
+
+            segments: list[dict[str, Any]] = state.resources.setdefault("run_segments", [])
+            prov = capture(self.config, self.adapter, state.schema_version).model_dump(mode="json")
+            prov["started_at_cycle"] = state.usage.cycles
+            prov["spend_at_start_usd"] = round(state.usage.estimated_cost_usd, 6)
+            segments.append(prov)
+            state.resources["run_segments"] = segments[-10:]
+        except Exception as exc:  # noqa: BLE001 - provenance must never block a run
+            self.tracer.emit("error", f"provenance capture failed: {exc}")
         self.store.save_mission(state, "run_started")
         limit = max_cycles if max_cycles is not None else state.budget.max_cycles
         ran = 0
@@ -205,6 +248,15 @@ class Executive:
         # unchanged; only task ordering and what the executive is told about it change.
         closure = self._assess_closure(state)
         planner._closure = closure
+        # Progress gradient (area G): spend rising against a flat verifiable-progress vector is an
+        # observation for the executive, never an instruction — it chooses the new approach.
+        progress_obs = track_progress(state)
+        if progress_obs.flat:
+            self.tracer.emit(
+                "progress",
+                f"no verifiable progress for {progress_obs.cycles_flat} cycles (${progress_obs.spend_since_flat_usd:.2f} spent)",
+                data=progress_obs.model_dump(mode="json"),
+            )
         falsify_target = self._falsification_target(state, beliefs)
         assessment = self.controller.assess(
             state,
@@ -230,6 +282,8 @@ class Executive:
         # 4. select ------------------------------------------------------------------
         try:
             decision = self._select(state, planner, beliefs, world, assessment, verification_pending, falsify_target)
+        except BudgetExhausted as exc:
+            return self._pause_on_budget(state, assessment, str(exc), cycle_no)
         except ExecutiveUnavailable as exc:
             return self._block_on_executive(state, assessment, str(exc), cycle_no)
         if decision is None:
@@ -253,6 +307,10 @@ class Executive:
             task.updated_at = iso_now()
         try:
             outcome = self._perform(state, decision, task, beliefs, planner, ledger, assessment)
+        except BudgetExhausted as exc:
+            if task is not None:
+                task.status = TaskStatus.PENDING
+            return self._pause_on_budget(state, assessment, str(exc), cycle_no)
         except ExecutiveUnavailable as exc:
             if task is not None:
                 task.status = TaskStatus.PENDING
@@ -514,6 +572,7 @@ class Executive:
             "unknowns": [{"id": u.id, "question": u.question, "priority": u.priority(), "attempts": u.attempts} for u in sorted(state.open_unknowns(), key=lambda u: -u.priority())[:8]],
             "contradictions": [c.model_dump(mode="json") for c in state.unresolved_contradictions()[:5]],
             "directives": assessment.directives,
+            "verifiable_progress": _progress_view(state),
             "closure": (
                 {
                     "completion_blocked_on": [{"check": n.check, "missing": n.detail[:200], "criterion_ids": n.criterion_ids} for n in planner._closure.needs],
@@ -1740,8 +1799,26 @@ class Executive:
         self.tracer.emit("decision", f"{dec.selected_option[:160]} (conf {dec.confidence:.2f})", data={"decision_id": dec.decision_id, "options": dec.available_options, "assumptions": dec.assumptions})
 
     def _cognition(self, state: MissionState, req: CognitionRequest) -> CognitionResponse:
+        # Admission control (area F): decide whether this call can *start* inside what is left,
+        # not merely whether the work already done fits. Refusal stops the mission; it is never a
+        # path to completion, and it never downgrades the executive model to make a call fit.
+        ledger = ResourceLedger(state.usage)
+        estimate = self._estimate_call(state, req.kind)
+        refusal = ledger.admit(state.budget, estimated_cost_usd=estimate["cost_usd"], estimated_seconds=estimate["seconds"])
+        if refusal:
+            self.tracer.emit(
+                "blocked",
+                f"cognition:{req.kind} refused admission — {refusal}",
+                data={"kind": req.kind, "estimate": estimate, "reason": refusal},
+            )
+            raise BudgetExhausted(refusal)
+        # Bound the call itself so a single runaway cannot spend the remainder.
+        affordable = ledger.affordable_cost(state.budget)
+        if affordable is not None:
+            req = req.model_copy(update={"max_cost_usd": round(max(0.0, affordable), 4)})
         resp = self.adapter.call(req)
-        ResourceLedger(state.usage).add_model_call(resp)
+        ledger.add_model_call(resp)
+        self._record_call_cost(state, req.kind, resp)
         self.tracer.emit("operation", f"cognition:{req.kind} {'ok' if resp.ok else 'FAILED'} model={','.join(resp.models_used) or req.model} {resp.duration_ms}ms", data={"kind": req.kind, "ok": resp.ok, "error": resp.error[:200], "error_kind": resp.error_kind, "models_used": resp.models_used, "residency_ok": resp.residency_ok}, cost={"cost_usd": resp.cost_usd, "input_tokens": resp.input_tokens, "output_tokens": resp.output_tokens})
         if not resp.ok and resp.error_kind == "refused":
             # A provider safety classification narrows what this call can do; it never changes
@@ -1760,6 +1837,42 @@ class Executive:
             if not resp.ok and resp.error_kind == "unavailable":
                 raise ExecutiveUnavailable(resp.error)
         return resp
+
+    def _estimate_call(self, state: MissionState, kind: str) -> dict[str, float]:
+        """What the next call of this kind is likely to consume, from this mission's own history.
+
+        Learned from observation rather than guessed: the mission measures its own calls. Until
+        there is history, the floor keeps admission from being trivially permissive.
+        """
+        model = state.resources.get("cost_model", {})
+        seen = model.get(kind) or {}
+        return {
+            "cost_usd": float(seen.get("max_cost_usd", 0.0)) or CALL_COST_FLOOR_USD,
+            "seconds": float(seen.get("max_seconds", 0.0)) or CALL_SECONDS_FLOOR,
+        }
+
+    @staticmethod
+    def _record_call_cost(state: MissionState, kind: str, resp: CognitionResponse) -> None:
+        """Update the mission's own cost model. Survives checkpoint/resume with the mission."""
+        model = state.resources.setdefault("cost_model", {})
+        seen = model.setdefault(kind, {"max_cost_usd": 0.0, "max_seconds": 0.0, "calls": 0})
+        seen["max_cost_usd"] = max(float(seen.get("max_cost_usd", 0.0)), float(resp.cost_usd or 0.0))
+        seen["max_seconds"] = max(float(seen.get("max_seconds", 0.0)), float(resp.duration_ms or 0) / 1000.0)
+        seen["calls"] = int(seen.get("calls", 0)) + 1
+
+    def _pause_on_budget(self, state: MissionState, assessment: Assessment, reason: str, cycle_no: int) -> CycleResult:
+        """Stop the mission because the next step cannot be paid for.
+
+        PAUSED, never COMPLETE and never FAILED: the work done so far stands, the mission is
+        resumable with a raised allowance, and cumulative spend is preserved so a resume continues
+        the ledger rather than restarting it.
+        """
+        state.status = MissionStatus.PAUSED
+        note = f"paused: {reason}"
+        if note not in state.notes:
+            state.notes.append(note)
+        self.tracer.emit("blocked", f"budget admission: {reason}", cycle=cycle_no, data={"reason": reason, "usage": state.usage.model_dump()})
+        return CycleResult(cycle_no, None, None, assessment, stop=True, stop_reason=reason)
 
     def _check_residency(self, state: MissionState, resp: CognitionResponse, kind: str) -> None:
         if not resp.residency_ok:

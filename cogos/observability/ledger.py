@@ -122,6 +122,46 @@ class ResourceLedger:
             out["wall_clock_seconds"] = round(budget.max_wall_clock_seconds - u.wall_clock_seconds, 1)
         return out
 
+    # -- admission control ---------------------------------------------------------------
+
+    def admit(self, budget: Budget, *, estimated_cost_usd: float = 0.0, estimated_seconds: float = 0.0) -> Optional[str]:
+        """Can the next operation be *started* within what is left? Returns a refusal, or None.
+
+        The live run checked the budget at cycle start, then began a call that ran for 486 seconds
+        and $2.53 — so a 2400s cap became 2940s and a $19.00 cap became $20.51. Checking whether
+        the work already done fits is not the same question as whether the next piece will.
+
+        Refusing is the only safe direction: it stops the mission, it never completes it. Nothing
+        here may downgrade the executive model to make a call fit — model residency is a safety
+        property, not a budget lever.
+        """
+        breach = self.over_budget(budget)
+        if breach:
+            return breach
+        u = self.usage
+        if budget.max_cost_usd is not None and estimated_cost_usd > 0:
+            committed = u.estimated_cost_usd + self.reserved_cost_usd + estimated_cost_usd
+            if committed > budget.max_cost_usd:
+                return (
+                    f"next operation would exceed the cost budget: ${u.estimated_cost_usd:.2f} spent"
+                    f"{f' + ${self.reserved_cost_usd:.2f} reserved' if self.reserved_cost_usd else ''}"
+                    f" + ${estimated_cost_usd:.2f} estimated > ${budget.max_cost_usd:.2f}"
+                )
+        if budget.max_wall_clock_seconds is not None and estimated_seconds > 0:
+            committed_s = u.wall_clock_seconds + estimated_seconds
+            if committed_s > budget.max_wall_clock_seconds:
+                return (
+                    f"next operation would exceed the wall-clock budget: {u.wall_clock_seconds:.0f}s elapsed"
+                    f" + {estimated_seconds:.0f}s estimated > {budget.max_wall_clock_seconds:.0f}s"
+                )
+        return None
+
+    def affordable_cost(self, budget: Budget) -> Optional[float]:
+        """The most the next single call may cost, or None when cost is unbounded."""
+        if budget.max_cost_usd is None:
+            return None
+        return max(0.0, budget.max_cost_usd - self.usage.estimated_cost_usd - self.reserved_cost_usd)
+
     def snapshot(self) -> dict[str, Any]:
         d = self.usage.model_dump()
         d["total_tokens"] = self.usage.input_tokens + self.usage.output_tokens
