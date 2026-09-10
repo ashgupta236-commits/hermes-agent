@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import shlex
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from cogos.config import GovernanceConfig
@@ -140,8 +140,10 @@ class CapabilityFirewall:
             command = str(args.get("command", ""))
             base = classify_shell_command(command)
             # A destination denied to write_file must be denied on this route too, so the shell
-            # command's own write targets are classified by the same rule.
-            if base == ActionClass.REVERSIBLE_LOCAL and self._writes_outside_roots(command):
+            # command's own write targets are classified by the same rule. A relative target
+            # resolves against the call's own `cwd`, not the repo root: a caller that points cwd
+            # outside the writable roots and writes to a bare filename is writing outside them.
+            if base == ActionClass.REVERSIBLE_LOCAL and self._writes_outside_roots(command, args.get("cwd")):
                 return ActionClass.CONSEQUENTIAL_SHARED
             return base
         if spec.substrate == "git":
@@ -167,11 +169,20 @@ class CapabilityFirewall:
             return ActionClass.REVERSIBLE_EXTERNAL
         return spec.default_action_class
 
-    def _writes_outside_roots(self, command: str) -> bool:
+    def _writes_outside_roots(self, command: str, cwd: Any = None) -> bool:
+        base = self.repo_root
+        if cwd:
+            candidate = Path(str(cwd))
+            base = candidate if candidate.is_absolute() else (self.repo_root / candidate)
+            if not _path_within(base, self.writable_roots):
+                # The working directory itself is outside the roots, so any relative write this
+                # command performs lands outside them.
+                if shell_write_targets(command):
+                    return True
         for raw in shell_write_targets(command):
             target = Path(raw)
             if not target.is_absolute():
-                target = self.repo_root / target
+                target = base / target
             if not _path_within(target, self.writable_roots):
                 return True
         return False
@@ -213,7 +224,11 @@ class CapabilityFirewall:
         # Writes outside writable roots are consequential/shared: deny unless granted. This
         # covers every execution route the firewall can classify, not just the filesystem tools —
         # a denied destination reached through a shell is the same denied destination.
-        if spec.substrate in ("filesystem", "shell", "git") and action_class == ActionClass.CONSEQUENTIAL_SHARED and "consequential_shared" not in self.human_grants:
+        # `tests` belongs here for the same reason `shell` does: it spawns a shell, so a denied
+        # destination reached through the test runner is the same denied destination. Classifying
+        # it without enforcing it left the bypass open — the classification said
+        # consequential_shared and this clause then allowed it.
+        if spec.substrate in ("filesystem", "shell", "git", "tests") and action_class == ActionClass.CONSEQUENTIAL_SHARED and "consequential_shared" not in self.human_grants:
             return FirewallVerdict(decision=PolicyDecision.DENY, action_class=action_class, reason="write outside writable roots")
         return FirewallVerdict(decision=PolicyDecision.ALLOW, action_class=action_class, reason="within policy")
 

@@ -84,24 +84,38 @@ _PYTEST_SUMMARY = re.compile(
     r"(?:^|\n)(?:=+ )?(?P<summary>\d+ (?:passed|failed|error|errors|skipped|xfailed|xpassed|deselected)[^\n=]*?) in [\d.]+s",
 )
 _PYTEST_COUNTS = re.compile(r"(\d+) (passed|failed|error|errors|skipped|xfailed|xpassed)")
-_RUNNER_IN_COMMAND = re.compile(r"(?:^|[\s;&|/])(pytest|py\.test)\b|-m\s+pytest\b|-m\s+unittest\b|(?:^|[\s;&|/])nose2?\b")
+_RUNNER_IN_COMMAND = re.compile(r"(?:^|\s)(pytest|py\.test)\b|-m\s+pytest\b|-m\s+unittest\b|(?:^|\s)nose2?\b")
+#: Anything that lets a second program write to the same stdout, or redirect the runner's away.
+_COMPOSED = re.compile(r"[;&|><`]|\$\(|\n")
 
 
 def detect_framework(command: str) -> str:
-    """Identify the runner from the **command**, never from the output.
+    """Identify the runner from a command whose output is attributable to it, or return unknown.
 
-    Output is written by the process under test. A program that prints "5 passed" would otherwise
-    forge structured test evidence for itself — verified: a one-line script printing
-    "Report: 5 passed, 0 failed" produced a PASSED verification with five fabricated tests. The
-    command, by contrast, comes from the plan and has already been through the firewall.
+    Two separate problems have to be closed here, and closing only one leaves the hole open.
+
+    Output is written by the process under test, so a program printing "5 passed" could forge
+    evidence about itself — hence reading the *command* rather than the output. But the command is
+    model-authored, and the firewall classifies danger, not truthfulness: verified against this
+    module's own earlier version, ``pytest -q > /dev/null 2>&1; echo "1 passed in 0.02s"`` named a
+    real runner, discarded its real (failing) output, and printed a convincing summary — producing
+    a PASSED record with one fabricated test while the suite actually failed.
+
+    So the command must also be *simple*: one invocation, nothing chained, piped or redirected.
+    Counts can only be attributed to a runner when the runner is the only thing that wrote them.
+    A composed command still executes — it is an authorized action — but its stdout is not test
+    evidence.
     """
-    m = _RUNNER_IN_COMMAND.search(command or "")
+    text = command or ""
+    if _COMPOSED.search(text):
+        return "unknown"
+    m = _RUNNER_IN_COMMAND.search(text)
     if not m:
         return "unknown"
-    text = m.group(0)
-    if "unittest" in text:
+    found = m.group(0)
+    if "unittest" in found:
         return "unittest"
-    if "nose" in text:
+    if "nose" in found:
         return "nose"
     return "pytest"
 
@@ -174,13 +188,16 @@ def classify_test_run(
         return outcome(FAILED, f"{c['failed']} failed, {c['error']} error(s)")
 
     if framework == "unknown":
-        # The command did not invoke a recognised test runner, so whatever it printed is program
-        # output, not a test report. It may well have succeeded at being a command; that is not
-        # evidence about tests. An authorized expected-zero contract still resolves, because it
-        # asserts that nothing ran rather than that anything passed.
+        # Either the command invoked no recognised runner, or it was composed so that something
+        # other than the runner could have written the output. Whatever it printed is program
+        # output, not a test report, so the counts are discarded rather than recorded as if real:
+        # leaving them in state would put fabricated numbers on a durable record. An authorized
+        # expected-zero contract still resolves, because it asserts that nothing ran rather than
+        # that anything passed.
+        c["passed"] = c["failed"] = c["error"] = c["skipped"] = 0
         if expect_zero and exit_code in (0, None):
             return outcome(PASSED, "zero executed tests, explicitly authorized by the verification contract")
-        return outcome(INCONCLUSIVE, "command invoked no recognised test runner: not test evidence")
+        return outcome(INCONCLUSIVE, "output is not attributable to a recognised test runner: not test evidence")
 
     executed = c["passed"] + c["failed"] + c["error"]
     if executed == 0:

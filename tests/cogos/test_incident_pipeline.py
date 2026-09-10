@@ -1145,3 +1145,119 @@ def test_a_symlink_repointed_after_verification_is_detected(tmp_path):
     os.symlink(tmp_path / "evil.py", tmp_path / "calc.py")
 
     assert mission_completion_check(state).status != PASSED, "repointing a symlink must not preserve the proof"
+
+
+# ======================================================================================
+# Independent adversarial review of the finished repair — reproduced fatal findings
+# ======================================================================================
+
+
+def test_ver1_a_composed_command_cannot_forge_test_evidence(tmp_path):
+    """Reproduced against the repair: `pytest -q > /dev/null 2>&1; echo "1 passed in 0.02s"` named
+    a real runner, discarded its real failing output and printed a convincing summary, producing a
+    PASSED record with one fabricated test. Detecting the runner from the command is not enough —
+    the command is model-authored, and the firewall classifies danger, not truthfulness."""
+    _write(tmp_path, "test_x.py", "def test_fails():\n    assert False\n")
+    state = MissionState(objective="forgery via composition")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+
+    res = engine.verify_code([f'{sys.executable} -m pytest -q > /dev/null 2>&1; echo "1 passed in 0.02s"'], cwd=str(tmp_path))
+
+    assert res.status != PASSED, f"a composed command's stdout is not test evidence: {res.summary}"
+    rec = state.tests[-1]
+    assert rec.framework == "unknown"
+    assert rec.executed == 0, f"fabricated counts must not be recorded as real: {rec.counts}"
+
+
+def test_ver1b_legitimate_simple_runner_commands_still_pass_and_fail_correctly(tmp_path):
+    """The attributability rule must not break ordinary verification."""
+    good = tmp_path / "good"
+    good.mkdir()
+    _write(good, "test_ok.py", "def test_ok():\n    assert True\n")
+    state = MissionState(objective="ok")
+    assert VerificationEngine(_fabric(good), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(good)).status == PASSED
+
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    _write(bad, "test_bad.py", "def test_bad():\n    assert False\n")
+    state2 = MissionState(objective="bad")
+    assert VerificationEngine(_fabric(bad), state2).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(bad)).status == FAILED
+
+
+def test_ver2_a_phantom_input_binding_does_not_make_a_receipt_permanently_intact(tmp_path):
+    """Reproduced against the repair: binding a receipt to a path that does not exist gave it an
+    empty hash, which the re-read skipped, so the receipt stayed 'intact' forever while the real
+    implementation was swapped underneath it."""
+    from cogos.schemas.verification import InputVersion
+    from cogos.verification.engine import receipt_inputs_intact
+    from cogos.verification import VerificationResult as _Result
+
+    ghost = tmp_path / "does_not_exist.py"
+    receipt = _Result(target_type="code", target_id="t", status=PASSED, summary="x",
+                      input_versions=[InputVersion(path=str(ghost), content_hash="")])
+    assert receipt_inputs_intact(receipt)[0], "absent when observed and absent now is consistent"
+
+    ghost.write_text("appeared later\n", encoding="utf-8")
+    ok, why = receipt_inputs_intact(receipt)
+    assert not ok and "exists now" in why, "a declared input that has since appeared invalidates the receipt"
+
+
+def test_ver2b_a_criterion_bound_only_to_phantom_inputs_cannot_complete(tmp_path):
+    """A binding that names no bytes does not make a proof re-checkable."""
+    _write(tmp_path, "calc.py", CALC)
+    _write(tmp_path, "test_calc.py", TEST_CALC)
+    state = MissionState(objective="phantom binding")
+    engine = VerificationEngine(_fabric(tmp_path), state)
+    crit = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(crit)
+    task = Task(title="run tests", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
+    state.tasks.append(task)
+    engine.verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path), task_id=task.id,
+                       input_paths=["does_not_exist.py"])
+    engine.verify_criterion(crit)
+
+    gate = mission_completion_check(state)
+    assert gate.status != PASSED, "a phantom binding is not a binding"
+    assert "no input versions" in gate.summary
+
+
+def test_fw1_the_test_runner_is_enforced_against_writable_roots_not_only_classified(tmp_path):
+    """Reproduced against the repair: `classify` had learned about the `tests` substrate but
+    `_decide`'s writable-roots clause had not, so the call was classified consequential_shared and
+    then allowed anyway. Classifying without enforcing is not a boundary."""
+    from cogos.schemas.common import PolicyDecision
+    from cogos.schemas.tools import ToolCall, ToolSpec
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fw = CapabilityFirewall(GovernanceConfig(writable_roots=[str(repo)]), repo)
+    cmd = f"echo pwned > {outside}/pwn.txt"
+
+    via_shell = fw.check(ToolCall(tool="shell", arguments={"command": cmd}), ToolSpec(name="shell", description="", substrate="shell"))
+    via_tests = fw.check(ToolCall(tool="run_tests", arguments={"command": cmd}), ToolSpec(name="run_tests", description="", substrate="tests"))
+
+    assert via_shell.decision is PolicyDecision.DENY
+    assert via_tests.decision is PolicyDecision.DENY, "the boundary must be enforced on the tests substrate too"
+    assert via_tests.reason == via_shell.reason
+
+
+def test_fw2_a_relative_write_under_a_cwd_outside_the_roots_is_classified(tmp_path):
+    """A caller that points cwd outside the writable roots and writes to a bare filename is
+    writing outside them; the target was previously resolved against the repo root instead."""
+    from cogos.schemas.common import PolicyDecision
+    from cogos.schemas.tools import ToolCall, ToolSpec
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fw = CapabilityFirewall(GovernanceConfig(writable_roots=[str(repo)]), repo)
+    spec = ToolSpec(name="shell", description="", substrate="shell")
+
+    escaped = fw.check(ToolCall(tool="shell", arguments={"command": "echo x > out.txt", "cwd": str(outside)}), spec)
+    inside = fw.check(ToolCall(tool="shell", arguments={"command": "echo x > out.txt", "cwd": str(repo)}), spec)
+
+    assert escaped.decision is PolicyDecision.DENY
+    assert inside.decision is PolicyDecision.ALLOW, "ordinary in-workspace writes must still be allowed"

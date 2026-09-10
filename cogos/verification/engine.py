@@ -172,6 +172,12 @@ def receipt_inputs_intact(receipt: VerificationResult) -> tuple[bool, str]:
         if iv.changed_during_verification:
             return False, f"inputs changed while it ran ({Path(iv.path).name})"
         if not iv.content_hash:
+            # An empty hash records "this declared input was not there when we looked". It proves
+            # nothing, and if the file has since appeared the receipt no longer describes reality.
+            # Skipping it outright made a receipt bound to a non-existent path permanently intact,
+            # which was a working route to a false completion.
+            if Path(iv.path).is_file():
+                return False, f"{Path(iv.path).name} did not exist when this ran but exists now"
             continue
         current = file_sha256(Path(iv.path)) if Path(iv.path).is_file() else None
         if current != iv.content_hash:
@@ -322,7 +328,10 @@ class VerificationEngine:
                     exit_code=res.data.get("exit_code"),
                     counts=res.data.get("counts") or {},
                     output=res.output or "",
-                    command=shell_cmd,
+                    # The declared command, not the shell_cmd: the `cd <cwd> &&` prefix is added by
+                    # this runtime and is trusted, while everything in `cmd` came from the plan and
+                    # is what the attributability check is about.
+                    command=cmd,
                     expect_zero=expect_zero_tests,
                 )
             detail = f"{outcome.reason}: {res.data.get('summary') or res.error or ''}".strip(": ")
@@ -968,7 +977,8 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
             for t in state.tests
         )
         judged = [(receipt_inputs_intact(r), r) for r in crs]
-        live = [r for (ok, _why), r in judged if ok and (r.input_versions or not engine_backed)]
+        # A binding with no content hash names no bytes, so it does not make a receipt re-checkable.
+        live = [r for (ok, _why), r in judged if ok and (any(iv.content_hash for iv in r.input_versions) or not engine_backed)]
         if live:
             # A later receipt that still matches supersedes an earlier one that no longer does.
             # Re-verifying after a fix is exactly how a mission is meant to recover; the stale
@@ -987,7 +997,7 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
         if unbound:
             missing.append(f"{len(unbound)} criterion receipt(s) name no input versions: " + "; ".join(unbound[:3]))
     else:
-        bound = sum(len(r.input_versions) for c in state.success_criteria for r in receipts(c))
+        bound = sum(1 for c in state.success_criteria for r in receipts(c) for iv in r.input_versions if iv.content_hash)
         checks.append(
             VerificationCheck(
                 name="receipt_input_versions",
