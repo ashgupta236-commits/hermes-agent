@@ -18,7 +18,7 @@ Separate these when reading any result.
 | | |
 | --- | --- |
 | **Historical live observation** | Live Run #1 (`LIVE_RUN.md`) and Live Run #2 (`LIVE_RUN_2.md`). Both ended `paused`. |
-| **Offline measured** | The before/after in `INCIDENT_REPAIR.md` §5, and 528 tests / 20/20 evals. Deterministic, no model involved. |
+| **Offline measured** | The before/after in `INCIDENT_REPAIR.md` §5, and 562 tests / 20/20 evals. Deterministic, no model involved. |
 | **Estimate** | Nothing in this protocol. Do not estimate live cost from offline replay. |
 | **Unmeasured** | Frontier-model cost, call count and token usage under the repair; the reality anchor; temporal settlement; the L1 digest tier; the progress-gradient escalation. |
 
