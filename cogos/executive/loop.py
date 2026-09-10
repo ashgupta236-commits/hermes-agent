@@ -27,6 +27,8 @@ from cogos.executive.controller import Assessment, MetaCognitiveController
 from cogos.prompts import PROMPTS
 from cogos.governance.immune import scan_for_injection, wrap_untrusted
 from cogos.ids import iso_now, new_id
+from cogos.learning.experience import extract_features
+from cogos.learning.retrieval_policy import LearnedRetrieval
 from cogos.memory import MemoryManager
 from cogos.observability import CalibrationTracker, DecisionJournal, ResourceLedger, Tracer
 from cogos.observability.channels import ChannelRecorder
@@ -132,6 +134,7 @@ class Executive:
         self.anchors = AnchorService(self)
         self.channels = ChannelRecorder(store, run_id=new_id("run"))
         self.continuity = detect_continuity(adapter)
+        self.retrieval = LearnedRetrieval()
         self._cognition_log: list[tuple[str, CognitionResponse]] = []
         self._sleep = sleep_fn
         self._tool_history: list[bool] = []
@@ -368,18 +371,34 @@ class Executive:
     def _select(self, state: MissionState, planner: Planner, beliefs: BeliefGraph, world: WorldModelManager, assessment: Assessment, verification_pending: list[str], falsify_target: Optional[dict[str, Any]]) -> Optional[StepDecision]:
         ready = planner.next_tasks(limit=6)
         memory_lines: list[str] = []
+        # L2: the learned policy picks among three validated, equivalent-effect retrieval
+        # strategies, and is then scored on what the choice actually recalled.
+        features = extract_features(state, str(state.resources.get("mission_kind", "general")))
+        strategy, why = self.retrieval.choose(features)
+        params = self.retrieval.parameters(strategy)
+        quarantined = 0
+        retrieved = 0
         try:
-            mems = self.memory.retrieve(state.objective, limit=6, mission_id=state.mission_id)
+            mems = self.memory.retrieve(state.objective, limit=int(params["limit"]), mission_id=state.mission_id, classes=params["classes"])
+            retrieved = len(mems)
             for m in mems:
                 flags = scan_for_injection(m.content)
                 if flags:
                     # Poisoned memory is quarantined from the workspace and reported, never followed.
+                    quarantined += 1
                     self.tracer.emit("blocked", f"memory {m.id} quarantined: injection flags {flags}", data={"memory_id": m.id, "flags": flags})
                     state.notes.append(f"memory {m.id} quarantined (injection flags {flags})")
                     continue
                 memory_lines.append(f"[{m.memory_class.value} {m.confidence:.2f}] {m.content[:200]}")
         except Exception as exc:  # noqa: BLE001 - memory failures must not stop cognition
             self.tracer.emit("error", f"memory retrieval failed: {exc}")
+        value = self.retrieval.record(used=len(memory_lines), retrieved=retrieved, quarantined=quarantined)
+        if retrieved:
+            self.tracer.emit(
+                "policy",
+                f"retrieval strategy '{strategy}' ({why}) recalled {len(memory_lines)}/{retrieved}, {quarantined} quarantined",
+                data={"policy": self.retrieval.bandit.name, "strategy": strategy, "context": features.bucket(), "estimate": value, "updates": self.retrieval.bandit.update_count},
+            )
         recent = [t.summary for t in self.store.traces(state.mission_id, limit=400) if t.kind in ("operation", "verify", "failure", "specialist")][-8:]
         view = self.workspace.build(
             state,
