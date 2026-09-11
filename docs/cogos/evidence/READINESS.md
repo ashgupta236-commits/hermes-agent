@@ -10,6 +10,11 @@ ones stated in the instruction that authorised the run conditionally. They are e
 [`readiness-live-run-3.json`](readiness-live-run-3.json); it exits non-zero when any condition
 fails. The numbers below are copied from that file, not asserted by hand.
 
+The recorded run is against commit `3f21c89` with a clean working tree, which is the freeze state
+`LIVE_RUN_3_PROTOCOL.md` §1 requires. (`readiness-live-run-3.json` is the gate's own output, so the
+commit that carries the file is necessarily one later than the commit it gates; that follow-up
+commit changes nothing but the record.)
+
 ## The conditions
 
 | # | Condition | Result |
@@ -149,6 +154,7 @@ before the run.
 
 | field | value |
 |---|---|
+| commit | `3f21c89b04d20501c77f5139551cdcd627201117`, clean tree (`dirty_tree: false`) |
 | branch | `claude/autonomous-cognitive-os-og6r0p` |
 | requirements digest (sha256 of `REQUIREMENTS.md` bytes) | `68f152318a8c00c2e99848617a19cdb1bc21bee0fa62c33d6e650e42337c1969` |
 | acceptance contract digest | `d4c75891a73cbb7cf9b203dacca220184c33344a8a5a7690b81970ed129753cb` |

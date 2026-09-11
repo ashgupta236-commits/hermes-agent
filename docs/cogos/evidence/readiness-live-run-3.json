@@ -1,6 +1,6 @@
 {
-  "sha": "5c960714a153dbd9980593bc6f8d4debeebaf7ab",
-  "dirty_tree": true,
+  "sha": "3f21c89b04d20501c77f5139551cdcd627201117",
+  "dirty_tree": false,
   "verdict": "BLOCKED",
   "conditions": [
     {
@@ -13,7 +13,7 @@
       "n": 1,
       "name": "Correct mission completes with production defaults, no trust exemption",
       "met": true,
-      "evidence": "test_isolated_verifier.py: 68 passed in 99.64s (0:01:39); real-backend tests skipped: 0"
+      "evidence": "test_isolated_verifier.py: 68 passed in 99.46s (0:01:39); real-backend tests skipped: 0"
     },
     {
       "n": 2,
@@ -37,7 +37,7 @@
       "n": 6,
       "name": "Suites, evals, demo, lint, type checks and every mutation audit pass",
       "met": true,
-      "evidence": "suite: 682 passed in 167.35s (0:02:47); ruff=clean; ty=clean; evals rc=0; demo rc=0; incident-repair-mutation-audit.sh: 17 guard(s) load-bearing, 0 problem(s); isolated-verifier-mutation-audit.sh: 42 guard(s) load-bearing, 0 problem(s); trust-boundary-mutation-audit.sh: 25 guard(s) load-bearing, 0 problem(s)"
+      "evidence": "suite: 682 passed in 169.94s (0:02:49); ruff=clean; ty=clean; evals rc=0; demo rc=0; incident-repair-mutation-audit.sh: 17 guard(s) load-bearing, 0 problem(s); isolated-verifier-mutation-audit.sh: 42 guard(s) load-bearing, 0 problem(s); trust-boundary-mutation-audit.sh: 25 guard(s) load-bearing, 0 problem(s)"
     },
     {
       "n": 7,
