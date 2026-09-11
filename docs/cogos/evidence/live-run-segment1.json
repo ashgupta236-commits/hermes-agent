@@ -1,0 +1,240 @@
+{
+ "mission_id": "msn_1m2677fqw0c0afe86",
+ "status": "paused",
+ "elapsed_seconds": 1522.4,
+ "completion_gate": "failed",
+ "gate_checks": [
+  {
+   "name": "success_criteria",
+   "status": "failed",
+   "detail": "'calc.py exists at /tmp/cogos-live-run/calc.py and defines add_percent(value: float, percent: float) -> float with type hints' (no passing verification record bound to it); 'add_percent returns value "
+  },
+  {
+   "name": "tests",
+   "status": "passed",
+   "detail": "0 test record(s), none failing"
+  },
+  {
+   "name": "contradictions",
+   "status": "failed",
+   "detail": "ctr_1m267xge119c5a184 (severity 1.00)"
+  },
+  {
+   "name": "blocked_operations",
+   "status": "passed",
+   "detail": "no unresolved blocked operations on unfinished tasks"
+  },
+  {
+   "name": "human_requests",
+   "status": "passed",
+   "detail": "no blocking unanswered human requests"
+  },
+  {
+   "name": "artifact_integrity",
+   "status": "skipped",
+   "detail": "no verified artifacts to re-check"
+  },
+  {
+   "name": "required_artifacts",
+   "status": "failed",
+   "detail": "missing or unverified: /tmp/cogos-live-run/calc.py, /tmp/cogos-live-run/test_calc.py"
+  }
+ ],
+ "criteria": [
+  {
+   "description": "calc.py exists at /tmp/cogos-live-run/calc.py and defines add_percent(value: float, percent: float) -> float with type hints",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "add_percent returns value increased by percent percent, rounded to 2 decimals (e.g. add_percent(100, 10) == 110.0, add_percent(50, 0) == 50.0, add_percent(200, -25) == 150.0, add_percent(10, 3.333) == 10.33)",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "test_calc.py exists and contains tests for a positive percent, a zero percent, and a negative percent",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "Full test suite passes with the environment test command",
+   "satisfied": false,
+   "bound_receipts": []
+  },
+  {
+   "description": "No other files in the project root are modified or deleted (README.md, REQUIREMENTS.md, pytest.ini untouched)",
+   "satisfied": false,
+   "bound_receipts": []
+  }
+ ],
+ "artifacts": [],
+ "tasks": [
+  {
+   "title": "Inspect project context (pytest.ini, README.md, existing files)",
+   "status": "done",
+   "attempts": 1
+  },
+  {
+   "title": "Write calc.py with add_percent",
+   "status": "done",
+   "attempts": 2
+  },
+  {
+   "title": "Write test_calc.py covering positive, zero, negative percent",
+   "status": "ready",
+   "attempts": 0
+  },
+  {
+   "title": "Run the test suite",
+   "status": "pending",
+   "attempts": 0
+  },
+  {
+   "title": "Independent spec conformance check",
+   "status": "pending",
+   "attempts": 0
+  },
+  {
+   "title": "Deterministic rounding falsification on the calculate substrate",
+   "status": "done",
+   "attempts": 1
+  },
+  {
+   "title": "Verbatim re-read of REQUIREMENTS.md and diff against paraphrase",
+   "status": "done",
+   "attempts": 1
+  },
+  {
+   "title": "Run pytest in /tmp/cogos-live-run and verify collection + pass",
+   "status": "pending",
+   "attempts": 0
+  },
+  {
+   "title": "Read back calc.py and test_calc.py to verify content",
+   "status": "ready",
+   "attempts": 0
+  },
+  {
+   "title": "Run pytest on test_calc.py as the independent verification gate",
+   "status": "ready",
+   "attempts": 0
+  },
+  {
+   "title": "Resolve disagreement: Provenance and epistemic status of the mission c",
+   "status": "ready",
+   "attempts": 0
+  }
+ ],
+ "tests": [],
+ "usage": {
+  "model_calls": 14,
+  "input_tokens": 128277,
+  "output_tokens": 86983,
+  "tool_calls": 12,
+  "retries": 0,
+  "subagents_spawned": 2,
+  "network_requests": 0,
+  "wall_clock_seconds": 2940.1196225749986,
+  "estimated_cost_usd": 8.807159749999999,
+  "cycles": 6
+ },
+ "executive_model": "claude-fable-5-1",
+ "capability_state": {
+  "read_file": {
+   "available": true,
+   "reason": ""
+  },
+  "list_dir": {
+   "available": true,
+   "reason": ""
+  },
+  "search_text": {
+   "available": true,
+   "reason": ""
+  },
+  "write_file": {
+   "available": true,
+   "reason": ""
+  },
+  "delete_file": {
+   "available": true,
+   "reason": ""
+  },
+  "shell": {
+   "available": true,
+   "reason": ""
+  },
+  "git": {
+   "available": true,
+   "reason": ""
+  },
+  "run_tests": {
+   "available": true,
+   "reason": ""
+  },
+  "calculate": {
+   "available": true,
+   "reason": ""
+  },
+  "web_fetch": {
+   "available": true,
+   "reason": ""
+  },
+  "memory_search": {
+   "available": true,
+   "reason": ""
+  },
+  "read_document": {
+   "available": true,
+   "reason": ""
+  }
+ },
+ "anchor": {
+  "assessments": 0,
+  "verdicts": [],
+  "observations": 0,
+  "holds": [],
+  "isolation": null,
+  "uncorroborated": []
+ },
+ "residency": {
+  "decision_records": 5,
+  "model_calls_by_residency": {
+   "verified": 11
+  }
+ },
+ "continuity": {
+  "mode": "external_state_only",
+  "adapter": "claude_code",
+  "preserves_internal_reasoning": false,
+  "stable_prompt_prefix": true,
+  "tool_result_pairing": false,
+  "opaque_blocks_supported": false,
+  "detected_from": "headless CLI is invoked with --no-session-persistence",
+  "limitations": [
+   "each cognition call is a fresh process: the executive's internal reasoning between cycles is not preserved",
+   "continuity is only as good as what the runtime wrote to durable state before the call"
+  ]
+ },
+ "retrieval_policy_updates": 5,
+ "notes": [
+  "material disagreement recorded: Provenance and epistemic status of the mission constraint 'Use Python's built-in round(x, 2)'",
+  "paused: wall-clock budget exhausted: 2940s of 2400s elapsed"
+ ],
+ "unresolved": {
+  "blocked_operations": [],
+  "open_unknowns": [
+   "Does test_calc.py as written cover positive, zero and negative percent with non-tie inputs and import add_percent correctly?",
+   "Does pytest under the existing pytest.ini collect and pass test_calc.py?",
+   "Decisive re-read not performed: run `grep -niE 'half|round_|banker|example|e\\.g\\.|->|=>' /tmp/cogos-live-run/REQUIREMENTS.md; wc -l /tmp/cogos-live-run/REQUIREMENTS.md` (or cat the 5 lines into the ev",
+   "Whether the mission's owner intends half-up (Decimal ROUND_HALF_UP) or accepts built-in round semantics on tie-like inputs; the spec appears silent, so this is a recorded assumption unless the human s"
+  ],
+  "contradictions": [
+   "The mission constraint 'Use Python's built-in round(x, 2) for rounding' is recorded as a hard constraint, while the cont",
+   "Conflicting evidence for: Baseline file set of /tmp/cogos-live-run is {.cogos/, README.md, REQUIREMENTS.md, pytest.ini};"
+  ],
+  "undecidable_criteria": [],
+  "human_requests": []
+ },
+ "discrepancies": []
+}

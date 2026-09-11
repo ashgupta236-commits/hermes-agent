@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(python -m cogos *)",
+      "Bash(.venv/bin/python -m cogos *)",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(python -m pytest *)",
+      "Bash(.venv/bin/ruff *)",
+      "Bash(.venv/bin/ty *)",
+      "Bash(make cogos-*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(ls*)",
+      "Bash(rg *)",
+      "Bash(cat *)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/id_rsa)",
+      "Read(**/*.pem)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/cogos-boot.sh" }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/cogos-checkpoint.sh" }
+        ]
+      }
+    ]
+  }
+}

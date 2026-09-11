@@ -102,6 +102,30 @@ For more context, see the upstream Astral reports: [astral-sh/uv#13553](https://
 
 ---
 
+## cogos — persistent cognitive operating system (this fork)
+
+This fork adds **cogos** (`cogos/`), a persistent, high-autonomy cognitive runtime in which a
+resident frontier Claude model (`claude-fable-5-1` by default) acts as the executive
+intelligence. A human supplies objectives, corrections, new information and the rare
+authorization; the runtime compiles the objective into durable mission state (SQLite +
+snapshots), runs a perceive → update → assess → select → act → verify → learn loop, maintains a
+world model and belief/evidence graph, spawns ephemeral specialists, routes every tool action
+through a capability firewall, and refuses to declare completion until success criteria are
+independently verified. It is a standalone package: no Hermes core file is touched.
+
+```bash
+uv sync --extra dev
+.venv/bin/python -m cogos demo                       # offline end-to-end demonstration (~5 s)
+.venv/bin/python -m cogos mission new "Research whether this business should enter Saudi Arabia." --run
+.venv/bin/python -m cogos boot                       # recovery protocol for a fresh context
+.venv/bin/python -m cogos eval --suite all           # acceptance (A–J) + adversarial suite
+make cogos-check                                     # tests, lint, types, evals, demo
+```
+
+Docs: [`docs/cogos/README.md`](docs/cogos/README.md) (architecture, autonomy contract, model
+policy, state/recovery, memory, evals, security, operations). Constitution for Claude Code
+sessions: [`CLAUDE.md`](CLAUDE.md).
+
 ## Getting Started
 
 ```bash

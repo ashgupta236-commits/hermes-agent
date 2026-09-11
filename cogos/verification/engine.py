@@ -1,0 +1,1711 @@
+"""Verification engine.
+
+Nothing in cogos is "done" because a process said so: code is verified by
+running tests through the tool fabric, research by structural checks on the
+belief graph, data by schema/anomaly/reconciliation checks, artifacts by
+hashing real files, criteria by the verification method they declare, and
+the mission as a whole by a completion-integrity gate that lists exactly what
+is still missing.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import shlex
+import shutil
+import statistics
+import tempfile
+import time
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+from cogos.ids import iso_now, new_id
+from cogos.schemas.beliefs import Claim, ClaimStatus, EvidenceKind
+from cogos.schemas.common import VerificationStatus
+from cogos.schemas.decisions import Decision
+from cogos.schemas.mission import Artifact, ArtifactOrigin, MissionState, SuccessCriterion, Task, TaskStatus, TestRecord
+from cogos.schemas.tools import ToolCall
+from cogos.schemas.verification import InputVersion, VerificationCheck, VerificationResult, cite
+from cogos.tools.fabric import ToolFabric
+from cogos.verification.contract import ACCEPTANCE_KEY, AcceptanceContract
+from cogos.verification.isolation import IsolationPolicy
+from cogos.verification.attestation import (
+    BEHAVIOUR_SCOPE,
+    CONTENT_SCOPE,
+    EXISTENCE_SCOPE,
+    KNOWN_FRAMEWORKS,
+    REPORTING_FRAMEWORKS,
+    EvidenceAuthority,
+    at_least,
+    authority_of,
+    build_trusted_run,
+    differential_control,
+    harness_selection,
+    read_report_once_settled,
+    scope_problems,
+)
+from cogos.verification.test_outcome import InputVersionGuard, TestRunOutcome, classify_test_run, detect_framework
+
+PASSED = VerificationStatus.PASSED
+FAILED = VerificationStatus.FAILED
+INCONCLUSIVE = VerificationStatus.INCONCLUSIVE
+SKIPPED = VerificationStatus.SKIPPED
+
+DEFAULT_TEST_COMMANDS = ["python -m pytest -q"]
+INDEPENDENCE_CONFIDENCE = 0.8
+MIN_INDEPENDENT_SOURCES = 2
+TOKEN_OVERLAP_THRESHOLD = 0.3
+ANOMALY_SIGMA = 5.0
+CONTRADICTION_SEVERITY_GATE = 0.5
+
+_STOPWORDS = frozenset(
+    "the a an and or of to in on for with by from at as is are was were be been being that this these those it its "
+    "than then there their they them we our you your he she his her not no nor but if so do does did done has have "
+    "had having will would should could can may might must shall into over under all any each every some such via "
+    "when where which who whom whose why how what about after before during between within without also more most".split()
+)
+_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+_B32_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "number": (int, float),
+    "integer": (int,),
+    "boolean": (bool,),
+    "array": (list, tuple),
+    "object": (dict,),
+    "null": (type(None),),
+}
+
+
+
+
+# --- helpers ---------------------------------------------------------------------
+
+
+def tokens(text: str) -> set[str]:
+    """Lowercase content tokens (>= 3 chars, stopwords removed)."""
+    return {t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) >= 3 and t not in _STOPWORDS}
+
+
+def _expectation_checks(expectation: Any, path: Path) -> list[VerificationCheck]:
+    """Deterministic checks of a file against what the mission said it must contain."""
+    out: list[VerificationCheck] = []
+    try:
+        size = path.stat().st_size
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [VerificationCheck(name="content", status=FAILED, detail=f"could not read the artifact: {exc}", authoritative=True)]
+    if expectation.min_bytes:
+        ok = size >= expectation.min_bytes
+        out.append(VerificationCheck(name="content_size", status=PASSED if ok else FAILED, detail=f"{size} bytes (expected at least {expectation.min_bytes})", authoritative=True))
+    missing = [needle for needle in expectation.must_contain if needle not in text]
+    if expectation.must_contain:
+        out.append(
+            VerificationCheck(
+                name="content_contains",
+                status=PASSED if not missing else FAILED,
+                detail="all declared content present" if not missing else "missing: " + ", ".join(missing[:3]),
+                authoritative=True,
+            )
+        )
+    present = [needle for needle in expectation.must_not_contain if needle in text]
+    if expectation.must_not_contain:
+        out.append(
+            VerificationCheck(
+                name="content_excludes",
+                status=PASSED if not present else FAILED,
+                detail="no excluded content present" if not present else "present but excluded: " + ", ".join(present[:3]),
+                authoritative=True,
+            )
+        )
+    if expectation.must_match:
+        try:
+            hit = re.search(expectation.must_match, text) is not None
+        except re.error as exc:
+            out.append(VerificationCheck(name="content_pattern", status=INCONCLUSIVE, detail=f"declared pattern is not a valid regular expression: {exc}", authoritative=True))
+            return out
+        out.append(VerificationCheck(name="content_pattern", status=PASSED if hit else FAILED, detail=f"pattern {expectation.must_match!r} {'matched' if hit else 'did not match'}", authoritative=True))
+    return out
+
+
+def token_overlap(needle: str, haystack: str) -> float:
+    """Fraction of ``needle``'s content tokens that also occur in ``haystack``."""
+    a, b = tokens(needle), tokens(haystack)
+    if not a:
+        return 0.0
+    return len(a & b) / len(a)
+
+
+def _aggregate(checks: list[VerificationCheck]) -> VerificationStatus:
+    statuses = {c.status for c in checks}
+    if FAILED in statuses:
+        return FAILED
+    if INCONCLUSIVE in statuses:
+        return INCONCLUSIVE
+    if PASSED in statuses:
+        return PASSED
+    return INCONCLUSIVE
+
+
+#: Prefix that marks a completion check as legitimately not applying to this mission, with the
+#: rule that decided so. A check may only be absent from the verdict if it says why.
+INAPPLICABLE = "INAPPLICABLE"
+
+
+def _gate_aggregate(checks: list[VerificationCheck]) -> VerificationStatus:
+    """Aggregate completion checks over four states, not three.
+
+    `_aggregate` ignores SKIPPED, so a check that turned itself off read as assent — which is how
+    the one check that asks whether the deliverable was delivered came to be satisfied by not
+    running. Here a SKIPPED check counts as INAPPLICABLE only when it declares the applicability
+    rule that excused it; an undeclared skip is an unanswered question, and an unanswered question
+    blocks completion.
+    """
+    statuses = {c.status for c in checks}
+    if FAILED in statuses:
+        return FAILED
+    if INCONCLUSIVE in statuses:
+        return INCONCLUSIVE
+    unjustified = [c for c in checks if c.status == SKIPPED and not (c.detail or "").startswith(INAPPLICABLE)]
+    if unjustified:
+        return INCONCLUSIVE
+    if PASSED in statuses:
+        return PASSED
+    return INCONCLUSIVE
+
+
+def _counts(checks: list[VerificationCheck]) -> str:
+    n = {s: 0 for s in VerificationStatus}
+    for c in checks:
+        n[c.status] += 1
+    return f"{n[PASSED]} passed, {n[FAILED]} failed, {n[INCONCLUSIVE]} inconclusive, {n[SKIPPED]} skipped"
+
+
+def _id_timestamp_ms(identifier: str) -> Optional[int]:
+    """Recover the millisecond timestamp embedded in a ``cogos.ids.new_id`` identifier."""
+    try:
+        _, body = identifier.rsplit("_", 1)
+    except ValueError:
+        return None
+    if len(body) < 9:
+        return None
+    value = 0
+    for ch in body[:9]:
+        idx = _B32_ALPHABET.find(ch)
+        if idx < 0:
+            return None
+        value = (value << 5) | idx
+    return value
+
+
+def _iso_to_ms(stamp: Optional[str]) -> Optional[int]:
+    if not stamp:
+        return None
+    try:
+        return int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def file_sha256(path: Path) -> Optional[str]:
+    """sha256 of a file's bytes, or None when it cannot be read."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def artifact_integrity(artifact: Artifact) -> tuple[bool, str]:
+    """Re-check a *previously verified* artifact against the filesystem, now.
+
+    `verified` is a claim about the past. This answers the question the completion gate
+    actually needs answered: are those exact bytes still there?
+    """
+    if not artifact.verified:
+        return False, "not verified"
+    if not artifact.verified_hash:
+        return False, "verified without a recorded content hash"
+    if not artifact.path:
+        return False, "declares no path"
+    path = Path(artifact.path).expanduser()
+    if not path.exists():
+        return False, f"{path} no longer exists"
+    if not path.is_file():
+        return False, f"{path} is no longer a regular file"
+    current = file_sha256(path)
+    if current is None:
+        return False, f"{path} could not be read"
+    if current != artifact.verified_hash:
+        return False, f"content changed since verification (sha256 {current[:12]}… != {artifact.verified_hash[:12]}…)"
+    return True, f"sha256 {artifact.verified_hash[:12]}… unchanged"
+
+
+#: Directories a verification run writes to or that are not the material under test. Including
+#: them would make every run report its own caches as inputs that changed mid-verification.
+_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".cogos", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".nox", ".venv", "venv", "node_modules", ".idea", ".vscode", "htmlcov", ".coverage",
+    "dist", "build", ".eggs",
+})
+#: A verification binds the tree it ran in, not an arbitrary filesystem. Past this many files the
+#: binding is abandoned rather than silently truncated: a partial binding that looks complete is
+#: worse than none, and the declared `input_paths` and artifact ledger still apply.
+MAX_BOUND_WORKSPACE_FILES = 500
+#: Runtime state and build products, never the material under test. A mission's own state store can
+#: sit inside the workspace, and binding it would make every later checkpoint invalidate the
+#: receipts written before it.
+_SKIP_SUFFIXES = (
+    ".pyc", ".pyo", ".so", ".log", ".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
+    ".lock", ".tmp", ".swp", ".jsonl", ".coverage",
+)
+
+
+def workspace_binding_abandoned(root: Path, limit: Optional[int] = None) -> bool:
+    """Whether the tree is too large to bind, which is not the same as having nothing to bind.
+
+    `_workspace_inputs` returns an empty list both when a directory holds no eligible files and
+    when it holds too many — and the caller could not tell the difference, so a receipt over a
+    large tree looked bound while binding nothing. This repository has 6221 eligible files, so
+    every verification rooted at it fell into the second case with no indication.
+    """
+    return bool(root.is_dir()) and not _workspace_inputs(root, limit) and _eligible_file_count(root, (MAX_BOUND_WORKSPACE_FILES if limit is None else limit)) > 0
+
+
+def _eligible_file_count(root: Path, limit: int) -> int:
+    """Eligible files under `root`, counted no further than one past the limit."""
+    seen = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if name.endswith(_SKIP_SUFFIXES) or name.startswith("."):
+                    continue
+                seen += 1
+                if seen > limit:
+                    return seen
+    except OSError:
+        return seen
+    return seen
+
+
+def _workspace_inputs(root: Path, limit: Optional[int] = None) -> list[Path]:
+    """Regular files under `root` that a run in it could depend on."""
+    limit = MAX_BOUND_WORKSPACE_FILES if limit is None else limit
+    found: list[Path] = []
+    try:
+        if not root.is_dir():
+            return []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if name.endswith(_SKIP_SUFFIXES) or name.startswith("."):
+                    continue
+                found.append(Path(dirpath) / name)
+                if len(found) > limit:
+                    return []
+    except OSError:
+        return []
+    return found
+
+
+def receipt_inputs_intact(receipt: VerificationResult) -> tuple[bool, str]:
+    """Do the inputs this receipt was produced against still hold, right now?
+
+    A receipt describes bytes. Once those bytes move it still records what it saw — history is
+    kept — but it no longer describes what is there, so it cannot close a criterion. A receipt
+    that recorded no input versions has nothing to contradict it and is reported intact; whether
+    that is *sufficient* is the gate's separate question.
+    """
+    for iv in receipt.input_versions:
+        if iv.changed_during_verification:
+            return False, f"inputs changed while it ran ({Path(iv.path).name})"
+        if not iv.content_hash:
+            # An empty hash records "this declared input was not there when we looked". It proves
+            # nothing, and if the file has since appeared the receipt no longer describes reality.
+            # Skipping it outright made a receipt bound to a non-existent path permanently intact,
+            # which was a working route to a false completion.
+            if Path(iv.path).is_file():
+                return False, f"{Path(iv.path).name} did not exist when this ran but exists now"
+            continue
+        current = file_sha256(Path(iv.path)) if Path(iv.path).is_file() else None
+        if current != iv.content_hash:
+            return False, (
+                f"{Path(iv.path).name} is now "
+                + (f"sha256 {current[:12]}…" if current else "missing")
+                + f", not the {iv.content_hash[:12]}… it was verified against"
+            )
+    return True, ""
+
+
+def _type_ok(value: Any, expected: Any) -> bool:
+    names = expected if isinstance(expected, list) else [expected]
+    for name in names:
+        allowed = _JSON_TYPES.get(str(name))
+        if allowed is None:
+            return True
+        if isinstance(value, bool) and name in ("number", "integer"):
+            continue
+        if isinstance(value, allowed):
+            if name == "integer" and isinstance(value, float) and not float(value).is_integer():
+                continue
+            return True
+    return False
+
+
+# --- engine ----------------------------------------------------------------------
+
+
+class VerificationEngine:
+    def __init__(self, fabric: Optional[ToolFabric], state: MissionState):
+        self.fabric = fabric
+        self.state = state
+        self.results: list[VerificationResult] = []
+
+    #: Soft cap on *unreferenced* records. Referenced receipts are never evicted: a gate that
+    #: cannot resolve the receipt a criterion cites cannot tell a forged citation from a
+    #: truncated store, so the store must be durable for anything still pointed at.
+    MAX_UNREFERENCED_VERIFICATIONS = 500
+
+    def record(self, result: VerificationResult) -> VerificationResult:
+        """Persist a verification record into mission state so gates can resolve it later."""
+        self.results.append(result)
+        if self.state is not None:
+            if not any(v.id == result.id for v in self.state.verifications):
+                self.state.verifications.append(result)
+            self.prune()
+        return result
+
+    def prune(self) -> int:
+        """Drop the oldest records that nothing references. Returns how many were dropped."""
+        records = self.state.verifications
+        referenced = self.state.referenced_verification_ids()
+        droppable = [i for i, v in enumerate(records) if v.id not in referenced]
+        excess = len(droppable) - self.MAX_UNREFERENCED_VERIFICATIONS
+        if excess <= 0:
+            return 0
+        drop = set(droppable[:excess])
+        self.state.verifications = [v for i, v in enumerate(records) if i not in drop]
+        return len(drop)
+
+    # -- code -----------------------------------------------------------------------
+
+    def _relevant_inputs(self, cwd: Optional[str], input_paths: Optional[list[str]], include_workspace: bool = True) -> list[tuple[Path, Optional[str]]]:
+        """The input versions a code receipt is about: the mission's own registered candidates.
+
+        Bounded deliberately to the verification contract (declared paths) plus the artifact
+        ledger. This is version binding, not a general dependency graph: a receipt should name the
+        implementation and test files whose bytes determine what it proves, and nothing else.
+        """
+        out: list[tuple[Path, Optional[str]]] = []
+        seen: set[str] = set()
+
+        def _add(raw: str, artifact_id: Optional[str]) -> None:
+            p = Path(raw)
+            if not p.is_absolute() and cwd:
+                p = Path(cwd) / p
+            # Canonical identity: a symlinked component or a different spelling of the same file
+            # must not be recorded as a different input, or the gate would later hash something
+            # other than what was verified.
+            try:
+                p = p.resolve()
+            except OSError:
+                pass
+            if str(p) in seen:
+                return
+            seen.add(str(p))
+            out.append((p, artifact_id))
+
+        for raw in input_paths or []:
+            _add(str(raw), None)
+        for art in self.state.artifacts:
+            if art.path:
+                _add(art.path, art.id)
+        # The tree the command runs in is, by construction, the material the run could depend on.
+        # Binding it is what makes the receipt describe what it actually ran against: a file the
+        # mission produced by a route the write-target extractor cannot see — an interpreter
+        # one-liner, say — is never an artifact candidate, so without this the implementation
+        # under test could be swapped afterwards and nothing would notice.
+        #
+        # This is version binding for one receipt, not a ledger crawl: it is bounded to the
+        # declared working directory, skips caches and vendored trees, and gives up rather than
+        # walking something enormous.
+        if cwd and include_workspace:
+            for p in _workspace_inputs(Path(cwd)):
+                _add(str(p), None)
+        return out
+
+    # -- isolated behavioural verification -------------------------------------------
+
+    def verify_behaviour(
+        self,
+        contract: "AcceptanceContract",
+        workspace: str,
+        *,
+        task_id: Optional[str] = None,
+        criterion_ids: Optional[list[str]] = None,
+        policy: Optional["IsolationPolicy"] = None,
+    ) -> VerificationResult:
+        """Decide the approved contract against a workspace, inside the execution boundary.
+
+        This is the one path whose conclusion the controller reaches itself. Everything else in this
+        engine reads something a subject process wrote and decides whether to believe it; here the
+        controller chooses the inputs, holds the expected answers, and compares. The subject never
+        receives an expectation, so there is nothing for it to agree with, and a forged
+        ``"passed": true`` on the wire is a key nobody reads.
+
+        A receipt is issued per criterion so that binding, citation and the gate's input-version
+        re-check all work unchanged. **Only this method issues them**: an authority value arriving
+        from a subject or from executive output is data, and there is no path by which it becomes
+        one of these.
+        """
+        from cogos.verification.behavioural import BehaviouralVerifier
+
+        outcome = BehaviouralVerifier(contract, policy).verify(Path(workspace))
+        checks: list[VerificationCheck] = []
+
+        for entry in outcome.existence:
+            checks.append(
+                VerificationCheck(
+                    name=f"existence:{entry['deliverable']}",
+                    status=PASSED if entry["present"] else FAILED,
+                    detail=f"{'present' if entry['present'] else 'absent'}"
+                    + (f", sha256 {str(entry['sha256'])[:12]}…" if entry["present"] else "")
+                    + " (scope: existence only)",
+                    authoritative=True,
+                )
+            )
+        if contract.cases:
+            failed = [c for c in outcome.cases if not c.passed]
+            checks.append(
+                VerificationCheck(
+                    name="behaviour",
+                    status=PASSED if not failed else FAILED,
+                    detail=f"{outcome.cases_passed}/{len(outcome.cases)} controller-chosen cases matched expectations the subject never saw"
+                    + ("" if not failed else ": " + "; ".join(c.detail for c in failed[:3])),
+                    authoritative=True,
+                )
+            )
+        for entry in outcome.structural:
+            checks.append(
+                VerificationCheck(
+                    name=f"structure:{entry['check_id']}",
+                    status=PASSED if entry.get("passed") else FAILED,
+                    detail=str(entry.get("detail", "")),
+                    authoritative=True,
+                )
+            )
+        for entry in outcome.suite:
+            checks.append(
+                VerificationCheck(
+                    name=f"suite_differential:{entry['check_id']}",
+                    status=PASSED if entry.get("passed") else FAILED,
+                    detail=str(entry.get("detail", "")),
+                    authoritative=True,
+                )
+            )
+        if outcome.refusal:
+            # A boundary that could not be established is an absence of evidence. It must not read
+            # as a failing deliverable, and it must never read as a passing one.
+            checks.append(VerificationCheck(name="execution_boundary", status=INCONCLUSIVE, detail=outcome.refusal, authoritative=True))
+        execution_facts: dict[str, Any] = dict(outcome.provenance.get("execution") or {})
+        # The receipt names the contract, the snapshot and the policy it was produced under, so a
+        # contract approved *afterwards* cannot silently re-interpret evidence recorded against a
+        # different one. `_acceptance_checks` refuses a receipt whose contract is not the approved
+        # one rather than assuming they agree.
+        checks.append(
+            VerificationCheck(
+                name="provenance",
+                status=PASSED,
+                detail=(
+                    f"contract={contract.digest()} snapshot={outcome.provenance.get('snapshot_tree_digest', '')} "
+                    f"policy={outcome.provenance.get('isolation_policy_digest', '')} "
+                    f"image={execution_facts.get('image_id', '')} "
+                    f"verifier={outcome.provenance.get('verifier', '')}"
+                ),
+            )
+        )
+
+        # Bind the bytes that produced this result, at the paths the gate will re-read later, so a
+        # deliverable swapped after verification invalidates the receipt through the existing check.
+        snapshot_files = dict(outcome.provenance.get("snapshot_files") or {})
+        input_versions = [
+            InputVersion(path=str(Path(workspace) / name), content_hash=digest, changed_during_verification=False)
+            for name, digest in sorted(snapshot_files.items())
+        ]
+
+        status = _aggregate(checks) if checks else INCONCLUSIVE
+        authority = outcome.authority if status == PASSED else EvidenceAuthority.PROCESS_OBSERVATION
+        if outcome.refusal:
+            authority = EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        summary = f"isolated behavioural verification: {outcome.summary}"
+
+        issued: list[VerificationResult] = []
+        for target_type, target_id in [("behaviour", cid) for cid in (criterion_ids or [])] or [("behaviour", task_id or "behaviour")]:
+            issued.append(
+                self.record(
+                    VerificationResult(
+                        target_type=target_type,
+                        target_id=target_id,
+                        status=status,
+                        summary=summary,
+                        checks=list(checks),
+                        input_versions=list(input_versions),
+                        authority=authority.value,
+                        produced_by_task_id=task_id,
+                    )
+                )
+            )
+        # The deliverables the contract decided are registered as artifacts carrying exactly the
+        # scope that was established: the gate's `required_artifacts` check asks whether the declared
+        # deliverable was delivered, and this is the verification that can answer it. `verified` is
+        # set only for files whose own predicates passed — existence for one it merely found, and
+        # content+behaviour for one the contract actually decided.
+        if self.state is not None:
+            decided = status == PASSED
+            for entry in outcome.existence:
+                name = str(entry["deliverable"])
+                if not entry["present"]:
+                    continue
+                path = str(Path(workspace) / name)
+                artifact = next((a for a in self.state.artifacts if a.path == path or a.name == name), None)
+                if artifact is None:
+                    artifact = Artifact(name=name, kind="code", path=path, summary=f"deliverable declared by {contract.contract_version}", origin=ArtifactOrigin.MISSION_WRITE)
+                    self.state.artifacts.append(artifact)
+                artifact.content_hash = str(entry["sha256"])
+                artifact.verified = decided
+                artifact.verified_hash = artifact.content_hash if decided else None
+                artifact.verified_at = iso_now() if decided else None
+                artifact.verified_scope = (
+                    f"{EXISTENCE_SCOPE}+{CONTENT_SCOPE}+{BEHAVIOUR_SCOPE}" if decided else EXISTENCE_SCOPE
+                )
+
+        # Provenance travels on the mission, keyed by receipt id, so the run can be re-derived.
+        ledger = self.state.resources.setdefault("behavioural_runs", []) if self.state is not None else []
+        if isinstance(ledger, list):
+            ledger.append({"receipt_ids": [r.id for r in issued], "ran_at": iso_now(), **outcome.provenance})
+            del ledger[:-20]
+        return issued[0]
+
+    # -- test evidence attestation -------------------------------------------------
+
+    def _workspace_code_trusted(self) -> bool:
+        """Whether a human has declared this workspace's code non-adversarial towards the verifier.
+
+        Read from the firewall's policy rather than from mission state, because it is a property
+        of the environment the runtime was pointed at, not something a mission can decide about
+        itself. Absent a firewall — the unit-test construction `VerificationEngine(None, state)` —
+        the answer is False, which is the fail-closed direction.
+        """
+        firewall = getattr(self.fabric, "firewall", None)
+        return bool(getattr(getattr(firewall, "config", None), "trust_workspace_code", False))
+
+    def _directory_under_test(self, cwd: Optional[str]) -> Optional[Path]:
+        if cwd:
+            return Path(cwd)
+        context = getattr(self.fabric, "context", None)
+        workdir = getattr(context, "workdir", None)
+        return Path(workdir) if workdir else None
+
+    def _trusted_report(self, run: Any, launched_at: float) -> tuple[Optional[dict[str, int]], list[str], set[str]]:
+        """Counts from the trusted run's report, or None plus the reasons it was refused.
+
+        A report is refused rather than read when it predates the run, changes while being read,
+        contradicts its own testcase elements, or describes a suite other than the one selected.
+        Each was reproduced as a false completion. Refusing it here means the run reaches
+        :func:`classify_test_run` with no report at all, which is already INCONCLUSIVE for a
+        framework that has a trusted path — nothing falls back to the weaker stdout evidence.
+        """
+        parsed, problems = read_report_once_settled(run.report, launched_at)
+        if parsed is None:
+            return None, problems, set()
+        problems = list(problems) + scope_problems(parsed, run.cwd, run.selection)
+        if problems:
+            return None, problems, set()
+        return dict(parsed.counts), [], parsed.passed_keys()
+
+    def _attest(
+        self,
+        outcome: TestRunOutcome,
+        run: Any,
+        report_counts: Optional[dict[str, int]],
+        report_problems: list[str],
+        passed_keys: set[str],
+    ) -> tuple[TestRunOutcome, EvidenceAuthority, str]:
+        """Decide how much authority a classified run carries, and downgrade it when it has none.
+
+        The engine cannot authenticate a report written by a process that imports the code under
+        test — not by choosing the filename, not by a nonce, not by hashing, not by a trusted
+        launcher, not from the exit code. Each was defeated in reproduction, and the strongest
+        case defeats all of them at once: a `conftest.py` hookwrapper that flips outcomes makes
+        the *genuine* runner write a genuine, well-formed, correctly located report whose contents
+        are false.
+
+        So authority does not come from the report. It comes from a question the workspace does
+        not get to answer by writing a file: **does this result depend on the implementation?**
+        A pass that survives the implementation being withheld was never a measurement of it.
+
+        A run that cannot be attested keeps its numbers as diagnosis and loses its status: it
+        becomes INCONCLUSIVE, so no criterion closes on it and nothing falls back silently to a
+        weaker kind of evidence.
+        """
+        untrusted = EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        if report_problems:
+            return (
+                replace(outcome, status=INCONCLUSIVE, reason="the runner report was refused: " + "; ".join(report_problems[:2])),
+                untrusted,
+                "; ".join(report_problems),
+            )
+        if run is None:
+            # No trusted path for this runner. `unittest` and `nose` cannot produce a report the
+            # engine asked for, so their output is stdout the code under test also writes to.
+            return outcome, untrusted, "no trusted verifier path for this runner"
+        if outcome.status != PASSED or report_counts is None or outcome.expected_zero:
+            # Nothing to attest: a failure is already a failure, and an authorized zero-execution
+            # contract asserts that nothing ran rather than that anything passed. The engine did
+            # observe the process, which is true and is not evidence about tests.
+            return outcome, EvidenceAuthority.PROCESS_OBSERVATION, ""
+        if not self._workspace_code_trusted():
+            # Fail closed. The run happened, the report is the runner's own, and the differential
+            # control may even have corroborated it — none of which establishes that the code
+            # imported into the reporting process was not targeting that process. This runtime has
+            # no boundary that would establish it, so the result is capped below the behavioural
+            # floor and the criterion stays open rather than being labelled PASSED.
+            return (
+                replace(outcome, status=INCONCLUSIVE, reason="same-process verification: the code under test ran inside the process that reported on it, and this runtime cannot establish that it did not interfere"),
+                EvidenceAuthority.PROCESS_OBSERVATION,
+                "workspace code is not declared non-adversarial (governance.trust_workspace_code is False)",
+            )
+        control = differential_control(cwd=run.cwd, selection=run.selection, passed_keys=passed_keys)
+        if control.attested:
+            return outcome, EvidenceAuthority.TRUSTED_HARNESS, control.reason
+        return (
+            replace(outcome, status=INCONCLUSIVE, reason="not attested: " + control.reason),
+            untrusted,
+            f"{control.reason}{': ' + control.detail if control.detail else ''}",
+        )
+
+    def verify_code(
+        self,
+        commands: Optional[list[str]] = None,
+        cwd: Optional[str] = None,
+        task_id: Optional[str] = None,
+        *,
+        expect_zero_tests: bool = False,
+        criterion_ids: Optional[list[str]] = None,
+        input_paths: Optional[list[str]] = None,
+    ) -> VerificationResult:
+        """Run test commands and record what they actually demonstrated.
+
+        ``expect_zero_tests`` comes from the verification contract as declared *before* the run.
+        It is the only way a zero-execution run can pass, and it cannot be supplied afterwards to
+        reinterpret an empty result.
+        """
+        commands = list(commands) if commands else list(DEFAULT_TEST_COMMANDS)
+        criterion_ids = list(criterion_ids or [])
+        if not criterion_ids and task_id:
+            # Make the record self-describing: scope comes from what the task declared it was for,
+            # which was fixed before the run and cannot be attached afterwards to fit the outcome.
+            producing = self.state.task(task_id)
+            if producing is not None:
+                criterion_ids = list(producing.addresses_criterion_ids or [])
+        checks: list[VerificationCheck] = []
+        test_totals = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+        if self.fabric is None:
+            for cmd in commands:
+                checks.append(VerificationCheck(name=cmd, status=INCONCLUSIVE, detail="no tool fabric", authoritative=True))
+                self.state.tests.append(TestRecord(name=cmd, command=cmd, status=SKIPPED, summary="no tool fabric", ran_at=iso_now(), task_id=task_id, criterion_ids=criterion_ids, cwd=str(cwd or "")))
+            return self.record(
+                VerificationResult(target_type="code", target_id=task_id or "code", status=INCONCLUSIVE, summary="no tool fabric: tests not run", checks=checks, produced_by_task_id=task_id)
+            )
+
+        # Declared and registered inputs are the ones the contract is *about*: a change to those
+        # mid-run is a finding. Files merely discovered in the working tree are candidates, and one
+        # that the run itself modified is an output of the run, not an input to it.
+        declared = self._relevant_inputs(cwd, input_paths, include_workspace=False)
+        relevant = self._relevant_inputs(cwd, input_paths)
+        declared_paths = {str(p) for p, _ in declared}
+        guard = InputVersionGuard([p for p, _ in relevant])
+        before = guard.snapshot()
+        action_ids: list[str] = []
+        run_authorities: list[str] = []
+
+        for cmd in commands:
+            # Ask a recognised runner for a machine-readable report at a path *we* choose. Stdout
+            # is written by the code under test — a workspace module named `pytest.py` shadows the
+            # real runner under `python -m pytest` and prints whatever it likes — so a report the
+            # runner had to actually run to produce is the only attributable evidence. The path is
+            # fresh per run, so it cannot be pre-written.
+            framework = detect_framework(cmd)
+            under_test = self._directory_under_test(cwd)
+            # The trusted verifier path. For a framework the engine has one for, the model-authored
+            # command is *not* executed: the engine builds the invocation itself — its own
+            # interpreter, its own flags, its own config file outside the workspace, plugin
+            # autoloading off, a scrubbed environment, the workspace off the import path, no shell,
+            # and an evidence destination in a private directory that did not exist beforehand.
+            # Measured: that neutralises the `pytest.py` shadow, `addopts = -p <plugin>` in the
+            # workspace ini and `PYTEST_ADDOPTS` in the ambient environment at the source. The plan
+            # still chooses the *selection*, which is validated against the tree and checked back
+            # against the report's identities.
+            run = None
+            if framework in REPORTING_FRAMEWORKS and under_test is not None:
+                run = build_trusted_run(cwd=under_test, selection=harness_selection(cmd, under_test))
+            shell_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}" if cwd else cmd
+            launched_at = time.time()
+            if run is not None:
+                # argv, not a command string: with no shell there is no expansion, no substitution
+                # and no redirection for the plan's text to reach through.
+                call_args: dict[str, object] = {"argv": list(run.argv), "cwd": str(run.cwd), "env": dict(run.env)}
+            else:
+                call_args = {"command": cmd}
+                if cwd:
+                    call_args["cwd"] = str(cwd)
+            res = self.fabric.execute(ToolCall(tool="run_tests", arguments=call_args, task_id=task_id, purpose="verification"))
+            action_ids.append(res.call_id)
+            if run is not None:
+                report_counts, report_problems, passed_keys = self._trusted_report(run, launched_at)
+            else:
+                report_counts, report_problems, passed_keys = None, [], set()
+            # Totals come from the *classified* outcome below, not from the raw parse: a run whose
+            # output was unattributable has its counts discarded, and the human-readable summary
+            # must not still report the numbers that were thrown away.
+            if res.error_kind in ("denied", "requires_human", "unavailable"):
+                # The check could not be run at all. That is an absence of evidence, not a verdict.
+                outcome = TestRunOutcome(status=INCONCLUSIVE, reason=res.error or "verification tool unavailable", exit_code=None, command=cmd)
+            else:
+                outcome = classify_test_run(
+                    exit_code=res.data.get("exit_code"),
+                    counts=res.data.get("counts") or {},
+                    report_counts=report_counts,
+                    # Every framework the parser recognises must back its counts with a report from
+                    # the engine's own invocation. `unittest` and `nose` have no trusted path, so
+                    # their output is stdout the code under test also writes to — not a weaker kind
+                    # of evidence, not evidence. Reproduced: `python -m unittest discover` with a
+                    # test module printing `3 passed in 0.05s` (unittest writes its own report to
+                    # stderr) satisfied a criterion and passed the completion gate over an
+                    # implementation returning 999.0.
+                    report_required=framework in KNOWN_FRAMEWORKS,
+                    output=res.output or "",
+                    command=cmd,
+                    expect_zero=expect_zero_tests,
+                )
+            outcome, authority, attestation = self._attest(outcome, run, report_counts, report_problems, passed_keys)
+            run_authorities.append(authority.value)
+            if run is not None:
+                run.dispose()
+            for key, value in (("passed", outcome.passed), ("failed", outcome.failed), ("error", outcome.errors), ("skipped", outcome.skipped)):
+                test_totals[key] += int(value)
+            detail = f"{outcome.reason}: {res.data.get('summary') or res.error or ''}".strip(": ")
+            checks.append(VerificationCheck(name=cmd, status=outcome.status, detail=detail, authoritative=True))
+            self.state.tests.append(
+                TestRecord(
+                    name=cmd,
+                    command=shell_cmd,
+                    status=outcome.status,
+                    summary=detail,
+                    ran_at=iso_now(),
+                    task_id=task_id,
+                    criterion_ids=criterion_ids,
+                    cwd=str(cwd or ""),
+                    framework=outcome.framework,
+                    exit_code=outcome.exit_code,
+                    counts={"passed": outcome.passed, "failed": outcome.failed, "error": outcome.errors, "skipped": outcome.skipped},
+                    executed=outcome.executed,
+                    outcome_reason=outcome.reason,
+                    expected_zero=outcome.expected_zero,
+                    report_backed=report_counts is not None,
+                    authority=authority.value,
+                    attestation=attestation,
+                )
+            )
+
+        # One post-run read, used both to detect movement and to record the version. Taking two
+        # separate snapshots would leave a window in which bytes could change between "did it
+        # move?" and "what is it now?", and be recorded as verified without being flagged.
+        after = guard.snapshot()
+        moved = {k for k in set(before) | set(after) if before.get(k, "") != after.get(k, "")}
+        input_versions = []
+        for p, aid in relevant:
+            key = str(p)
+            if key in moved and key not in declared_paths:
+                # The run wrote this. It is an output — a cache, a log, a state store — so it is
+                # not bound as an input, and it does not make the run look incoherent either.
+                continue
+            input_versions.append(
+                InputVersion(path=key, content_hash=after.get(key, ""), artifact_id=aid, changed_during_verification=key in moved)
+            )
+        moved &= declared_paths
+        if under_test is not None and workspace_binding_abandoned(under_test):
+            # Nothing can be re-checked later, so nothing here may close a criterion. Recorded as
+            # an authoritative inconclusive rather than passed-with-a-caveat: a receipt that names
+            # no bytes is not a weaker proof, it is not a proof.
+            checks.append(
+                VerificationCheck(
+                    name="input_binding",
+                    status=INCONCLUSIVE,
+                    detail=f"the directory under test holds more than {MAX_BOUND_WORKSPACE_FILES} eligible files, so the run's inputs were not bound and cannot be re-checked",
+                    authoritative=True,
+                )
+            )
+        status = _aggregate(checks)
+        if moved:
+            # The bytes moved underneath the run, so no single coherent version was observed.
+            status = INCONCLUSIVE
+            checks.append(VerificationCheck(name="input_stability", status=INCONCLUSIVE, detail="inputs changed during verification: " + ", ".join(sorted(moved)[:3]), authoritative=True))
+        best = max([authority_of(a) for a in run_authorities] or [EvidenceAuthority.UNTRUSTED_SELF_REPORT], key=lambda a: list(EvidenceAuthority).index(a))
+        n_pass = sum(1 for c in checks if c.status == PASSED)
+        n_fail = sum(1 for c in checks if c.status == FAILED)
+        n_inc = len(checks) - n_pass - n_fail
+        summary = (
+            f"{n_pass}/{len(checks)} commands passed, {n_fail} failed, {n_inc} inconclusive; "
+            f"tests: {test_totals['passed']} passed, {test_totals['failed']} failed, {test_totals['error']} errors, "
+            f"{test_totals['skipped']} skipped"
+        )
+        return self.record(
+            VerificationResult(
+                target_type="code",
+                target_id=task_id or "code",
+                status=status,
+                summary=summary,
+                checks=checks,
+                input_versions=input_versions,
+                authority=best.value,
+                produced_by_task_id=task_id,
+                produced_by_action_ids=action_ids,
+            )
+        )
+
+    # -- research -------------------------------------------------------------------
+
+    def _unresolved_contradictions_for(self, claim_id: str):
+        return [c for c in self.state.contradictions if not c.resolved and claim_id in c.claim_ids]
+
+    def _check_claim(self, claim: Claim, checks: list[VerificationCheck], evidence_ids: list[str]) -> None:
+        cid = claim.id
+        evidence = [e for e in (self.state.evidence_item(eid) for eid in claim.evidence_for) if e is not None]
+        evidence_ids.extend(e.id for e in evidence)
+        missing = [eid for eid in claim.evidence_for if self.state.evidence_item(eid) is None]
+
+        if evidence:
+            checks.append(VerificationCheck(name=f"{cid}:has_evidence", status=PASSED, detail=f"{len(evidence)} supporting evidence item(s)" + (f"; {len(missing)} referenced id(s) missing" if missing else "")))
+        else:
+            checks.append(VerificationCheck(name=f"{cid}:has_evidence", status=FAILED, detail="claim has no resolvable supporting evidence"))
+
+        roots: set[str] = set()
+        for e in evidence:
+            roots |= e.root_sources()
+        if claim.confidence >= INDEPENDENCE_CONFIDENCE:
+            if len(roots) >= MIN_INDEPENDENT_SOURCES:
+                checks.append(VerificationCheck(name=f"{cid}:independence", status=PASSED, detail=f"{len(roots)} independent root sources"))
+            else:
+                checks.append(VerificationCheck(name=f"{cid}:independence", status=FAILED, detail=f"confidence {claim.confidence:.2f} rests on {len(roots)} independent root source(s); need >= {MIN_INDEPENDENT_SOURCES}"))
+        else:
+            checks.append(VerificationCheck(name=f"{cid}:independence", status=SKIPPED, detail=f"{len(roots)} root source(s); independence only required at confidence >= {INDEPENDENCE_CONFIDENCE}"))
+
+        if claim.status == ClaimStatus.ESTABLISHED:
+            if any(e.kind == EvidenceKind.PRIMARY for e in evidence):
+                checks.append(VerificationCheck(name=f"{cid}:primary_evidence", status=PASSED, detail="established claim backed by primary evidence"))
+            else:
+                checks.append(VerificationCheck(name=f"{cid}:primary_evidence", status=INCONCLUSIVE, detail="established claim has no primary evidence"))
+        else:
+            checks.append(VerificationCheck(name=f"{cid}:primary_evidence", status=SKIPPED, detail="only required for established claims"))
+
+        if any(e.freshness for e in evidence):
+            if claim.freshness:
+                checks.append(VerificationCheck(name=f"{cid}:freshness", status=PASSED, detail=f"claim freshness {claim.freshness}"))
+            else:
+                checks.append(VerificationCheck(name=f"{cid}:freshness", status=INCONCLUSIVE, detail="evidence carries freshness but the claim records none"))
+        else:
+            checks.append(VerificationCheck(name=f"{cid}:freshness", status=SKIPPED, detail="no dated evidence"))
+
+        narrow = []
+        for e in evidence:
+            if e.supports_proposition:
+                overlap = token_overlap(e.supports_proposition, claim.proposition)
+                if overlap < TOKEN_OVERLAP_THRESHOLD:
+                    narrow.append(f"{e.id} ({overlap:.0%} overlap)")
+        if narrow:
+            checks.append(VerificationCheck(name=f"{cid}:consistency", status=INCONCLUSIVE, detail="evidence supports narrower proposition: " + ", ".join(narrow)))
+        else:
+            checks.append(VerificationCheck(name=f"{cid}:consistency", status=PASSED, detail="evidence propositions consistent with claim"))
+
+        open_contradictions = self._unresolved_contradictions_for(cid)
+        if open_contradictions:
+            checks.append(VerificationCheck(name=f"{cid}:contradictions", status=FAILED, detail="unresolved contradiction(s): " + ", ".join(c.id for c in open_contradictions)))
+        else:
+            checks.append(VerificationCheck(name=f"{cid}:contradictions", status=PASSED, detail="no unresolved contradictions"))
+
+    def verify_research(self, claim_ids: Optional[list[str]] = None, task_id: Optional[str] = None) -> VerificationResult:
+        checks: list[VerificationCheck] = []
+        evidence_ids: list[str] = []
+        if claim_ids is None:
+            claims: list[Optional[Claim]] = list(self.state.claims)
+            ids = [c.id for c in self.state.claims]
+        else:
+            ids = list(claim_ids)
+            claims = [self.state.claim(cid) for cid in ids]
+        for cid, claim in zip(ids, claims):
+            if claim is None:
+                checks.append(VerificationCheck(name=f"{cid}:exists", status=FAILED, detail="claim not found in mission state"))
+                continue
+            self._check_claim(claim, checks, evidence_ids)
+        if not checks:
+            checks.append(VerificationCheck(name="claims", status=INCONCLUSIVE, detail="no claims to verify"))
+        status = _aggregate(checks)
+        failed = [c for c in checks if c.status == FAILED]
+        summary = f"{len(ids)} claim(s): {_counts(checks)}"
+        if failed:
+            summary += "; failing: " + "; ".join(f"{c.name} ({c.detail})" for c in failed[:5])
+        return self.record(
+            VerificationResult(target_type="claim", target_id=task_id or (",".join(ids) if ids else "claims"), status=status, summary=summary, checks=checks, evidence_ids=sorted(set(evidence_ids)))
+        )
+
+    # -- data -----------------------------------------------------------------------
+
+    def verify_data(self, records: list[dict[str, Any]], schema: dict[str, Any], reconciliation: Optional[dict[str, Any]] = None) -> VerificationResult:
+        checks: list[VerificationCheck] = []
+        required = list(schema.get("required") or [])
+        properties: dict[str, Any] = dict(schema.get("properties") or {})
+        violations: list[str] = []
+        for i, rec in enumerate(records):
+            if not isinstance(rec, dict):
+                violations.append(f"record {i}: not an object")
+                continue
+            for key in required:
+                if key not in rec:
+                    violations.append(f"record {i}: missing required '{key}'")
+            for key, spec in properties.items():
+                if key in rec and isinstance(spec, dict) and "type" in spec and not _type_ok(rec[key], spec["type"]):
+                    violations.append(f"record {i}: '{key}' expected {spec['type']}, got {type(rec[key]).__name__}")
+        if violations:
+            checks.append(VerificationCheck(name="schema", status=FAILED, detail=f"{len(violations)} violation(s): " + "; ".join(violations[:5])))
+        else:
+            checks.append(VerificationCheck(name="schema", status=PASSED, detail=f"{len(records)} record(s) conform"))
+
+        numeric_fields = [k for k, s in properties.items() if isinstance(s, dict) and s.get("type") in ("number", "integer")]
+        if not numeric_fields:
+            candidates: set[str] = set()
+            for rec in records:
+                if isinstance(rec, dict):
+                    candidates |= {k for k, v in rec.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            numeric_fields = sorted(candidates)
+        anomalies: list[str] = []
+        for field in numeric_fields:
+            values = [(i, float(r[field])) for i, r in enumerate(records) if isinstance(r, dict) and isinstance(r.get(field), (int, float)) and not isinstance(r.get(field), bool)]
+            if len(values) < 3:
+                continue
+            xs = [v for _, v in values]
+            mean = statistics.fmean(xs)
+            std = statistics.pstdev(xs)
+            if std <= 0:
+                continue
+            for i, v in values:
+                if abs(v - mean) > ANOMALY_SIGMA * std:
+                    anomalies.append(f"record {i}: {field}={v:g} is {abs(v - mean) / std:.1f} std from mean {mean:g}")
+        if anomalies:
+            checks.append(VerificationCheck(name="anomalies", status=INCONCLUSIVE, detail="; ".join(anomalies[:5])))
+        else:
+            checks.append(VerificationCheck(name="anomalies", status=PASSED, detail=f"no values beyond {ANOMALY_SIGMA:g} std in {len(numeric_fields)} numeric field(s)"))
+
+        if reconciliation:
+            field = str(reconciliation.get("field", ""))
+            tolerance = float(reconciliation.get("tolerance", 0.0))
+            rel_tol = float(reconciliation.get("relative_tolerance", 0.0))
+            details: list[str] = []
+            ok = True
+            if "expected_total" in reconciliation:
+                total = sum(float(r.get(field, 0) or 0) for r in records if isinstance(r, dict) and isinstance(r.get(field), (int, float)))
+                expected = float(reconciliation["expected_total"])
+                allowed = max(tolerance, rel_tol * abs(expected))
+                diff = abs(total - expected)
+                if diff > allowed:
+                    ok = False
+                details.append(f"sum({field})={total:g} vs expected {expected:g} (diff {diff:g}, tolerance {allowed:g})")
+            if "expected_count" in reconciliation:
+                expected_count = int(reconciliation["expected_count"])
+                if len(records) != expected_count:
+                    ok = False
+                details.append(f"count={len(records)} vs expected {expected_count}")
+            if not details:
+                checks.append(VerificationCheck(name="reconciliation", status=INCONCLUSIVE, detail="reconciliation spec has no expected_total or expected_count"))
+            else:
+                checks.append(VerificationCheck(name="reconciliation", status=PASSED if ok else FAILED, detail="; ".join(details)))
+
+        status = _aggregate(checks)
+        summary = f"{len(records)} record(s): {_counts(checks)}"
+        failed = [c for c in checks if c.status == FAILED]
+        if failed:
+            summary += "; failing: " + "; ".join(f"{c.name} ({c.detail})" for c in failed)
+        return self.record(VerificationResult(target_type="data", target_id=str(schema.get("title") or "records"), status=status, summary=summary, checks=checks))
+
+    # -- artifacts ------------------------------------------------------------------
+
+    def verify_artifact(self, artifact: Artifact) -> VerificationResult:
+        checks: list[VerificationCheck] = []
+        path = Path(artifact.path).expanduser() if artifact.path else None
+        if path is None:
+            checks.append(VerificationCheck(name="path", status=FAILED, detail="artifact declares no path", authoritative=True))
+        elif not path.exists():
+            checks.append(VerificationCheck(name="path", status=FAILED, detail=f"{path} does not exist", authoritative=True))
+        elif not path.is_file():
+            checks.append(VerificationCheck(name="path", status=FAILED, detail=f"{path} is not a regular file", authoritative=True))
+        else:
+            checks.append(VerificationCheck(name="path", status=PASSED, detail=str(path)))
+            size = path.stat().st_size
+            if size == 0:
+                checks.append(VerificationCheck(name="non_empty", status=FAILED, detail="file is empty", authoritative=True))
+            else:
+                checks.append(VerificationCheck(name="non_empty", status=PASSED, detail=f"{size} bytes"))
+            content_hash = file_sha256(path) or ""
+            # The comparison that matters is against the hash this artifact last *passed* on.
+            # A re-check of changed bytes is a real check of the bytes that are there now, so it
+            # passes and records the change; it is the completion gate that refuses to accept
+            # the stale receipt in between.
+            previous = artifact.verified_hash
+            artifact.content_hash = content_hash
+            if previous and previous != content_hash:
+                checks.append(VerificationCheck(name="hash", status=PASSED, detail=f"sha256 {content_hash} (changed since it was verified at {previous[:12]}…; re-checked)"))
+            else:
+                checks.append(VerificationCheck(name="hash", status=PASSED, detail=f"sha256 {content_hash}"))
+        # A declared expectation is the only thing that makes this a check about *content*. It has
+        # to be declared in advance — an expectation invented after reading the file would be
+        # satisfied by whatever the file happens to say.
+        content_checked = False
+        if path is not None and path.is_file() and artifact.expectation is not None:
+            for check in _expectation_checks(artifact.expectation, path):
+                checks.append(check)
+            content_checked = True
+        status = _aggregate(checks)
+        artifact.verified = status == PASSED
+        # Exactly what passed, recorded next to the boolean that says it passed. `verified` on its
+        # own reads as a claim about the deliverable; without an expectation what was established
+        # is that a path resolved to a regular non-empty file whose bytes hash to H, which a
+        # 20-byte `TODO: write this up` satisfies identically to a finished report.
+        scope = ""
+        if artifact.verified:
+            scope = EXISTENCE_SCOPE + (f"+{CONTENT_SCOPE}" if content_checked else "")
+        artifact.verified_scope = scope
+        # The hash the artifact was verified *at* is what later integrity checks compare against,
+        # so a file that is deleted or edited after this point stops counting as verified.
+        artifact.verified_hash = artifact.content_hash if artifact.verified else None
+        artifact.verified_at = iso_now() if artifact.verified else None
+        stored = next((a for a in self.state.artifacts if a.id == artifact.id), None)
+        if stored is not None and stored is not artifact:
+            stored.content_hash = artifact.content_hash
+            stored.verified = artifact.verified
+            stored.verified_hash = artifact.verified_hash
+            stored.verified_at = artifact.verified_at
+        summary = f"artifact '{artifact.name}': {_counts(checks)}"
+        return self.record(VerificationResult(target_type="artifact", target_id=artifact.id, status=status, summary=summary, checks=checks))
+
+    # -- criteria -------------------------------------------------------------------
+
+    def _supporting_versions(self, criterion: SuccessCriterion) -> tuple[list[InputVersion], list[str]]:
+        """Input versions and action ids of the evidence this criterion actually rests on.
+
+        A criterion receipt is a summary of other receipts. It has to inherit their version
+        identity, or the chain criterion -> receipt -> evidence -> action breaks at the first hop
+        and the gate re-checks nothing.
+        """
+        paths: dict[str, Optional[str]] = {}
+        actions: list[str] = []
+        task_ids = {t.task_id for t in self.state.tests if t.task_id and self._test_addresses(t, criterion.id)}
+        for res in self.state.verifications:
+            relevant = res.target_type in ("code", "task") and (
+                (res.produced_by_task_id and res.produced_by_task_id in task_ids) or res.target_id in task_ids
+            )
+            # A supporting receipt whose own inputs have since moved is history, not support. It
+            # contributes nothing here, so a fresh conclusion is not born stale by inheriting the
+            # hashes of a superseded run.
+            if not relevant or not receipt_inputs_intact(res)[0]:
+                continue
+            for iv in res.input_versions:
+                paths.setdefault(iv.path, iv.artifact_id)
+            actions.extend(a for a in res.produced_by_action_ids if a not in actions)
+        # Verified artifacts are re-checked independently by artifact_integrity, but binding them
+        # here keeps the criterion's own receipt self-contained for traversal.
+        for art in self.state.artifacts:
+            if art.verified and art.verified_hash and art.path:
+                paths.setdefault(art.path, art.id)
+        # Record the bytes as they are at the moment this conclusion is drawn. That is what the
+        # completion gate later re-reads, so "still true?" is answerable against the conclusion.
+        versions = [
+            InputVersion(path=p, content_hash=(file_sha256(Path(p)) or "") if Path(p).is_file() else "", artifact_id=aid)
+            for p, aid in paths.items()
+        ]
+        return versions, actions
+
+    def _acceptance_checks(self, criterion: SuccessCriterion, mapped: list[str], created_ms: int) -> list[VerificationCheck]:
+        """Decide a contract-mapped criterion from behavioural receipts alone.
+
+        Every mapped predicate must be carried by a passing check in a behavioural receipt bound to
+        this criterion and newer than it. A receipt that is missing a mapped predicate does not
+        partially satisfy the criterion — the predicate is simply unanswered, and an unanswered
+        predicate blocks rather than defaulting to satisfied.
+        """
+        receipts = [
+            r
+            for r in (self.state.verifications if self.state is not None else [])
+            if r.target_type == "behaviour" and r.target_id == criterion.id and (_iso_to_ms(r.ran_at) or -1) >= created_ms
+        ]
+        if not receipts:
+            return [
+                VerificationCheck(
+                    name="acceptance",
+                    status=FAILED,
+                    detail="no isolated behavioural verification has been run for this criterion",
+                    authoritative=True,
+                )
+            ]
+        receipt = receipts[-1]
+        approved = str(((self.state.resources or {}).get(ACCEPTANCE_KEY) or {}).get("contract_digest") or "")
+        cited = ""
+        for check in receipt.checks:
+            if check.name == "provenance" and "contract=" in check.detail:
+                cited = check.detail.split("contract=", 1)[1].split(" ", 1)[0]
+                break
+        if approved and cited != approved:
+            # Either the receipt predates the approved contract or it was produced against another
+            # one. Neither is evidence about the expectations this mission actually approved.
+            return [
+                VerificationCheck(
+                    name="acceptance",
+                    status=FAILED,
+                    detail=f"the behavioural receipt was produced against contract {cited[:12] or '(none)'}…, not the approved {approved[:12]}…",
+                    authoritative=True,
+                )
+            ]
+        if not at_least(receipt.authority):
+            return [
+                VerificationCheck(
+                    name="acceptance",
+                    status=FAILED,
+                    detail=f"the behavioural receipt carries {authority_of(receipt.authority).value}, below the floor for a behavioural claim: {receipt.summary[:120]}",
+                    authoritative=True,
+                )
+            ]
+        out: list[VerificationCheck] = []
+        for predicate in mapped:
+            covering = [c for c in receipt.checks if c.name == predicate or c.name.startswith(predicate + ":")]
+            if not covering:
+                out.append(VerificationCheck(name=f"acceptance:{predicate}", status=FAILED, detail="the approved contract maps this criterion to a predicate the receipt does not carry", authoritative=True))
+                continue
+            failed = [c for c in covering if c.status != PASSED]
+            out.append(
+                VerificationCheck(
+                    name=f"acceptance:{predicate}",
+                    status=PASSED if not failed else _aggregate(covering),
+                    detail=("; ".join(c.detail for c in failed[:2]) if failed else f"{len(covering)} check(s) held: " + "; ".join(c.detail for c in covering[:2]))[:400],
+                    authoritative=True,
+                )
+            )
+        return out
+
+    def _criterion_authority(self, criterion: SuccessCriterion, status: VerificationStatus) -> EvidenceAuthority:
+        """The strongest authority behind this criterion, or the weakest when nothing backs it."""
+        if status != PASSED:
+            return EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        levels = [
+            authority_of(r.authority)
+            for r in (self.state.verifications if self.state is not None else [])
+            if r.target_type == "behaviour" and r.target_id == criterion.id and r.status == PASSED
+        ]
+        levels += [authority_of(t.authority) for t in self.state.tests if self._test_addresses(t, criterion.id) and t.status == PASSED]
+        levels += [
+            EvidenceAuthority.PROCESS_OBSERVATION
+            for a in self.state.artifacts
+            if a.verified and CONTENT_SCOPE in (a.verified_scope or "") and token_overlap(criterion.description, f"{a.name} {a.summary}") >= TOKEN_OVERLAP_THRESHOLD
+        ]
+        if not levels:
+            return EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        return max(levels, key=lambda a: list(EvidenceAuthority).index(a))
+
+    def _test_attested(self, record: TestRecord) -> bool:
+        """Whether this record is allowed to close a criterion.
+
+        `engine_attested` means the engine re-ran the command itself against a copy of the
+        workspace with the implementation withheld and every passing test stopped passing. That
+        is the strongest statement available here, and it is a sensitivity check rather than a
+        security boundary: an adversary who models the control and answers the two runs
+        differently defeats it. It is not authentication of the report, which is not obtainable
+        while the reporting process imports the code under test.
+
+        Everything else closes nothing, **including a record with no authority at all**. The
+        permissive reading was tempting — "written before authority existed, keep the older
+        guarantee" — and it is wrong here: an absent field is indistinguishable from a stripped
+        one and from a record produced under the rules this repair replaced, and those rules
+        admitted forged passes. Three permissive defaults already compose into a false completion
+        in this codebase, so the weakest reading is the only one that does not reopen them. The
+        cost is that a mission resumed from a pre-repair snapshot must re-run its verification;
+        the state still loads, and the records are still there as diagnosis.
+        """
+        return at_least(getattr(record, "authority", ""))
+
+    @staticmethod
+    def _test_executed_something(record: TestRecord) -> bool:
+        """Did this record observe a required test actually run?
+
+        Records the engine produces carry structured counts, so ``executed`` is authoritative:
+        a zero-execution run (all skipped, or an authorized expected-zero) is a legitimate
+        outcome but never proof that the required tests ran. Records with no counts at all
+        predate structured capture; for those the recorded status is all there is.
+        """
+        if not record.counts:
+            return True
+        return record.executed > 0
+
+    def _test_addresses(self, record: TestRecord, criterion_id: str) -> bool:
+        """Is this test record offered as evidence for *this* criterion?
+
+        Either the record names the criterion directly, or the task that produced it declared the
+        criterion in ``addresses_criterion_ids``. Both are machine-readable links recorded before
+        the outcome was known, so neither can be attached after the fact to fit a result.
+        """
+        if record.criterion_ids:
+            # Scope frozen onto the record when it ran. Once a record carries its own scope that
+            # is the whole answer: re-resolving through the task would let a criterion be claimed
+            # by editing the task *after* the outcome was known.
+            return criterion_id in record.criterion_ids
+        if record.task_id:
+            # No frozen scope: a record written before scope was captured. Fall back to the task's
+            # declaration, which is the weaker guarantee those records were made under.
+            task = self.state.task(record.task_id)
+            if task is not None and criterion_id in (task.addresses_criterion_ids or []):
+                return True
+        return False
+
+    def verify_criterion(self, criterion: SuccessCriterion, evidence_ok: Optional[bool] = None) -> VerificationResult:
+        method = (criterion.verification_method or "").lower()
+        checks: list[VerificationCheck] = []
+        evidence_ids: list[str] = []
+        created_ms = _id_timestamp_ms(criterion.id) or 0
+
+        # When the mission carries an approved acceptance contract and this criterion is mapped to
+        # predicates in it, that mapping is the *only* way the criterion closes. The token-overlap
+        # and "a green suite exists somewhere" routes are not consulted at all: they decide by
+        # resemblance, and resemblance is what let an unrelated passing suite and a placeholder file
+        # satisfy criteria they said nothing about.
+        acceptance = (self.state.resources or {}).get(ACCEPTANCE_KEY) if self.state is not None else None
+        mapped = list(((acceptance or {}).get("criteria") or {}).get(criterion.id) or [])
+        if mapped:
+            checks.extend(self._acceptance_checks(criterion, mapped, created_ms))
+        elif re.search(r"\b(tests?|pytest|unit\s*tests?)\b", method):
+            # Scope binds the proof to the claim. A passing suite demonstrates something about the
+            # criteria it was *run for*; without that link any unrelated green run would satisfy
+            # any criterion whose method happens to mention tests.
+            scoped = [
+                t
+                for t in self.state.tests
+                if t.status == PASSED
+                and not t.expected_failure
+                and (_iso_to_ms(t.ran_at) or -1) >= created_ms
+                and self._test_addresses(t, criterion.id)
+                and self._test_executed_something(t)
+            ]
+            # Scope says the run was about this criterion; authority says the run proved anything
+            # at all. A self-reported pass — one the engine's differential control could not show
+            # to depend on the implementation — is kept as diagnosis and closes nothing.
+            fresh = [t for t in scoped if self._test_attested(t)]
+            unattested = [t for t in scoped if not self._test_attested(t)]
+            unbound = [
+                t
+                for t in self.state.tests
+                if t.status == PASSED and not t.expected_failure and (_iso_to_ms(t.ran_at) or -1) >= created_ms and not self._test_addresses(t, criterion.id)
+            ]
+            if fresh:
+                checks.append(VerificationCheck(name="tests", status=PASSED, detail=f"{len(fresh)} passed test record(s) bound to this criterion and newer than it: " + ", ".join(t.name for t in fresh[:3])))
+            elif unattested:
+                checks.append(
+                    VerificationCheck(
+                        name="tests",
+                        status=FAILED,
+                        detail=f"{len(unattested)} passing test record(s) are scoped to this criterion but none is attested: "
+                        + "; ".join(f"{t.name} ({t.attestation or 'self-reported'})" for t in unattested[:2]),
+                    )
+                )
+            elif unbound:
+                checks.append(VerificationCheck(name="tests", status=FAILED, detail=f"{len(unbound)} passing test record(s) exist but none is scoped to this criterion; an unrelated suite is not proof of it"))
+            else:
+                checks.append(VerificationCheck(name="tests", status=FAILED, detail="no passed (non-reproduction) test record newer than the criterion"))
+
+        if "artifact" in method:
+            matches = [a for a in self.state.artifacts if a.verified and token_overlap(criterion.description, f"{a.name} {a.summary}") >= TOKEN_OVERLAP_THRESHOLD]
+            # What `verify_artifact` establishes without a declared expectation is that a path
+            # resolved to a regular non-empty file whose bytes hash to H. Reproduced: a 20-byte
+            # `TODO: write this up` closed a criterion demanding a written analysis, producing an
+            # outcome byte-for-byte indistinguishable from the finished deliverable. Existence is
+            # therefore not criterion satisfaction; an artifact closes a criterion only when the
+            # mission declared, in advance, what its content has to be, and the engine checked it.
+            checked = [a for a in matches if CONTENT_SCOPE in (a.verified_scope or "")]
+            if checked:
+                checks.append(VerificationCheck(name="artifact", status=PASSED, detail="verified against a declared content expectation: " + ", ".join(a.name for a in checked[:3])))
+            elif matches:
+                checks.append(
+                    VerificationCheck(
+                        name="artifact",
+                        status=INCONCLUSIVE,
+                        detail="artifact(s) "
+                        + ", ".join(a.name for a in matches[:3])
+                        + " were verified to exist, be non-empty and match a recorded hash; no content expectation was declared, so nothing was checked about what is in them",
+                        authoritative=True,
+                    )
+                )
+            else:
+                checks.append(VerificationCheck(name="artifact", status=FAILED, detail="no verified artifact mentions the criterion"))
+
+        if evidence_ok is None and re.search(r"\b(evidence|sources?)\b", method):
+            related = [c for c in self.state.claims if token_overlap(criterion.description, c.proposition) >= TOKEN_OVERLAP_THRESHOLD]
+            good = [c for c in related if c.status in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED) and not self._unresolved_contradictions_for(c.id)]
+            if good:
+                for c in good:
+                    evidence_ids.extend(c.evidence_for)
+                checks.append(VerificationCheck(name="evidence", status=PASSED, detail="supported claim(s): " + ", ".join(c.id for c in good[:3])))
+            elif related:
+                checks.append(VerificationCheck(name="evidence", status=FAILED, detail=f"{len(related)} related claim(s) but none supported/established without open contradictions"))
+            else:
+                checks.append(VerificationCheck(name="evidence", status=FAILED, detail="no claim relates to the criterion"))
+
+        if evidence_ok is not None:
+            related = [c for c in self.state.claims if token_overlap(criterion.description, c.proposition) >= TOKEN_OVERLAP_THRESHOLD]
+            for c in related:
+                if c.status in (ClaimStatus.SUPPORTED, ClaimStatus.ESTABLISHED):
+                    evidence_ids.extend(c.evidence_for)
+            checks.append(VerificationCheck(name="explicit_evidence", status=PASSED if evidence_ok else FAILED, detail="deterministic runtime judgement of the evidence state supplied by the executive"))
+        if not checks:
+            checks.append(VerificationCheck(name="method", status=INCONCLUSIVE, detail=f"verification method '{criterion.verification_method}' is not machine-checkable and no evidence_ok was supplied"))
+
+        status = _aggregate(checks)
+        criterion.satisfied = status == PASSED
+        # Carry the supporting evidence's version identity onto the criterion receipt. Without
+        # this the receipt names no inputs, so the completion gate has nothing to re-check and a
+        # post-verification swap of the implementation goes unnoticed.
+        supporting, actions = self._supporting_versions(criterion)
+        result = VerificationResult(
+            target_type="criterion",
+            target_id=criterion.id,
+            status=status,
+            summary=f"criterion '{criterion.description}': {_counts(checks)}",
+            checks=checks,
+            evidence_ids=sorted(set(evidence_ids)),
+            input_versions=supporting,
+            authority=self._criterion_authority(criterion, status).value,
+            produced_by_action_ids=actions,
+        )
+        # Only a passing record is citable evidence. A failed or inconclusive attempt is still
+        # persisted (see record()), but citing it would turn the completion gate into a
+        # has-this-been-attempted check.
+        cite(criterion.verification_ids, result, criterion.id, target_type="criterion")
+        return self.record(result)
+
+    # -- decisions ------------------------------------------------------------------
+
+    def verify_decision(self, decision: Decision, simulation_result: Any = None) -> VerificationResult:
+        checks: list[VerificationCheck] = []
+        if decision.concise_rationale.strip():
+            checks.append(VerificationCheck(name="rationale", status=PASSED, detail="rationale recorded"))
+        else:
+            checks.append(VerificationCheck(name="rationale", status=FAILED, detail="rationale is empty"))
+
+        known = [eid for eid in decision.decisive_evidence if self.state.evidence_item(eid) is not None]
+        unknown = [eid for eid in decision.decisive_evidence if self.state.evidence_item(eid) is None]
+        if known:
+            checks.append(VerificationCheck(name="decisive_evidence", status=PASSED, detail=f"{len(known)} evidence id(s) resolved" + (f"; unknown: {', '.join(unknown)}" if unknown else "")))
+        elif unknown:
+            checks.append(VerificationCheck(name="decisive_evidence", status=FAILED, detail="referenced evidence not in mission state: " + ", ".join(unknown)))
+        else:
+            checks.append(VerificationCheck(name="decisive_evidence", status=FAILED, detail="no decisive evidence cited"))
+
+        if decision.assumptions:
+            checks.append(VerificationCheck(name="assumptions", status=PASSED, detail=f"{len(decision.assumptions)} load-bearing assumption(s) listed"))
+        else:
+            checks.append(VerificationCheck(name="assumptions", status=INCONCLUSIVE, detail="no load-bearing assumptions listed"))
+
+        if simulation_result is not None:
+            best = str(getattr(simulation_result, "best_option", "") or "")
+            robust = bool(getattr(simulation_result, "robust_best", False))
+            if decision.selected_option == best:
+                checks.append(VerificationCheck(name="simulation_agreement", status=PASSED, detail=f"selected option matches simulation best '{best}'"))
+            elif best and best.lower() in decision.concise_rationale.lower():
+                checks.append(VerificationCheck(name="simulation_agreement", status=PASSED, detail=f"deviates from simulation best '{best}' but the rationale addresses it"))
+            else:
+                checks.append(VerificationCheck(name="simulation_agreement", status=FAILED, detail=f"selected '{decision.selected_option}' but simulation prefers '{best}' and the rationale does not say why"))
+            if robust:
+                checks.append(VerificationCheck(name="robustness", status=PASSED, detail="simulation best is robust across assumption extremes"))
+            else:
+                checks.append(VerificationCheck(name="robustness", status=INCONCLUSIVE, detail="sensitive to assumptions"))
+
+        status = _aggregate(checks)
+        return self.record(
+            VerificationResult(target_type="decision", target_id=decision.decision_id, status=status, summary=f"decision '{decision.selected_option}': {_counts(checks)}", checks=checks, evidence_ids=known)
+        )
+
+    # -- tasks ----------------------------------------------------------------------
+
+    def verify_task(self, task: Task) -> VerificationResult:
+        params = task.parameters or {}
+        commands: list[str] = []
+        if params.get("test_command"):
+            commands.append(str(params["test_command"]))
+        verify_commands = params.get("verify_commands")
+        if isinstance(verify_commands, str):
+            commands.append(verify_commands)
+        elif isinstance(verify_commands, (list, tuple)):
+            commands.extend(str(c) for c in verify_commands)
+
+        checks: list[VerificationCheck] = []
+        evidence_ids: list[str] = []
+        if commands:
+            sub = self.verify_code(commands, cwd=params.get("cwd"), task_id=task.id)
+            checks.extend(sub.checks)
+            evidence_ids.append(sub.id)
+            summary = sub.summary
+        elif task.artifact_ids:
+            for art_id in task.artifact_ids:
+                artifact = next((a for a in self.state.artifacts if a.id == art_id), None)
+                if artifact is None:
+                    checks.append(VerificationCheck(name=f"artifact:{art_id}", status=FAILED, detail="artifact not found in mission state"))
+                    continue
+                sub = self.verify_artifact(artifact)
+                evidence_ids.append(sub.id)
+                # A task "verified" by a file being present is a task whose output exists. Recorded
+                # as inconclusive unless a declared content expectation was checked, because a
+                # 5-byte placeholder otherwise produced a PASSED task receipt that then counted as
+                # substantive grounding for a model judgement.
+                scoped = sub.status if CONTENT_SCOPE in (artifact.verified_scope or "") else (INCONCLUSIVE if sub.status == PASSED else sub.status)
+                detail = sub.summary if scoped == sub.status else f"{sub.summary}; existence only, no declared content expectation to check"
+                checks.append(VerificationCheck(name=f"artifact:{artifact.name}", status=scoped, detail=detail))
+            summary = f"{len(task.artifact_ids)} artifact(s): {_counts(checks)}"
+        else:
+            checks.append(VerificationCheck(name="output", status=INCONCLUSIVE, detail="no verifiable output declared"))
+            summary = "no verifiable output declared"
+        status = _aggregate(checks)
+        result = VerificationResult(target_type="task", target_id=task.id, status=status, summary=summary, checks=checks, evidence_ids=evidence_ids)
+        if result.id not in task.verification_attempt_ids:
+            task.verification_attempt_ids.append(result.id)
+        cite(task.verification_ids, result, task.id)
+        return self.record(result)
+
+    # -- mission gate ---------------------------------------------------------------
+
+    def mission_completion_check(self, state: Optional[MissionState] = None) -> VerificationResult:
+        return self.record(mission_completion_check(state or self.state))
+
+
+def mission_completion_check(state: MissionState) -> VerificationResult:
+    """Completion-integrity gate: refuse completion until every obligation is verified."""
+    checks: list[VerificationCheck] = []
+    missing: list[str] = []
+
+    # A criterion counts as verified only when an id on it resolves to a PASSED record in
+    # durable state. A non-empty id list is not evidence of anything.
+    def receipts(c: SuccessCriterion) -> list[VerificationResult]:
+        # F4: the receipt must have been produced *against this criterion*. A passing record
+        # for some unrelated artifact is not evidence, however it came to be cited.
+        return state.passing_verifications(c.verification_ids, target_type="criterion", target_id=c.id)
+
+    unverified = [c for c in state.success_criteria if not (c.satisfied and receipts(c))]
+    if not state.success_criteria:
+        checks.append(VerificationCheck(name="success_criteria", status=INCONCLUSIVE, detail="mission declares no success criteria"))
+        missing.append("no success criteria declared")
+    elif unverified:
+        detail = "; ".join(f"'{c.description}'" + (" (no passing verification record bound to it)" if not receipts(c) else " (not satisfied)") for c in unverified)
+        checks.append(VerificationCheck(name="success_criteria", status=FAILED, detail=detail))
+        missing.append(f"{len(unverified)} of {len(state.success_criteria)} success criteria not verified: {detail}")
+    else:
+        checks.append(VerificationCheck(name="success_criteria", status=PASSED, detail=f"all {len(state.success_criteria)} criteria satisfied and verified"))
+
+    # Only the latest record per test command counts: a fixed failure is not a failure.
+    latest: dict[str, Any] = {}
+    for rec in state.tests:
+        if rec.expected_failure:
+            continue  # a reproduction run is evidence the bug exists, never that the suite passes
+        latest[rec.name] = rec
+    failing_tests = [t for t in latest.values() if t.status == FAILED]
+    if failing_tests:
+        names = ", ".join(t.name for t in failing_tests[:5])
+        checks.append(VerificationCheck(name="tests", status=FAILED, detail=f"{len(failing_tests)} failing test record(s): {names}"))
+        missing.append(f"failing tests: {names}")
+    else:
+        checks.append(VerificationCheck(name="tests", status=PASSED, detail=f"{len(state.tests)} test record(s), none failing"))
+
+    contradictions = [c for c in state.unresolved_contradictions() if c.severity >= CONTRADICTION_SEVERITY_GATE]
+    if contradictions:
+        ids = ", ".join(f"{c.id} (severity {c.severity:.2f})" for c in contradictions[:5])
+        checks.append(VerificationCheck(name="contradictions", status=FAILED, detail=ids))
+        missing.append(f"unresolved contradictions with severity >= {CONTRADICTION_SEVERITY_GATE}: {ids}")
+    else:
+        checks.append(VerificationCheck(name="contradictions", status=PASSED, detail="no unresolved contradictions above severity gate"))
+
+    blocked = []
+    for b in state.blocked_operations:
+        if b.resolved or not b.task_id:
+            continue
+        task = state.task(b.task_id)
+        if task is None or task.status != TaskStatus.DONE:
+            blocked.append(b)
+    if blocked:
+        detail = "; ".join(f"{b.operation} (task {b.task_id}: {b.what_would_unblock})" for b in blocked[:5])
+        checks.append(VerificationCheck(name="blocked_operations", status=FAILED, detail=detail))
+        missing.append(f"unresolved blocked operations on unfinished tasks: {detail}")
+    else:
+        checks.append(VerificationCheck(name="blocked_operations", status=PASSED, detail="no unresolved blocked operations on unfinished tasks"))
+
+    waiting = [h for h in state.unanswered_human_requests() if not h.independent_work_remaining]
+    if waiting:
+        detail = "; ".join(f"{h.kind}: {h.question}" for h in waiting[:5])
+        checks.append(VerificationCheck(name="human_requests", status=FAILED, detail=detail))
+        missing.append(f"unanswered human requests with no independent work remaining: {detail}")
+    else:
+        checks.append(VerificationCheck(name="human_requests", status=PASSED, detail="no blocking unanswered human requests"))
+
+    # F3: `verified` is a claim about the past. Re-hash every artifact the mission still
+    # presents as verified, so a file deleted or edited after verification cannot pass the gate.
+    intact: dict[str, Artifact] = {}
+    broken: list[str] = []
+    for a in state.artifacts:
+        if not a.verified:
+            continue
+        ok, detail = artifact_integrity(a)
+        if ok:
+            intact[a.id] = a
+        else:
+            broken.append(f"'{a.name}' ({detail})")
+    if broken:
+        checks.append(VerificationCheck(name="artifact_integrity", status=FAILED, detail="; ".join(broken[:5])))
+        missing.append(f"{len(broken)} verified artifact(s) no longer match what was verified: " + "; ".join(broken[:5]))
+    elif intact:
+        checks.append(VerificationCheck(name="artifact_integrity", status=PASSED, detail=f"all {len(intact)} verified artifacts still match their recorded hash"))
+    else:
+        # Applicability rule: this check asks whether artifacts still presented as verified still
+        # have the bytes they were verified against. With none presented there is nothing to ask —
+        # unless a criterion was closed by an artifact receipt, in which case an empty set
+        # contradicts the mission's own record and is a finding, not an absence.
+        artifact_backed = [
+            c.id
+            for c in state.success_criteria
+            if c.satisfied
+            for r in receipts(c)
+            for chk in r.checks
+            if chk.name == "artifact" and chk.status == PASSED
+        ]
+        if artifact_backed:
+            checks.append(
+                VerificationCheck(
+                    name="artifact_integrity",
+                    status=FAILED,
+                    detail=f"{len(artifact_backed)} criterion(s) were closed by an artifact receipt but no artifact is currently verified",
+                )
+            )
+            missing.append(f"{len(artifact_backed)} criterion(s) rest on an artifact receipt with no verified artifact behind it")
+        else:
+            checks.append(VerificationCheck(name="artifact_integrity", status=SKIPPED, detail=f"{INAPPLICABLE}: no artifact is presented as verified and no criterion was closed by an artifact receipt"))
+
+    required = list(state.resources.get("required_artifacts", []) or [])
+    if required:
+        # A required artifact may be declared by id, by name, or by path — the live mission
+        # declared absolute paths, which matched nothing, so even a verified intact artifact at
+        # exactly that path could not satisfy the check. Compare all three, resolving paths so an
+        # equivalent spelling of the same file is recognised as the same file.
+        verified_keys = set(intact) | {a.name for a in intact.values()}
+        verified_paths: set[str] = set()
+        for a in intact.values():
+            if a.path:
+                verified_paths.add(str(a.path))
+                try:
+                    verified_paths.add(str(Path(a.path).resolve()))
+                except OSError:
+                    pass
+
+        def _declared_present(ref: str) -> bool:
+            if ref in verified_keys or ref in verified_paths:
+                return True
+            try:
+                return str(Path(ref).resolve()) in verified_paths
+            except OSError:
+                return False
+
+        absent = [r for r in required if not _declared_present(str(r))]
+        if absent:
+            checks.append(VerificationCheck(name="required_artifacts", status=FAILED, detail="missing or unverified: " + ", ".join(map(str, absent))))
+            missing.append("required artifacts missing or unverified: " + ", ".join(map(str, absent)))
+        else:
+            checks.append(VerificationCheck(name="required_artifacts", status=PASSED, detail=f"all {len(required)} required artifacts verified and intact"))
+    else:
+        # Applicability rule: this check asks whether every declared deliverable exists, is
+        # verified and is intact. It is inapplicable only when the compiled mission declares no
+        # deliverable — and compilation now populates that deterministically, so an empty list
+        # means the mission genuinely asked for none rather than that nobody filled the field in.
+        checks.append(VerificationCheck(name="required_artifacts", status=SKIPPED, detail=f"{INAPPLICABLE}: the compiled mission declares no required deliverable"))
+
+    # A receipt proves something about the bytes it was produced against. Before accepting one at
+    # completion, re-read those inputs: if they have moved, the receipt still describes what it
+    # saw (history is kept) but it no longer describes what is there, so it cannot close a
+    # criterion. Records written before version binding carry no input_versions at all; that is
+    # "unknown", and unknown is not re-interpreted as "unchanged".
+    stale: list[str] = []
+    unbound: list[str] = []
+    for c in state.success_criteria:
+        crs = receipts(c)
+        if not crs:
+            continue
+        # A criterion proved by a test run the current engine produced must name the inputs that
+        # run was about, or nothing can be re-checked later. Records with no structured counts
+        # predate version binding and keep the older, weaker guarantee rather than being
+        # retroactively failed.
+        producing_tasks = {t.id for t in state.tasks if c.id in (t.addresses_criterion_ids or [])}
+        engine_backed = any(
+            t.status == PASSED and t.counts and (c.id in (t.criterion_ids or []) or (t.task_id in producing_tasks))
+            for t in state.tests
+        )
+        judged = [(receipt_inputs_intact(r), r) for r in crs]
+        # A binding with no content hash names no bytes, so it does not make a receipt re-checkable.
+        live = [r for (ok, _why), r in judged if ok and (any(iv.content_hash for iv in r.input_versions) or not engine_backed)]
+        if live:
+            # A later receipt that still matches supersedes an earlier one that no longer does.
+            # Re-verifying after a fix is exactly how a mission is meant to recover; the stale
+            # record stays in history rather than blocking forever.
+            continue
+        broken_reasons = [why for (ok, why), _r in judged if not ok]
+        if broken_reasons:
+            stale.append(f"'{c.description[:60]}': no receipt still matches the current inputs — " + "; ".join(broken_reasons[:2]))
+        elif engine_backed:
+            unbound.append(f"'{c.description[:60]}' is proved by a test run that names no input versions, so it cannot be re-checked")
+    if stale or unbound:
+        detail = "; ".join((stale + unbound)[:5])
+        checks.append(VerificationCheck(name="receipt_input_versions", status=FAILED, detail=detail, authoritative=True))
+        if stale:
+            missing.append(f"{len(stale)} receipt(s) no longer describe the current inputs: " + "; ".join(stale[:3]))
+        if unbound:
+            missing.append(f"{len(unbound)} criterion receipt(s) name no input versions: " + "; ".join(unbound[:3]))
+    else:
+        bound = sum(1 for c in state.success_criteria for r in receipts(c) for iv in r.input_versions if iv.content_hash)
+        checks.append(
+            VerificationCheck(
+                name="receipt_input_versions",
+                status=PASSED,
+                detail=f"{bound} bound input version(s) re-read and still matching",
+                authoritative=True,
+            )
+        )
+
+    status = _gate_aggregate(checks)
+    if status == PASSED:
+        summary = "all completion gates satisfied"
+    else:
+        if not missing:
+            missing = [
+                f"'{c.name}' did not run and did not say why it does not apply"
+                for c in checks
+                if c.status == SKIPPED and not (c.detail or "").startswith(INAPPLICABLE)
+            ] or [f"inconclusive: {c.name} ({c.detail[:80]})" for c in checks if c.status == INCONCLUSIVE]
+        summary = "completion blocked: " + " | ".join(missing) if missing else f"completion not confirmed: {_counts(checks)}"
+    return VerificationResult(target_type="mission", target_id=state.mission_id, status=status, summary=summary, checks=checks)
