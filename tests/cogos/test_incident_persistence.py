@@ -54,7 +54,7 @@ def _store(tmp_path: Path) -> StateStore:
 
 
 def _fabric(root: Path):
-    return build_default_fabric(CapabilityFirewall(GovernanceConfig(), root), ToolContext(root))
+    return build_default_fabric(CapabilityFirewall(GovernanceConfig(trust_workspace_code=True), root), ToolContext(root))
 
 
 def _roundtrip(store: StateStore, state: MissionState) -> MissionState:

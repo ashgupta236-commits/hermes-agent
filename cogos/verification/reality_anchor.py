@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cogos.ids import iso_now
+from cogos.verification.attestation import CONTENT_SCOPE, at_least
 from cogos.schemas.anchor import (
     AnchorAssessment,
     AnchorVerdict,
@@ -97,6 +98,7 @@ class ObservationCollector:
         scope: ObservationScope = ObservationScope.TOOL_OUTPUT,
         trust: TrustLevel = TrustLevel.UNTRUSTED_EXTERNAL,
         units: str = "",
+        authority: str = "",
         supersedes: Optional[str] = None,
     ) -> Observation:
         text = (content or "")[:MAX_OBSERVATION_CHARS]
@@ -111,6 +113,7 @@ class ObservationCollector:
             scope=scope,
             trust=trust,
             units=units,
+            authority=authority,
             supersedes=supersedes,
         )
         return obs
@@ -523,11 +526,20 @@ def deterministic_anchor(packet: dict[str, Any]) -> dict[str, Any]:
         content = str(o.get("content") or "")
         if o.get("scope") == "test":
             if "status=failed" in content and "reproduction=True" not in content:
+                # A refutation stands whatever its authority: a self-reported failure is still a
+                # reason to doubt, and discarding it would turn weak evidence into good news.
                 failing.append(o)
-            elif "status=passed" in content:
+            elif "status=passed" in content and at_least(o.get("authority")):
+                # A pass only supports a proposition if it was allowed to prove anything. Without
+                # this the second opinion corroborated a fabricated result, because a forged pass
+                # and an attested one read identically in the summary text.
                 passing.append(o)
         elif o.get("scope") == "artifact":
             if content.startswith("<unreadable:") or not content.strip():
+                continue
+            if CONTENT_SCOPE not in str(o.get("authority") or ""):
+                # The file is there and readable. That is integrity, not content: a 20-byte
+                # `TODO: write this up` is indistinguishable here from the finished deliverable.
                 continue
             intact_artifacts.append(o)
 

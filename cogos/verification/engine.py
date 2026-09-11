@@ -14,8 +14,11 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import statistics
 import tempfile
+import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -30,7 +33,21 @@ from cogos.schemas.mission import Artifact, MissionState, SuccessCriterion, Task
 from cogos.schemas.tools import ToolCall
 from cogos.schemas.verification import InputVersion, VerificationCheck, VerificationResult, cite
 from cogos.tools.fabric import ToolFabric
-from cogos.verification.test_outcome import InputVersionGuard, TestRunOutcome, classify_test_run, detect_framework, junit_counts
+from cogos.verification.attestation import (
+    CONTENT_SCOPE,
+    EXISTENCE_SCOPE,
+    KNOWN_FRAMEWORKS,
+    REPORTING_FRAMEWORKS,
+    EvidenceAuthority,
+    at_least,
+    authority_of,
+    build_trusted_run,
+    differential_control,
+    harness_selection,
+    read_report_once_settled,
+    scope_problems,
+)
+from cogos.verification.test_outcome import InputVersionGuard, TestRunOutcome, classify_test_run, detect_framework
 
 PASSED = VerificationStatus.PASSED
 FAILED = VerificationStatus.FAILED
@@ -73,6 +90,47 @@ def tokens(text: str) -> set[str]:
     return {t for t in _TOKEN_RE.findall((text or "").lower()) if len(t) >= 3 and t not in _STOPWORDS}
 
 
+def _expectation_checks(expectation: Any, path: Path) -> list[VerificationCheck]:
+    """Deterministic checks of a file against what the mission said it must contain."""
+    out: list[VerificationCheck] = []
+    try:
+        size = path.stat().st_size
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [VerificationCheck(name="content", status=FAILED, detail=f"could not read the artifact: {exc}", authoritative=True)]
+    if expectation.min_bytes:
+        ok = size >= expectation.min_bytes
+        out.append(VerificationCheck(name="content_size", status=PASSED if ok else FAILED, detail=f"{size} bytes (expected at least {expectation.min_bytes})", authoritative=True))
+    missing = [needle for needle in expectation.must_contain if needle not in text]
+    if expectation.must_contain:
+        out.append(
+            VerificationCheck(
+                name="content_contains",
+                status=PASSED if not missing else FAILED,
+                detail="all declared content present" if not missing else "missing: " + ", ".join(missing[:3]),
+                authoritative=True,
+            )
+        )
+    present = [needle for needle in expectation.must_not_contain if needle in text]
+    if expectation.must_not_contain:
+        out.append(
+            VerificationCheck(
+                name="content_excludes",
+                status=PASSED if not present else FAILED,
+                detail="no excluded content present" if not present else "present but excluded: " + ", ".join(present[:3]),
+                authoritative=True,
+            )
+        )
+    if expectation.must_match:
+        try:
+            hit = re.search(expectation.must_match, text) is not None
+        except re.error as exc:
+            out.append(VerificationCheck(name="content_pattern", status=INCONCLUSIVE, detail=f"declared pattern is not a valid regular expression: {exc}", authoritative=True))
+            return out
+        out.append(VerificationCheck(name="content_pattern", status=PASSED if hit else FAILED, detail=f"pattern {expectation.must_match!r} {'matched' if hit else 'did not match'}", authoritative=True))
+    return out
+
+
 def token_overlap(needle: str, haystack: str) -> float:
     """Fraction of ``needle``'s content tokens that also occur in ``haystack``."""
     a, b = tokens(needle), tokens(haystack)
@@ -86,6 +144,33 @@ def _aggregate(checks: list[VerificationCheck]) -> VerificationStatus:
     if FAILED in statuses:
         return FAILED
     if INCONCLUSIVE in statuses:
+        return INCONCLUSIVE
+    if PASSED in statuses:
+        return PASSED
+    return INCONCLUSIVE
+
+
+#: Prefix that marks a completion check as legitimately not applying to this mission, with the
+#: rule that decided so. A check may only be absent from the verdict if it says why.
+INAPPLICABLE = "INAPPLICABLE"
+
+
+def _gate_aggregate(checks: list[VerificationCheck]) -> VerificationStatus:
+    """Aggregate completion checks over four states, not three.
+
+    `_aggregate` ignores SKIPPED, so a check that turned itself off read as assent — which is how
+    the one check that asks whether the deliverable was delivered came to be satisfied by not
+    running. Here a SKIPPED check counts as INAPPLICABLE only when it declares the applicability
+    rule that excused it; an undeclared skip is an unanswered question, and an unanswered question
+    blocks completion.
+    """
+    statuses = {c.status for c in checks}
+    if FAILED in statuses:
+        return FAILED
+    if INCONCLUSIVE in statuses:
+        return INCONCLUSIVE
+    unjustified = [c for c in checks if c.status == SKIPPED and not (c.detail or "").startswith(INAPPLICABLE)]
+    if unjustified:
         return INCONCLUSIVE
     if PASSED in statuses:
         return PASSED
@@ -180,6 +265,34 @@ _SKIP_SUFFIXES = (
     ".pyc", ".pyo", ".so", ".log", ".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
     ".lock", ".tmp", ".swp", ".jsonl", ".coverage",
 )
+
+
+def workspace_binding_abandoned(root: Path, limit: Optional[int] = None) -> bool:
+    """Whether the tree is too large to bind, which is not the same as having nothing to bind.
+
+    `_workspace_inputs` returns an empty list both when a directory holds no eligible files and
+    when it holds too many — and the caller could not tell the difference, so a receipt over a
+    large tree looked bound while binding nothing. This repository has 6221 eligible files, so
+    every verification rooted at it fell into the second case with no indication.
+    """
+    return bool(root.is_dir()) and not _workspace_inputs(root, limit) and _eligible_file_count(root, (MAX_BOUND_WORKSPACE_FILES if limit is None else limit)) > 0
+
+
+def _eligible_file_count(root: Path, limit: int) -> int:
+    """Eligible files under `root`, counted no further than one past the limit."""
+    seen = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+            for name in filenames:
+                if name.endswith(_SKIP_SUFFIXES) or name.startswith("."):
+                    continue
+                seen += 1
+                if seen > limit:
+                    return seen
+    except OSError:
+        return seen
+    return seen
 
 
 def _workspace_inputs(root: Path, limit: Optional[int] = None) -> list[Path]:
@@ -328,6 +441,104 @@ class VerificationEngine:
                 _add(str(p), None)
         return out
 
+    # -- test evidence attestation -------------------------------------------------
+
+    def _workspace_code_trusted(self) -> bool:
+        """Whether a human has declared this workspace's code non-adversarial towards the verifier.
+
+        Read from the firewall's policy rather than from mission state, because it is a property
+        of the environment the runtime was pointed at, not something a mission can decide about
+        itself. Absent a firewall — the unit-test construction `VerificationEngine(None, state)` —
+        the answer is False, which is the fail-closed direction.
+        """
+        firewall = getattr(self.fabric, "firewall", None)
+        return bool(getattr(getattr(firewall, "config", None), "trust_workspace_code", False))
+
+    def _directory_under_test(self, cwd: Optional[str]) -> Optional[Path]:
+        if cwd:
+            return Path(cwd)
+        context = getattr(self.fabric, "context", None)
+        workdir = getattr(context, "workdir", None)
+        return Path(workdir) if workdir else None
+
+    def _trusted_report(self, run: Any, launched_at: float) -> tuple[Optional[dict[str, int]], list[str], set[str]]:
+        """Counts from the trusted run's report, or None plus the reasons it was refused.
+
+        A report is refused rather than read when it predates the run, changes while being read,
+        contradicts its own testcase elements, or describes a suite other than the one selected.
+        Each was reproduced as a false completion. Refusing it here means the run reaches
+        :func:`classify_test_run` with no report at all, which is already INCONCLUSIVE for a
+        framework that has a trusted path — nothing falls back to the weaker stdout evidence.
+        """
+        parsed, problems = read_report_once_settled(run.report, launched_at)
+        if parsed is None:
+            return None, problems, set()
+        problems = list(problems) + scope_problems(parsed, run.cwd, run.selection)
+        if problems:
+            return None, problems, set()
+        return dict(parsed.counts), [], parsed.passed_keys()
+
+    def _attest(
+        self,
+        outcome: TestRunOutcome,
+        run: Any,
+        report_counts: Optional[dict[str, int]],
+        report_problems: list[str],
+        passed_keys: set[str],
+    ) -> tuple[TestRunOutcome, EvidenceAuthority, str]:
+        """Decide how much authority a classified run carries, and downgrade it when it has none.
+
+        The engine cannot authenticate a report written by a process that imports the code under
+        test — not by choosing the filename, not by a nonce, not by hashing, not by a trusted
+        launcher, not from the exit code. Each was defeated in reproduction, and the strongest
+        case defeats all of them at once: a `conftest.py` hookwrapper that flips outcomes makes
+        the *genuine* runner write a genuine, well-formed, correctly located report whose contents
+        are false.
+
+        So authority does not come from the report. It comes from a question the workspace does
+        not get to answer by writing a file: **does this result depend on the implementation?**
+        A pass that survives the implementation being withheld was never a measurement of it.
+
+        A run that cannot be attested keeps its numbers as diagnosis and loses its status: it
+        becomes INCONCLUSIVE, so no criterion closes on it and nothing falls back silently to a
+        weaker kind of evidence.
+        """
+        untrusted = EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        if report_problems:
+            return (
+                replace(outcome, status=INCONCLUSIVE, reason="the runner report was refused: " + "; ".join(report_problems[:2])),
+                untrusted,
+                "; ".join(report_problems),
+            )
+        if run is None:
+            # No trusted path for this runner. `unittest` and `nose` cannot produce a report the
+            # engine asked for, so their output is stdout the code under test also writes to.
+            return outcome, untrusted, "no trusted verifier path for this runner"
+        if outcome.status != PASSED or report_counts is None or outcome.expected_zero:
+            # Nothing to attest: a failure is already a failure, and an authorized zero-execution
+            # contract asserts that nothing ran rather than that anything passed. The engine did
+            # observe the process, which is true and is not evidence about tests.
+            return outcome, EvidenceAuthority.PROCESS_OBSERVATION, ""
+        if not self._workspace_code_trusted():
+            # Fail closed. The run happened, the report is the runner's own, and the differential
+            # control may even have corroborated it — none of which establishes that the code
+            # imported into the reporting process was not targeting that process. This runtime has
+            # no boundary that would establish it, so the result is capped below the behavioural
+            # floor and the criterion stays open rather than being labelled PASSED.
+            return (
+                replace(outcome, status=INCONCLUSIVE, reason="same-process verification: the code under test ran inside the process that reported on it, and this runtime cannot establish that it did not interfere"),
+                EvidenceAuthority.PROCESS_OBSERVATION,
+                "workspace code is not declared non-adversarial (governance.trust_workspace_code is False)",
+            )
+        control = differential_control(cwd=run.cwd, selection=run.selection, passed_keys=passed_keys)
+        if control.attested:
+            return outcome, EvidenceAuthority.TRUSTED_HARNESS, control.reason
+        return (
+            replace(outcome, status=INCONCLUSIVE, reason="not attested: " + control.reason),
+            untrusted,
+            f"{control.reason}{': ' + control.detail if control.detail else ''}",
+        )
+
     def verify_code(
         self,
         commands: Optional[list[str]] = None,
@@ -371,6 +582,7 @@ class VerificationEngine:
         guard = InputVersionGuard([p for p, _ in relevant])
         before = guard.snapshot()
         action_ids: list[str] = []
+        run_authorities: list[str] = []
 
         for cmd in commands:
             # Ask a recognised runner for a machine-readable report at a path *we* choose. Stdout
@@ -379,24 +591,35 @@ class VerificationEngine:
             # runner had to actually run to produce is the only attributable evidence. The path is
             # fresh per run, so it cannot be pre-written.
             framework = detect_framework(cmd)
-            report: Optional[Path] = None
-            run_cmd = cmd
-            if framework == "pytest":
-                report = Path(tempfile.gettempdir()) / f"cogos-junit-{new_id('rep')}.xml"
-                run_cmd = f"{cmd} --junitxml={shlex.quote(str(report))}"
-            # Recorded as declared: the report argument is runtime instrumentation pointing at a
-            # temp path that will not exist later, and `report_backed` answers the question it
-            # would otherwise be standing in for.
+            under_test = self._directory_under_test(cwd)
+            # The trusted verifier path. For a framework the engine has one for, the model-authored
+            # command is *not* executed: the engine builds the invocation itself — its own
+            # interpreter, its own flags, its own config file outside the workspace, plugin
+            # autoloading off, a scrubbed environment, the workspace off the import path, no shell,
+            # and an evidence destination in a private directory that did not exist beforehand.
+            # Measured: that neutralises the `pytest.py` shadow, `addopts = -p <plugin>` in the
+            # workspace ini and `PYTEST_ADDOPTS` in the ambient environment at the source. The plan
+            # still chooses the *selection*, which is validated against the tree and checked back
+            # against the report's identities.
+            run = None
+            if framework in REPORTING_FRAMEWORKS and under_test is not None:
+                run = build_trusted_run(cwd=under_test, selection=harness_selection(cmd, under_test))
             shell_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}" if cwd else cmd
-            executed = f"cd {shlex.quote(str(cwd))} && {run_cmd}" if cwd else run_cmd
-            res = self.fabric.execute(ToolCall(tool="run_tests", arguments={"command": executed}, task_id=task_id, purpose="verification"))
+            launched_at = time.time()
+            if run is not None:
+                # argv, not a command string: with no shell there is no expansion, no substitution
+                # and no redirection for the plan's text to reach through.
+                call_args: dict[str, object] = {"argv": list(run.argv), "cwd": str(run.cwd), "env": dict(run.env)}
+            else:
+                call_args = {"command": cmd}
+                if cwd:
+                    call_args["cwd"] = str(cwd)
+            res = self.fabric.execute(ToolCall(tool="run_tests", arguments=call_args, task_id=task_id, purpose="verification"))
             action_ids.append(res.call_id)
-            report_counts = junit_counts(report) if report is not None else None
-            if report is not None:
-                try:
-                    report.unlink()
-                except OSError:
-                    pass
+            if run is not None:
+                report_counts, report_problems, passed_keys = self._trusted_report(run, launched_at)
+            else:
+                report_counts, report_problems, passed_keys = None, [], set()
             # Totals come from the *classified* outcome below, not from the raw parse: a run whose
             # output was unattributable has its counts discarded, and the human-readable summary
             # must not still report the numbers that were thrown away.
@@ -408,14 +631,22 @@ class VerificationEngine:
                     exit_code=res.data.get("exit_code"),
                     counts=res.data.get("counts") or {},
                     report_counts=report_counts,
-                    report_required=framework == "pytest",
+                    # Every framework the parser recognises must back its counts with a report from
+                    # the engine's own invocation. `unittest` and `nose` have no trusted path, so
+                    # their output is stdout the code under test also writes to — not a weaker kind
+                    # of evidence, not evidence. Reproduced: `python -m unittest discover` with a
+                    # test module printing `3 passed in 0.05s` (unittest writes its own report to
+                    # stderr) satisfied a criterion and passed the completion gate over an
+                    # implementation returning 999.0.
+                    report_required=framework in KNOWN_FRAMEWORKS,
                     output=res.output or "",
-                    # The declared command, not the shell_cmd: the `cd <cwd> &&` prefix is added by
-                    # this runtime and is trusted, while everything in `cmd` came from the plan and
-                    # is what the attributability check is about.
                     command=cmd,
                     expect_zero=expect_zero_tests,
                 )
+            outcome, authority, attestation = self._attest(outcome, run, report_counts, report_problems, passed_keys)
+            run_authorities.append(authority.value)
+            if run is not None:
+                run.dispose()
             for key, value in (("passed", outcome.passed), ("failed", outcome.failed), ("error", outcome.errors), ("skipped", outcome.skipped)):
                 test_totals[key] += int(value)
             detail = f"{outcome.reason}: {res.data.get('summary') or res.error or ''}".strip(": ")
@@ -437,6 +668,8 @@ class VerificationEngine:
                     outcome_reason=outcome.reason,
                     expected_zero=outcome.expected_zero,
                     report_backed=report_counts is not None,
+                    authority=authority.value,
+                    attestation=attestation,
                 )
             )
 
@@ -456,11 +689,24 @@ class VerificationEngine:
                 InputVersion(path=key, content_hash=after.get(key, ""), artifact_id=aid, changed_during_verification=key in moved)
             )
         moved &= declared_paths
+        if under_test is not None and workspace_binding_abandoned(under_test):
+            # Nothing can be re-checked later, so nothing here may close a criterion. Recorded as
+            # an authoritative inconclusive rather than passed-with-a-caveat: a receipt that names
+            # no bytes is not a weaker proof, it is not a proof.
+            checks.append(
+                VerificationCheck(
+                    name="input_binding",
+                    status=INCONCLUSIVE,
+                    detail=f"the directory under test holds more than {MAX_BOUND_WORKSPACE_FILES} eligible files, so the run's inputs were not bound and cannot be re-checked",
+                    authoritative=True,
+                )
+            )
         status = _aggregate(checks)
         if moved:
             # The bytes moved underneath the run, so no single coherent version was observed.
             status = INCONCLUSIVE
             checks.append(VerificationCheck(name="input_stability", status=INCONCLUSIVE, detail="inputs changed during verification: " + ", ".join(sorted(moved)[:3]), authoritative=True))
+        best = max([authority_of(a) for a in run_authorities] or [EvidenceAuthority.UNTRUSTED_SELF_REPORT], key=lambda a: list(EvidenceAuthority).index(a))
         n_pass = sum(1 for c in checks if c.status == PASSED)
         n_fail = sum(1 for c in checks if c.status == FAILED)
         n_inc = len(checks) - n_pass - n_fail
@@ -477,6 +723,7 @@ class VerificationEngine:
                 summary=summary,
                 checks=checks,
                 input_versions=input_versions,
+                authority=best.value,
                 produced_by_task_id=task_id,
                 produced_by_action_ids=action_ids,
             )
@@ -674,8 +921,24 @@ class VerificationEngine:
                 checks.append(VerificationCheck(name="hash", status=PASSED, detail=f"sha256 {content_hash} (changed since it was verified at {previous[:12]}…; re-checked)"))
             else:
                 checks.append(VerificationCheck(name="hash", status=PASSED, detail=f"sha256 {content_hash}"))
+        # A declared expectation is the only thing that makes this a check about *content*. It has
+        # to be declared in advance — an expectation invented after reading the file would be
+        # satisfied by whatever the file happens to say.
+        content_checked = False
+        if path is not None and path.is_file() and artifact.expectation is not None:
+            for check in _expectation_checks(artifact.expectation, path):
+                checks.append(check)
+            content_checked = True
         status = _aggregate(checks)
         artifact.verified = status == PASSED
+        # Exactly what passed, recorded next to the boolean that says it passed. `verified` on its
+        # own reads as a claim about the deliverable; without an expectation what was established
+        # is that a path resolved to a regular non-empty file whose bytes hash to H, which a
+        # 20-byte `TODO: write this up` satisfies identically to a finished report.
+        scope = ""
+        if artifact.verified:
+            scope = EXISTENCE_SCOPE + (f"+{CONTENT_SCOPE}" if content_checked else "")
+        artifact.verified_scope = scope
         # The hash the artifact was verified *at* is what later integrity checks compare against,
         # so a file that is deleted or edited after this point stops counting as verified.
         artifact.verified_hash = artifact.content_hash if artifact.verified else None
@@ -726,6 +989,41 @@ class VerificationEngine:
         ]
         return versions, actions
 
+    def _criterion_authority(self, criterion: SuccessCriterion, status: VerificationStatus) -> EvidenceAuthority:
+        """The strongest authority behind this criterion, or the weakest when nothing backs it."""
+        if status != PASSED:
+            return EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        levels = [authority_of(t.authority) for t in self.state.tests if self._test_addresses(t, criterion.id) and t.status == PASSED]
+        levels += [
+            EvidenceAuthority.PROCESS_OBSERVATION
+            for a in self.state.artifacts
+            if a.verified and CONTENT_SCOPE in (a.verified_scope or "") and token_overlap(criterion.description, f"{a.name} {a.summary}") >= TOKEN_OVERLAP_THRESHOLD
+        ]
+        if not levels:
+            return EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        return max(levels, key=lambda a: list(EvidenceAuthority).index(a))
+
+    def _test_attested(self, record: TestRecord) -> bool:
+        """Whether this record is allowed to close a criterion.
+
+        `engine_attested` means the engine re-ran the command itself against a copy of the
+        workspace with the implementation withheld and every passing test stopped passing. That
+        is the strongest statement available here, and it is a sensitivity check rather than a
+        security boundary: an adversary who models the control and answers the two runs
+        differently defeats it. It is not authentication of the report, which is not obtainable
+        while the reporting process imports the code under test.
+
+        Everything else closes nothing, **including a record with no authority at all**. The
+        permissive reading was tempting — "written before authority existed, keep the older
+        guarantee" — and it is wrong here: an absent field is indistinguishable from a stripped
+        one and from a record produced under the rules this repair replaced, and those rules
+        admitted forged passes. Three permissive defaults already compose into a false completion
+        in this codebase, so the weakest reading is the only one that does not reopen them. The
+        cost is that a mission resumed from a pre-repair snapshot must re-run its verification;
+        the state still loads, and the records are still there as diagnosis.
+        """
+        return at_least(getattr(record, "authority", ""))
+
     @staticmethod
     def _test_executed_something(record: TestRecord) -> bool:
         """Did this record observe a required test actually run?
@@ -769,7 +1067,7 @@ class VerificationEngine:
             # Scope binds the proof to the claim. A passing suite demonstrates something about the
             # criteria it was *run for*; without that link any unrelated green run would satisfy
             # any criterion whose method happens to mention tests.
-            fresh = [
+            scoped = [
                 t
                 for t in self.state.tests
                 if t.status == PASSED
@@ -778,6 +1076,11 @@ class VerificationEngine:
                 and self._test_addresses(t, criterion.id)
                 and self._test_executed_something(t)
             ]
+            # Scope says the run was about this criterion; authority says the run proved anything
+            # at all. A self-reported pass — one the engine's differential control could not show
+            # to depend on the implementation — is kept as diagnosis and closes nothing.
+            fresh = [t for t in scoped if self._test_attested(t)]
+            unattested = [t for t in scoped if not self._test_attested(t)]
             unbound = [
                 t
                 for t in self.state.tests
@@ -785,6 +1088,15 @@ class VerificationEngine:
             ]
             if fresh:
                 checks.append(VerificationCheck(name="tests", status=PASSED, detail=f"{len(fresh)} passed test record(s) bound to this criterion and newer than it: " + ", ".join(t.name for t in fresh[:3])))
+            elif unattested:
+                checks.append(
+                    VerificationCheck(
+                        name="tests",
+                        status=FAILED,
+                        detail=f"{len(unattested)} passing test record(s) are scoped to this criterion but none is attested: "
+                        + "; ".join(f"{t.name} ({t.attestation or 'self-reported'})" for t in unattested[:2]),
+                    )
+                )
             elif unbound:
                 checks.append(VerificationCheck(name="tests", status=FAILED, detail=f"{len(unbound)} passing test record(s) exist but none is scoped to this criterion; an unrelated suite is not proof of it"))
             else:
@@ -792,8 +1104,26 @@ class VerificationEngine:
 
         if "artifact" in method:
             matches = [a for a in self.state.artifacts if a.verified and token_overlap(criterion.description, f"{a.name} {a.summary}") >= TOKEN_OVERLAP_THRESHOLD]
-            if matches:
-                checks.append(VerificationCheck(name="artifact", status=PASSED, detail="verified artifact(s): " + ", ".join(a.name for a in matches[:3])))
+            # What `verify_artifact` establishes without a declared expectation is that a path
+            # resolved to a regular non-empty file whose bytes hash to H. Reproduced: a 20-byte
+            # `TODO: write this up` closed a criterion demanding a written analysis, producing an
+            # outcome byte-for-byte indistinguishable from the finished deliverable. Existence is
+            # therefore not criterion satisfaction; an artifact closes a criterion only when the
+            # mission declared, in advance, what its content has to be, and the engine checked it.
+            checked = [a for a in matches if CONTENT_SCOPE in (a.verified_scope or "")]
+            if checked:
+                checks.append(VerificationCheck(name="artifact", status=PASSED, detail="verified against a declared content expectation: " + ", ".join(a.name for a in checked[:3])))
+            elif matches:
+                checks.append(
+                    VerificationCheck(
+                        name="artifact",
+                        status=INCONCLUSIVE,
+                        detail="artifact(s) "
+                        + ", ".join(a.name for a in matches[:3])
+                        + " were verified to exist, be non-empty and match a recorded hash; no content expectation was declared, so nothing was checked about what is in them",
+                        authoritative=True,
+                    )
+                )
             else:
                 checks.append(VerificationCheck(name="artifact", status=FAILED, detail="no verified artifact mentions the criterion"))
 
@@ -832,6 +1162,7 @@ class VerificationEngine:
             checks=checks,
             evidence_ids=sorted(set(evidence_ids)),
             input_versions=supporting,
+            authority=self._criterion_authority(criterion, status).value,
             produced_by_action_ids=actions,
         )
         # Only a passing record is citable evidence. A failed or inconclusive attempt is still
@@ -910,7 +1241,13 @@ class VerificationEngine:
                     continue
                 sub = self.verify_artifact(artifact)
                 evidence_ids.append(sub.id)
-                checks.append(VerificationCheck(name=f"artifact:{artifact.name}", status=sub.status, detail=sub.summary))
+                # A task "verified" by a file being present is a task whose output exists. Recorded
+                # as inconclusive unless a declared content expectation was checked, because a
+                # 5-byte placeholder otherwise produced a PASSED task receipt that then counted as
+                # substantive grounding for a model judgement.
+                scoped = sub.status if CONTENT_SCOPE in (artifact.verified_scope or "") else (INCONCLUSIVE if sub.status == PASSED else sub.status)
+                detail = sub.summary if scoped == sub.status else f"{sub.summary}; existence only, no declared content expectation to check"
+                checks.append(VerificationCheck(name=f"artifact:{artifact.name}", status=scoped, detail=detail))
             summary = f"{len(task.artifact_ids)} artifact(s): {_counts(checks)}"
         else:
             checks.append(VerificationCheck(name="output", status=INCONCLUSIVE, detail="no verifiable output declared"))
@@ -1013,7 +1350,29 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
     elif intact:
         checks.append(VerificationCheck(name="artifact_integrity", status=PASSED, detail=f"all {len(intact)} verified artifacts still match their recorded hash"))
     else:
-        checks.append(VerificationCheck(name="artifact_integrity", status=SKIPPED, detail="no verified artifacts to re-check"))
+        # Applicability rule: this check asks whether artifacts still presented as verified still
+        # have the bytes they were verified against. With none presented there is nothing to ask —
+        # unless a criterion was closed by an artifact receipt, in which case an empty set
+        # contradicts the mission's own record and is a finding, not an absence.
+        artifact_backed = [
+            c.id
+            for c in state.success_criteria
+            if c.satisfied
+            for r in receipts(c)
+            for chk in r.checks
+            if chk.name == "artifact" and chk.status == PASSED
+        ]
+        if artifact_backed:
+            checks.append(
+                VerificationCheck(
+                    name="artifact_integrity",
+                    status=FAILED,
+                    detail=f"{len(artifact_backed)} criterion(s) were closed by an artifact receipt but no artifact is currently verified",
+                )
+            )
+            missing.append(f"{len(artifact_backed)} criterion(s) rest on an artifact receipt with no verified artifact behind it")
+        else:
+            checks.append(VerificationCheck(name="artifact_integrity", status=SKIPPED, detail=f"{INAPPLICABLE}: no artifact is presented as verified and no criterion was closed by an artifact receipt"))
 
     required = list(state.resources.get("required_artifacts", []) or [])
     if required:
@@ -1046,7 +1405,11 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
         else:
             checks.append(VerificationCheck(name="required_artifacts", status=PASSED, detail=f"all {len(required)} required artifacts verified and intact"))
     else:
-        checks.append(VerificationCheck(name="required_artifacts", status=SKIPPED, detail="no required artifacts declared"))
+        # Applicability rule: this check asks whether every declared deliverable exists, is
+        # verified and is intact. It is inapplicable only when the compiled mission declares no
+        # deliverable — and compilation now populates that deterministically, so an empty list
+        # means the mission genuinely asked for none rather than that nobody filled the field in.
+        checks.append(VerificationCheck(name="required_artifacts", status=SKIPPED, detail=f"{INAPPLICABLE}: the compiled mission declares no required deliverable"))
 
     # A receipt proves something about the bytes it was produced against. Before accepting one at
     # completion, re-read those inputs: if they have moved, the receipt still describes what it
@@ -1099,9 +1462,15 @@ def mission_completion_check(state: MissionState) -> VerificationResult:
             )
         )
 
-    status = _aggregate(checks)
+    status = _gate_aggregate(checks)
     if status == PASSED:
         summary = "all completion gates satisfied"
     else:
+        if not missing:
+            missing = [
+                f"'{c.name}' did not run and did not say why it does not apply"
+                for c in checks
+                if c.status == SKIPPED and not (c.detail or "").startswith(INAPPLICABLE)
+            ] or [f"inconclusive: {c.name} ({c.detail[:80]})" for c in checks if c.status == INCONCLUSIVE]
         summary = "completion blocked: " + " | ".join(missing) if missing else f"completion not confirmed: {_counts(checks)}"
     return VerificationResult(target_type="mission", target_id=state.mission_id, status=status, summary=summary, checks=checks)

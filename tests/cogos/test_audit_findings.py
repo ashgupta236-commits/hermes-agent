@@ -21,7 +21,7 @@ from cogos.evaluation.skill_runner import MeasuredSkillRunner
 from cogos.evaluation.support import Sandbox
 from cogos.observability.ledger import ResourceLedger
 from cogos.schemas.common import VerificationStatus as VS
-from cogos.schemas.mission import Artifact, Budget, CandidateSkill, MissionState, ResourceUsage, SuccessCriterion
+from cogos.schemas.mission import ArtifactExpectation, Artifact, Budget, CandidateSkill, MissionState, ResourceUsage, SuccessCriterion
 from cogos.schemas.verification import VerificationResult, cite
 from cogos.verification.engine import VerificationEngine, artifact_integrity, mission_completion_check
 
@@ -54,7 +54,12 @@ def test_deleting_a_verified_artifact_blocks_completion():
         path = Path(d) / "report.txt"
         path.write_text("market analysis findings", encoding="utf-8")
         state = MissionState(objective="Deliver market analysis report")
-        artifact = Artifact(name="market analysis report", path=str(path), summary="market analysis report")
+        artifact = Artifact(
+            name="market analysis report",
+            path=str(path),
+            summary="market analysis report",
+            expectation=ArtifactExpectation(must_contain=["findings"], must_not_contain=["TODO"]),
+        )
         state.artifacts.append(artifact)
         state.resources["required_artifacts"] = [artifact.id]
         criterion = SuccessCriterion(description="market analysis report", verification_method="artifact")
@@ -218,7 +223,12 @@ def test_the_same_judgement_is_accepted_when_real_material_backs_it():
         state = MissionState(objective="Produce a correct report", executive_model=sb.config.executive.model)
         criterion = SuccessCriterion(description="The report is correct", verification_method="independent reviewer judgment")
         state.success_criteria.append(criterion)
-        artifact = Artifact(name="report.md", path=str(report_path), summary="the report")
+        artifact = Artifact(
+            name="report.md",
+            path=str(report_path),
+            summary="the report",
+            expectation=ArtifactExpectation(must_contain=["conclusions"], must_not_contain=["TODO"]),
+        )
         state.artifacts.append(artifact)
         engine = VerificationEngine(sb.runtime.fabric, state)
         engine.verify_artifact(artifact)

@@ -72,7 +72,19 @@ def run_demo(adapter: Optional[str] = None, objective: Optional[str] = None, max
     adapter_name = adapter or "scripted"
     workdir = Path(tempfile.mkdtemp(prefix="cogos-demo-"))
     make_demo_workspace(workdir)
-    cfg = CogosConfig(home=Path(home) if home else workdir / ".cogos", repo_root=workdir, executive=ExecutiveConfig(adapter=adapter_name), trace_to_stdout=verbose)
+    # The demo workspace is created by `make_demo_workspace` and filled in by the scripted
+    # engineer above, so its code is not adversarial towards the verifier and saying so is true.
+    # The production default is False: a workspace whose code came from somewhere else has to have
+    # that declaration made for it, deliberately.
+    from cogos.config import GovernanceConfig
+
+    cfg = CogosConfig(
+        home=Path(home) if home else workdir / ".cogos",
+        repo_root=workdir,
+        executive=ExecutiveConfig(adapter=adapter_name),
+        governance=GovernanceConfig(trust_workspace_code=adapter_name == "scripted"),
+        trace_to_stdout=verbose,
+    )
     cfg.executive.adapter = adapter_name
     exec_adapter = ScriptedExecutive(policies={"specialist": scripted_engineer(workdir)}) if adapter_name == "scripted" else None
     rt = Runtime(cfg, adapter=exec_adapter, stdout_trace=verbose)

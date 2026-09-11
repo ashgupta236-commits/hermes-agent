@@ -13,7 +13,7 @@ from cogos.ids import iso_now
 from cogos.schemas.beliefs import Claim, ClaimStatus, Contradiction, Evidence, EvidenceKind
 from cogos.schemas.common import ActionClass, Provenance, VerificationStatus
 from cogos.schemas.decisions import Decision
-from cogos.schemas.mission import Artifact, BlockedOperation, HumanRequest, MissionState, SuccessCriterion, Task, TaskStatus
+from cogos.schemas.mission import ArtifactExpectation, Artifact, BlockedOperation, HumanRequest, MissionState, SuccessCriterion, Task, TaskStatus
 from cogos.schemas.mission import TestRecord as _TestRecord  # aliased so pytest does not try to collect it
 from cogos.simulation import Option, Outcome, Scenario, simulate
 from cogos.tools import build_default_fabric
@@ -30,7 +30,11 @@ def _state() -> MissionState:
 
 
 def _fabric(tmp_path):
-    return build_default_fabric(CapabilityFirewall(GovernanceConfig(), tmp_path), ToolContext(tmp_path))
+    # These fixtures are workspaces this file writes, so declaring their code non-adversarial
+    # towards the verifier is true of them. The production default is False — see
+    # `GovernanceConfig.trust_workspace_code` — and `test_trust_boundary.py` covers that default
+    # and every attack that runs *despite* this declaration.
+    return build_default_fabric(CapabilityFirewall(GovernanceConfig(trust_workspace_code=True), tmp_path), ToolContext(tmp_path))
 
 
 def _evidence(summary: str, source: str, lineage: list[str] | None = None, **kw) -> Evidence:
@@ -47,7 +51,8 @@ def _check(result: VerificationResult, name: str):
 
 
 def test_verify_code_runs_real_pytest(tmp_path):
-    (tmp_path / "test_ok.py").write_text("def test_pass():\n    assert 1 + 1 == 2\n", encoding="utf-8")
+    (tmp_path / "arith.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (tmp_path / "test_ok.py").write_text("from arith import add\n\n\ndef test_pass():\n    assert add(1, 1) == 2\n", encoding="utf-8")
     state = _state()
     engine = VerificationEngine(_fabric(tmp_path), state)
     cmd = f"{sys.executable} -m pytest -q test_ok.py"
@@ -217,7 +222,10 @@ def test_verify_criterion_test_gating():
     unbound = engine.verify_criterion(criterion)
     assert unbound.status == FAILED and criterion.satisfied is False
 
-    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id]))
+    # Scope *and* authority: a record has to be bound to the criterion and to have been produced
+    # through the engine's trusted path. An unlabelled record deserialises to the weakest level
+    # and closes nothing, so a fixture standing in for a real attested run has to say so.
+    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id], authority="trusted_harness"))
     again = engine.verify_criterion(criterion)
     assert again.status == PASSED
     assert criterion.satisfied is True
@@ -234,7 +242,14 @@ def test_verify_criterion_artifact_and_evidence_methods(tmp_path):
     state = _state()
     path = tmp_path / "pricing_report.md"
     path.write_text("data", encoding="utf-8")
-    artifact = Artifact(name="pricing report", path=str(path), summary="pricing analysis for the launch")
+    # Declared before the file is read: without an expectation `verified` is an integrity claim,
+    # and a placeholder would satisfy the criterion identically to the finished deliverable.
+    artifact = Artifact(
+        name="pricing report",
+        path=str(path),
+        summary="pricing analysis for the launch",
+        expectation=ArtifactExpectation(min_bytes=4, must_not_contain=["TODO"]),
+    )
     state.artifacts.append(artifact)
     engine = VerificationEngine(None, state)
     criterion = SuccessCriterion(description="Deliver the pricing report", verification_method="artifact exists")
@@ -309,7 +324,8 @@ def test_verify_decision_with_simulation():
 
 
 def test_verify_task_dispatch(tmp_path):
-    (tmp_path / "test_t.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
+    (tmp_path / "thing.py").write_text("def x():\n    return True\n", encoding="utf-8")
+    (tmp_path / "test_t.py").write_text("from thing import x\n\n\ndef test_x():\n    assert x()\n", encoding="utf-8")
     state = _state()
     engine = VerificationEngine(_fabric(tmp_path), state)
 
@@ -350,7 +366,10 @@ def test_mission_completion_gate_refuses_until_verified(tmp_path):
     assert _check(mission_completion_check(state), "success_criteria").status == FAILED
 
     # Bound to the criterion it is offered as proof of (incident F2: scope binding).
-    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id]))
+    # Scope *and* authority: a record has to be bound to the criterion and to have been produced
+    # through the engine's trusted path. An unlabelled record deserialises to the weakest level
+    # and closes nothing, so a fixture standing in for a real attested run has to say so.
+    state.tests.append(_TestRecord(name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id], authority="trusted_harness"))
     engine.verify_criterion(criterion)
     assert mission_completion_check(state).status == PASSED
 

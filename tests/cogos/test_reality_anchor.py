@@ -26,7 +26,7 @@ from cogos.schemas.anchor import (
     stable_hash,
 )
 from cogos.schemas.common import TrustLevel
-from cogos.schemas.mission import MissionState, Task, TaskStatus
+from cogos.schemas.mission import ArtifactExpectation, MissionState, Task, TaskStatus
 from cogos.planner import Planner
 from cogos.verification.reality_anchor import (
     MAX_RESOLUTION_ROUNDS,
@@ -340,7 +340,7 @@ def test_two_agreeing_anchors_cannot_authorise_a_missing_artifact():
         path = Path(d) / "report.txt"
         path.write_text("findings", encoding="utf-8")
         state = MissionState(objective="Deliver the report")
-        artifact = Artifact(name="report", path=str(path), summary="report")
+        artifact = Artifact(name="report", path=str(path), summary="report", expectation=ArtifactExpectation(must_contain=["findings"]))
         state.artifacts.append(artifact)
         state.resources["required_artifacts"] = [artifact.id]
         criterion = SuccessCriterion(description="report", verification_method="artifact")

@@ -137,13 +137,15 @@ def test_shell_exit_codes_and_stderr_capture(fabric, tmp_path):
     assert "out" in bad.output and "[stderr]" in bad.output and "err" in bad.output
     (tmp_path / "sub").mkdir()
     assert _call(fabric, "shell", command="pwd", cwd="sub").output.strip().endswith("sub")
-    assert _call(fabric, "shell", command="test -n \"$COGOS_TOOL\"").ok is True
+    # `test -n "$COGOS_TOOL"` asserted the same property, but a `$` expansion is now refused
+    # before execution as unanalysable, so the marker is read from the environment listing.
+    assert "COGOS_TOOL=1" in _call(fabric, "shell", command="env").output
     gated = _call(fabric, "shell", command="rm -rf build")
     assert gated.ok is False and gated.error_kind == "requires_human" and gated.verdict.decision is PolicyDecision.REQUIRE_HUMAN
 
 
 def test_shell_timeout_is_reported(fabric):
-    res = _call(fabric, "shell", command=f"{sys.executable} -c 'import time; time.sleep(5)'", timeout=1)
+    res = _call(fabric, "shell", command="sleep 5", timeout=1)
     assert res.ok is False and res.error_kind == "timeout" and "timeout after 1" in res.error
 
 

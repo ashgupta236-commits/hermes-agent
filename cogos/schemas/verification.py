@@ -61,6 +61,10 @@ class VerificationResult(BaseModel):
         description="Relevant input versions this receipt was produced against. Empty on records "
         "written before version binding existed, which the gate treats as 'unknown', never as 'unchanged'.",
     )
+    #: The highest evidence authority anything in this receipt reaches. Deserialises **down**:
+    #: an absent value is `untrusted_self_report`, because a missing field is indistinguishable
+    #: from a stripped one and from a receipt written under rules that admitted forged passes.
+    authority: str = ""
     produced_by_task_id: Optional[str] = None
     produced_by_action_ids: list[str] = Field(
         default_factory=list,

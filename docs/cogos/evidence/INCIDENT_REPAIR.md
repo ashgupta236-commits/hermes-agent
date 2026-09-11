@@ -379,3 +379,28 @@ cognition-cost question rather than an evidence-integrity one.
 **The reality anchor is still not live-validated.** It has never run in a live mission, because no
 live mission has reached a completion attempt. Nothing in this repair changes that, and it must not
 be reported as validated until it actually occurs.
+
+---
+
+# CORRECTION — appended, not edited
+
+Everything above is left as written, including the parts that are wrong, because the record of what
+was believed is itself evidence. The corrections are here.
+
+A bounded trust-boundary investigation after this repair reproduced **twelve complete false
+completions** against the pipeline it describes. Full account: [`TRUST_BOUNDARY.md`](TRUST_BOUNDARY.md).
+
+1. **The central claim of this document is false.** "A report at a path the engine chose cannot be
+   produced by a runner that never ran" — the path is handed to the child in its own argv, the child
+   runs as the same uid, and it can write there. A workspace `pytest.py` reading `--junitxml=` out of
+   `sys.argv` carried `add_percent(100, 10) == 999.0` to a PASSED completion gate. The generalisation:
+   **any process that imports the code under test can author that process's own report, stdout and
+   exit status**, and no attribute of the report distinguishes the honest case.
+2. **This repair introduced a regression.** `report_backed` suppressed the multi-summary ambiguity
+   guard, so an attacker who fabricated a report was strictly better off than one who did not.
+3. **The `unittest` / `nose` branch was reachable, and inverted.** It accepted forged stdout and
+   rejected genuine runs. The dismissal at item 9 above ("those runners are simply not used here")
+   was a statement about habit, not a control — the command is model-authored.
+4. **"Repair complete" was wrong**, and so was treating Live Run #3 as ready.
+5. **Skipped CI is not executed validation**, and the 562-test figure is `tests/cogos` only —
+   repository-wide execution has never been run.

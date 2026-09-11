@@ -85,7 +85,11 @@ BROKEN_CALC = '''def add_percent(value: float, percent: float) -> float:
 
 
 def _fabric(root: Path):
-    return build_default_fabric(CapabilityFirewall(GovernanceConfig(), root), ToolContext(root))
+    # These fixtures are workspaces this file writes, so declaring their code non-adversarial
+    # towards the verifier is true of them. The production default is False — see
+    # `GovernanceConfig.trust_workspace_code` — and `test_trust_boundary.py` covers that default
+    # and every attack that runs *despite* this declaration.
+    return build_default_fabric(CapabilityFirewall(GovernanceConfig(trust_workspace_code=True), root), ToolContext(root))
 
 
 def _perform(sb: Sandbox, state: MissionState, decision: StepDecision, task: Task | None):
@@ -315,7 +319,7 @@ def test_f2_explicitly_preauthorized_expected_zero_is_honoured(tmp_path):
     state = MissionState(objective="expected zero")
     engine = VerificationEngine(_fabric(tmp_path), state)
 
-    res = engine.verify_code([f'{sys.executable} -c "print(1)"'], cwd=str(tmp_path), expect_zero_tests=True)
+    res = engine.verify_code(["echo no tests to run"], cwd=str(tmp_path), expect_zero_tests=True)
 
     assert res.status == PASSED, f"a pre-authorized expected-zero run may pass: {res.summary}"
 
@@ -751,7 +755,7 @@ def test_f2b_an_authorized_expected_zero_run_still_does_not_prove_a_criterion(tm
     task = Task(title="expected zero", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
     state.tasks.append(task)
 
-    code = engine.verify_code([f'{sys.executable} -c "print(1)"'], cwd=str(tmp_path), task_id=task.id, expect_zero_tests=True)
+    code = engine.verify_code(["echo no tests to run"], cwd=str(tmp_path), task_id=task.id, expect_zero_tests=True)
     assert code.status == PASSED, "the contract authorized a zero-execution run"
 
     res = engine.verify_criterion(crit)
@@ -998,7 +1002,13 @@ def test_r1b_disabling_shell_also_disables_the_test_runner(tmp_path):
     verdict = fw.check(ToolCall(tool="run_tests", arguments={"command": "python -m pytest -q"}), ToolSpec(name="run_tests", description="", substrate="tests"))
 
     assert verdict.decision is PolicyDecision.DENY
-    assert "shell execution disabled" in verdict.reason
+    assert "process execution disabled" in verdict.reason
+
+    # ...and so is git, which is a process spawner in its own right: aliases, hooks, `core.pager`,
+    # `core.sshCommand` and credential helpers all run arbitrary programs. Gating only the two
+    # substrates named after shells left the third one open.
+    git_verdict = fw.check(ToolCall(tool="git", arguments={"args": ["status"]}), ToolSpec(name="git", description="", substrate="git"))
+    assert git_verdict.decision is PolicyDecision.DENY
 
 
 def test_r5_a_specialist_cannot_launder_an_arbitrary_path_into_the_ledger():
@@ -1073,7 +1083,7 @@ def test_g4_an_unrelated_passing_test_does_not_ground_a_judgement_about_a_criter
         state.tests.append(_TR(name="some other suite", status=PASSED, ran_at=iso_now(), counts={"passed": 3}, executed=3))
         assert sb.runtime.executive._judgment_grounding(state, crit) == [], "an unrelated suite grounds nothing"
 
-        state.tests.append(_TR(name="payments suite", status=PASSED, ran_at=iso_now(), criterion_ids=[crit.id], counts={"passed": 3}, executed=3))
+        state.tests.append(_TR(name="payments suite", status=PASSED, ran_at=iso_now(), criterion_ids=[crit.id], counts={"passed": 3}, executed=3, authority="trusted_harness"))
         grounding = sb.runtime.executive._judgment_grounding(state, crit)
         assert any("payments suite" in g for g in grounding), "a bound suite does ground it"
     finally:
@@ -1103,7 +1113,8 @@ def test_every_persisted_schema_field_has_a_default_so_stored_missions_stay_load
 def test_scope_frozen_on_the_record_cannot_be_retro_claimed_by_editing_the_task(tmp_path):
     """A record that carries its own scope is the whole answer. Re-resolving through the task
     would let a criterion be claimed by editing the task after the outcome was known."""
-    _write(tmp_path, "test_unrelated.py", "def test_u():\n    assert True\n")
+    _write(tmp_path, "unrelated.py", "def value():\n    return 7\n")
+    _write(tmp_path, "test_unrelated.py", "from unrelated import value\n\n\ndef test_u():\n    assert value() == 7\n")
     state = MissionState(objective="retro-claim")
     engine = VerificationEngine(_fabric(tmp_path), state)
     target = SuccessCriterion(description="the payments module rounds correctly", verification_method="pytest tests pass")
@@ -1131,7 +1142,7 @@ def test_an_authorized_expected_zero_run_cannot_be_chained_into_completion(tmp_p
     task = Task(title="cheap", status=TaskStatus.DONE, addresses_criterion_ids=[crit.id])
     state.tasks.append(task)
 
-    assert engine.verify_code([f'{sys.executable} -c "print(1)"'], cwd=str(tmp_path), task_id=task.id, expect_zero_tests=True).status == PASSED
+    assert engine.verify_code(["echo no tests to run"], cwd=str(tmp_path), task_id=task.id, expect_zero_tests=True).status == PASSED
     engine.verify_criterion(crit)
 
     assert not crit.satisfied
@@ -1197,13 +1208,15 @@ def test_ver1b_legitimate_simple_runner_commands_still_pass_and_fail_correctly(t
     """The attributability rule must not break ordinary verification."""
     good = tmp_path / "good"
     good.mkdir()
-    _write(good, "test_ok.py", "def test_ok():\n    assert True\n")
+    _write(good, "impl.py", "def ok():\n    return True\n")
+    _write(good, "test_ok.py", "from impl import ok\n\n\ndef test_ok():\n    assert ok()\n")
     state = MissionState(objective="ok")
     assert VerificationEngine(_fabric(good), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(good)).status == PASSED
 
     bad = tmp_path / "bad"
     bad.mkdir()
-    _write(bad, "test_bad.py", "def test_bad():\n    assert False\n")
+    _write(bad, "impl.py", "def ok():\n    return False\n")
+    _write(bad, "test_bad.py", "from impl import ok\n\n\ndef test_bad():\n    assert ok()\n")
     state2 = MissionState(objective="bad")
     assert VerificationEngine(_fabric(bad), state2).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(bad)).status == FAILED
 
@@ -1389,7 +1402,7 @@ def test_test_runner_output_is_untrusted_and_scanned(tmp_path):
     _write(tmp_path, "test_x.py", "def test_p():\n    assert True\n")
     fabric = _fabric(tmp_path)
 
-    res = fabric.execute(ToolCall(tool="run_tests", arguments={"command": f"cd {tmp_path} && {sys.executable} -m pytest -q"}))
+    res = fabric.execute(ToolCall(tool="run_tests", arguments={"command": f"{sys.executable} -m pytest -q", "cwd": str(tmp_path)}))
 
     assert res.trust == TrustLevel.UNTRUSTED_EXTERNAL
     assert "ignore_previous" in res.injection_flags
@@ -1500,21 +1513,27 @@ def test_the_summary_reports_the_counts_that_were_kept(tmp_path):
 def test_a_shadowing_module_cannot_impersonate_the_test_runner(tmp_path):
     """The last and best forgery: a workspace module named `pytest.py` shadows the real runner
     under `python -m pytest`. The command genuinely names pytest, the output holds exactly one
-    summary line, and nothing about the text gives it away. Only a report the runner had to
-    actually run to produce — at a path the runtime chose — can tell them apart."""
-    _write(tmp_path, "pytest.py", 'print("2 passed in 0.01s")\n')
+    summary line, and nothing about the text gives it away.
+
+    **Correction.** This test previously asserted that the shadow was caught by producing no
+    report. That was the wrong ground: the shadow reads `--junitxml=` out of its own argv and
+    writes one. What actually stops it is that the workspace is no longer on the import path, so
+    the shadow never becomes the runner — the real one runs and reports the real failure."""
+    _write(tmp_path, "pytest.py", 'import sys\nfor a in sys.argv:\n    if a.startswith("--junitxml="):\n        open(a.split("=", 1)[1], "w").write(\'<testsuites><testsuite name="pytest" tests="2" failures="0" errors="0" skipped="0"><testcase classname="test_real" name="test_f"/><testcase classname="test_real" name="test_g"/></testsuite></testsuites>\')\nprint("2 passed in 0.01s")\nsys.exit(0)\n')
     _write(tmp_path, "test_real.py", "def test_f():\n    assert False\n")
     state = MissionState(objective="shadowed runner")
 
     res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path))
 
-    assert res.status != PASSED, f"a shadowed runner produces no report: {res.summary}"
+    assert res.status == FAILED, f"the real runner must run and report the real failure: {res.summary}"
     rec = state.tests[-1]
-    assert rec.executed == 0 and rec.report_backed is False
+    assert rec.counts["failed"] == 1, "the counts are the real runner's, not the shadow's"
+    assert rec.counts["passed"] == 0 and rec.authority != "engine_attested"
 
 
 def test_a_genuine_run_is_report_backed_and_its_counts_come_from_the_report(tmp_path):
-    _write(tmp_path, "test_ok.py", "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n")
+    _write(tmp_path, "impl.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n")
+    _write(tmp_path, "test_ok.py", "from impl import a, b\n\n\ndef test_a():\n    assert a() == 1\n\n\ndef test_b():\n    assert b() == 2\n")
     state = MissionState(objective="report backed")
 
     res = VerificationEngine(_fabric(tmp_path), state).verify_code([f"{sys.executable} -m pytest -q"], cwd=str(tmp_path))
@@ -1602,11 +1621,16 @@ def test_rule_ambiguous_output_is_inconclusive_without_a_report():
     assert out.executed == 0
 
 
-def test_rule_a_report_outranks_ambiguous_stdout():
-    """With a report, stdout no longer decides anything — including its ambiguity."""
+def test_rule_a_report_does_not_switch_off_the_ambiguity_guard():
+    """**Correction.** This previously asserted that a report outranks ambiguous stdout, and so
+    suppressed the multi-summary guard. That made fabricating a report strictly *better* for an
+    attacker than not fabricating one: the forgery supplied the counts and disabled the check that
+    would have noticed a second summary. A second summary means something other than the runner
+    wrote one, which is true whether or not a report also exists."""
     out = _classify(report_counts={"passed": 2, "failed": 0, "error": 0, "skipped": 0},
                     output="3 passed in 0.12s\n...\n2 passed in 0.01s")
-    assert out.status == PASSED and out.passed == 2
+    assert out.status == INCONCLUSIVE and "more than one runner summary" in out.reason
+    assert out.passed == 0
 
 
 def test_rule_nonzero_exit_with_nothing_executed_fails():

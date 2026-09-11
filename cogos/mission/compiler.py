@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -60,6 +61,41 @@ def gather_repo_context(root: Path, max_entries: int = 60) -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError):
         pass
     return ctx
+
+
+#: File-shaped tokens in a specification. Deliberately narrow: a token has to carry a known
+#: extension, so prose is not mistaken for a deliverable.
+_DELIVERABLE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:py|md|rst|txt|json|ya?ml|toml|csv|tsv|sql|ts|tsx|js|jsx|html|css|ipynb)\b")
+#: Inputs, never deliverables: the specification the mission is compiled *from*, and the files a
+#: repository already has. Naming them as required would make the gate assert that the mission
+#: delivered its own instructions.
+_NOT_DELIVERABLES = frozenset({"readme.md", "requirements.md", "pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini", "makefile"})
+
+
+def derive_required_artifacts(comp: MissionCompilation, ctx: dict[str, Any]) -> list[str]:
+    """Deliverables the compiled mission asks for, derived deterministically.
+
+    `required_artifacts` is the one completion check that asks whether the deliverable was
+    delivered, and it was reachable only through an optional model-authored field that the compile
+    prompt never requests and the fallback compilation never fills — so on every mission it turned
+    itself off. Applicability now comes from the compiled mission instead: the files its
+    specification and its own success criteria name.
+
+    A model-supplied list is kept and added to, never replaced: this widens what must be delivered
+    and cannot narrow it.
+    """
+    out: list[str] = [str(a) for a in comp.required_artifacts]
+    if comp.mission_kind not in ("implementation", "repair"):
+        return out
+    sources = [str(ctx.get("requirements_text") or "")] + [c.description for c in comp.success_criteria]
+    for text in sources:
+        for match in _DELIVERABLE.finditer(text):
+            name = match.group(0)
+            if name.lower() in _NOT_DELIVERABLES or Path(name).name.lower() in _NOT_DELIVERABLES:
+                continue
+            if name not in out:
+                out.append(name)
+    return out
 
 
 class MissionCompiler:
@@ -133,7 +169,7 @@ class MissionCompiler:
         state.executive_model = self.config.executive.model
         state.budget = budget or Budget(**self.config.budget.model_dump())
         state.permissions = dict(permissions or {})
-        state.resources = {"mission_kind": comp.mission_kind, "interpretation": comp.interpretation, "required_artifacts": list(comp.required_artifacts), "required_tests": list(comp.required_tests), "repo_root": str(self.config.repo_root), "compiled_at": iso_now(), "controller": {}}
+        state.resources = {"mission_kind": comp.mission_kind, "interpretation": comp.interpretation, "required_artifacts": derive_required_artifacts(comp, ctx), "required_tests": list(comp.required_tests), "repo_root": str(self.config.repo_root), "compiled_at": iso_now(), "controller": {}}
         state.timestamps.started_at = None
         state.success_criteria = [SuccessCriterion(description=c.description, verification_method=c.verification_method, explicit=c.explicit) for c in comp.success_criteria]
         state.explicit_constraints = list(comp.explicit_constraints)

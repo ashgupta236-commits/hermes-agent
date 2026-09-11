@@ -60,6 +60,11 @@ class Observation(BaseModel):
     scope: ObservationScope = ObservationScope.TOOL_OUTPUT
     trust: TrustLevel = TrustLevel.UNTRUSTED_EXTERNAL
     units: str = Field(default="", description="Units/definitions needed to read the value; omitting these manufactures false blindness")
+    #: How much the observed material is allowed to prove — `EvidenceAuthority` for a test
+    #: record, the artifact's `verified_scope` for a file. The blind assessment reads it: a
+    #: self-reported pass and an attested one look identical in the summary text, and treating
+    #: them alike let the second opinion corroborate a fabricated result.
+    authority: str = ""
     supersedes: Optional[str] = Field(default=None, description="An earlier observation this replaces")
 
     def digest(self) -> dict[str, Any]:

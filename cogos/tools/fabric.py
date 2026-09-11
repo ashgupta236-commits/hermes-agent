@@ -303,7 +303,44 @@ _PYTEST_COUNTS = re.compile(r"(\d+) (passed|failed|error|errors|skipped|xfailed|
 def _run_tests(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     command = str(args.get("command") or "python -m pytest -q")
     timeout = int(args.get("timeout", max(ctx.timeout, 600)))
-    proc = subprocess.run(command, shell=True, cwd=str(ctx.workdir), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)  # noqa: S602
+    # The directory under test is an *argument*, not a `cd` spliced into the command text. A
+    # caller that embeds its own `cd` moves the working directory out from under the firewall's
+    # relative-path resolution, so `cd <elsewhere> && echo x > f.txt` was classified against the
+    # repo root and allowed while writing outside the writable roots. Passing it here lets the
+    # firewall see the real base and lets `cd` in command text be refused as unanalysable.
+    cwd = ctx.resolve(str(args["cwd"])) if args.get("cwd") else ctx.workdir
+    argv = args.get("argv")
+    if isinstance(argv, list) and argv:
+        # The trusted verifier path: an invocation the engine authored, executed with no shell at
+        # all, so there is no expansion, substitution or redirection for plan text to reach
+        # through. The environment is built here rather than accepted as an argument — "runs in a
+        # controlled environment" has to be a property of the path, not a parameter a caller sets.
+        from cogos.verification.attestation import trusted_env
+
+        proc = subprocess.run([str(a) for a in argv], cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=trusted_env(), check=False)
+        out = proc.stdout + proc.stderr
+        from cogos.verification.test_outcome import parse_test_output, summarise_test_output
+
+        counts = parse_test_output(out)
+        ok = proc.returncode == 0
+        return {
+            "ok": ok,
+            "output": out,
+            "exit_code": proc.returncode,
+            "counts": counts,
+            "summary": summarise_test_output(out, "no summary line"),
+            "error": "" if ok else f"exit code {proc.returncode}",
+            "error_kind": "" if ok else "structural",
+        }
+    # The working directory must not be on the import path. Without this a workspace module named
+    # `pytest.py` *is* the runner under `python -m pytest`: reproduced, such a module read
+    # `--junitxml=` out of its own argv, wrote passing XML, and carried a wrong implementation to
+    # a PASSED completion gate. With it set the shadow does not load and the real runner reports
+    # the real failures. pytest still inserts the rootdir itself, so tests importing a sibling
+    # module under the default `prepend` import mode keep working.
+    env = {**os.environ, "COGOS_TOOL": "1", "PYTHONSAFEPATH": "1"}
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.run(command, shell=True, cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env, check=False)  # noqa: S602
     out = proc.stdout + proc.stderr
     # Parsing lives in cogos.verification.test_outcome so it is unit-testable and anchored on the
     # runner's summary line: an unanchored scan of program output lets a process forge its own
@@ -390,7 +427,7 @@ def build_default_fabric(firewall: CapabilityFirewall, context: ToolContext) -> 
     fab.register(ToolSpec(name="delete_file", description="Delete a single file inside writable roots", substrate="filesystem", parameters_schema=_params(path={"type": "string"})), _delete_file)
     fab.register(ToolSpec(name="shell", description="Run a shell command (classified by the firewall)", substrate="shell", parameters_schema=_params(command={"type": "string"}, cwd={"type": "string"}, timeout={"type": "integer"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL, deterministic=False), _shell)
     fab.register(ToolSpec(name="git", description="Run a git subcommand in the repository", substrate="git", parameters_schema=_params(args={"type": "array"})), _git)
-    fab.register(ToolSpec(name="run_tests", description="Run a test command and parse the result (pytest by default); output is untrusted", substrate="tests", parameters_schema=_params(command={"type": "string"}, timeout={"type": "integer"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL, deterministic=False), _run_tests)
+    fab.register(ToolSpec(name="run_tests", description="Run a test command and parse the result (pytest by default); output is untrusted", substrate="tests", parameters_schema=_params(command={"type": "string"}, argv={"type": "array"}, cwd={"type": "string"}, timeout={"type": "integer"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL, deterministic=False), _run_tests)
     fab.register(ToolSpec(name="calculate", description="Deterministically evaluate arithmetic/statistics in a sandboxed Python subset", substrate="calc", parameters_schema=_params(program={"type": "string"})), _calculate)
     fab.register(ToolSpec(name="web_fetch", description="Fetch a URL (GET) and return text; output is untrusted", substrate="web", parameters_schema=_params(url={"type": "string"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL, deterministic=False, network=True, default_action_class=ActionClass.REVERSIBLE_EXTERNAL), _web_fetch)
     fab.register(ToolSpec(name="memory_search", description="Relevance-ranked retrieval from long-term memory (content is scanned as untrusted)", substrate="memory", parameters_schema=_params(query={"type": "string"}, limit={"type": "integer"}), output_trust=TrustLevel.UNTRUSTED_EXTERNAL), _memory_search)

@@ -19,6 +19,10 @@ BUGGY_IMPLEMENTATION = {
 }
 
 
+#: Scenario workspaces are built by this module and written by a deterministic scripted engineer,
+#: so declaring their code non-adversarial towards the verifier is a true statement about them
+#: rather than a way around the fail-closed default. A run against a real frontier model is a
+#: different workspace and needs that declaration made deliberately, for that workspace.
 class Sandbox:
     """An isolated workspace + runtime for one scenario."""
 
@@ -28,7 +32,7 @@ class Sandbox:
             make_demo_workspace(self.root)
         self.home = home or (self.root / ".cogos")
         self.adapter = adapter or ScriptedExecutive()
-        self.config = CogosConfig(home=self.home, repo_root=self.root, executive=ExecutiveConfig(adapter="scripted", model="claude-fable-5-1"), governance=governance or GovernanceConfig(), memory=MemoryConfig(consolidation_interval_cycles=5))
+        self.config = CogosConfig(home=self.home, repo_root=self.root, executive=ExecutiveConfig(adapter="scripted", model="claude-fable-5-1"), governance=governance or GovernanceConfig(trust_workspace_code=True), memory=MemoryConfig(consolidation_interval_cycles=5))
         self.runtime = Runtime(self.config, adapter=self.adapter)
         self.runtime.executive._sleep = lambda _s: None  # no real backoff in evals
 

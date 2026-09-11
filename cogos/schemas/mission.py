@@ -178,6 +178,23 @@ class ArtifactOrigin(str, Enum):
     DECLARED = "declared"
 
 
+class ArtifactExpectation(BaseModel):
+    """What a deliverable's content has to be, declared before it is checked.
+
+    Existence, size and a hash are integrity properties; they say nothing about whether the file
+    is the deliverable. Reproduced: a 20-byte `TODO: write this up` produced an outcome
+    indistinguishable from a finished report at every stage. An expectation is the explicit,
+    deterministic, engine-checkable relation between a criterion and its evidence — and it must be
+    declared in advance, because one invented after reading the file is satisfied by whatever the
+    file happens to say.
+    """
+
+    min_bytes: int = 0
+    must_contain: list[str] = Field(default_factory=list, description="Literal substrings that must be present")
+    must_not_contain: list[str] = Field(default_factory=list, description="Literal substrings that must be absent, e.g. placeholder markers")
+    must_match: str = Field(default="", description="Regular expression that must match somewhere in the file")
+
+
 class Artifact(BaseModel):
     id: str = Field(default_factory=lambda: new_id("art"))
     name: str
@@ -202,6 +219,13 @@ class Artifact(BaseModel):
         "the file and refuses to accept an artifact whose content no longer matches this value.",
     )
     verified_at: Optional[str] = None
+    #: Exactly what `verified` means for this artifact. The boolean alone reads as a claim about
+    #: the deliverable; what is actually established is that a path resolved to a regular
+    #: non-empty file whose bytes hash to a recorded value. A 20-byte `TODO: write this up`
+    #: satisfies that identically to a finished report, so the scope travels with the label.
+    verified_scope: str = Field(default="", description="'existence', or 'existence+content' when a declared expectation was checked")
+    #: Declared in advance by the mission. Without one, `verified` is an integrity claim only.
+    expectation: Optional[ArtifactExpectation] = None
     created_at: str = Field(default_factory=iso_now)
 
 
@@ -235,6 +259,14 @@ class TestRecord(BaseModel):
         default=False,
         description="The verification contract authorized a zero-execution run before it ran.",
     )
+    #: How much this record is allowed to prove. A report written by a process that imports the
+    #: code under test authenticates nothing — filename, nonce, hash, launcher and exit code were
+    #: each defeated in reproduction — so `engine_attested` is reserved for a run the engine's own
+    #: differential control showed to depend on the implementation. `self_reported` is diagnosis.
+    #: The empty default is "written before authority existed", which keeps the older, weaker
+    #: guarantee for restored snapshots rather than failing them retroactively.
+    authority: str = Field(default="", description="engine_attested | self_reported | '' (legacy)")
+    attestation: str = Field(default="", description="Why the run was or was not attested")
 
 
 class Lesson(BaseModel):

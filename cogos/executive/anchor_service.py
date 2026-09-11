@@ -85,6 +85,8 @@ class AnchorService:
             if not artifact.path:
                 continue
             obs = collector.capture_file(Path(artifact.path), scope=ObservationScope.ARTIFACT)
+            # What the ledger is entitled to say about this file, carried with the bytes.
+            obs.authority = artifact.verified_scope or ""
             if (obs.reference, obs.content_hash) in existing:
                 continue
             prior = latest_by_ref.get(obs.reference)
@@ -104,6 +106,7 @@ class AnchorService:
                 reference=ref,
                 scope=ObservationScope.TEST,
                 trust=TrustLevel.VERIFIED_TOOL,
+                authority=rec.authority or "",
             )
             if (obs.reference, obs.content_hash) in existing:
                 continue

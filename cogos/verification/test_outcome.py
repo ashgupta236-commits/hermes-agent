@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
 from cogos.schemas.common import VerificationStatus
+from cogos.verification.attestation import parse_junit
 
 PASSED = VerificationStatus.PASSED
 FAILED = VerificationStatus.FAILED
@@ -125,37 +126,22 @@ def detect_framework(command: str) -> str:
 
 
 def junit_counts(report: Path) -> Optional[dict[str, int]]:
-    """Counts from a JUnit XML report the runner wrote, or None when there is no usable report.
+    """Counts from a JUnit XML report, or None when there is no usable XML.
 
-    This is the only *attributable* source of test counts. Everything else is stdout, which the
-    code under test writes to: a module named ``pytest.py`` in the workspace shadows the real
-    runner under ``python -m pytest``, prints one convincing summary line and exits 0 — the command
-    genuinely names pytest, the output holds exactly one summary, and nothing about the text can
-    give it away. A report at a path *the engine chose* cannot be produced by a runner that never
-    ran.
+    **Correction.** An earlier version of this docstring claimed that "a report at a path the
+    engine chose cannot be produced by a runner that never ran". That claim was false and is
+    withdrawn. An engine-selected output path does not authenticate the producer: the path is
+    handed to the child in its own argv, the child runs as the same uid, and it can write there.
+    Reproduced end to end — a workspace ``pytest.py`` reading ``--junitxml=`` out of ``sys.argv``
+    and writing passing XML carried an implementation returning ``999.0`` to a PASSED completion
+    gate.
+
+    Counts alone therefore carry no authority. What the engine can establish about a run lives in
+    :mod:`cogos.verification.attestation`; this function is the numeric half of that parse, kept
+    for callers that only want totals.
     """
-    import xml.etree.ElementTree as ET
-
-    try:
-        if not report.is_file() or report.stat().st_size == 0:
-            return None
-        root = ET.parse(report).getroot()
-    except (OSError, ET.ParseError):
-        return None
-    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    if not suites:
-        return None
-    total = failures = errors = skipped = 0
-    for suite in suites:
-        try:
-            total += int(suite.get("tests", 0) or 0)
-            failures += int(suite.get("failures", 0) or 0)
-            errors += int(suite.get("errors", 0) or 0)
-            skipped += int(suite.get("skipped", 0) or 0)
-        except ValueError:
-            return None
-    passed = max(0, total - failures - errors - skipped)
-    return {"passed": passed, "failed": failures, "error": errors, "skipped": skipped}
+    parsed = parse_junit(report)
+    return dict(parsed.counts) if parsed is not None else None
 
 
 def summary_lines(output: str) -> list[str]:
@@ -218,7 +204,12 @@ def classify_test_run(
     source: Mapping[str, int] = report_counts if report_counts is not None else (counts or {})
     c = {k: int(source.get(k, 0) or 0) for k in COUNT_KEYS}
     framework = detect_framework(command)
-    ambiguous = (not report_backed) and len(summary_lines(output or "")) > 1
+    # Unconditional, and deliberately not `(not report_backed) and ...`. Making the report
+    # suppress this guard meant an attacker who fabricated a report was strictly better off than
+    # one who did not: the forged report both supplied the counts and switched off the check that
+    # would have noticed a second summary line. A second summary means something other than the
+    # runner wrote one, and that is true whether or not a report also exists.
+    ambiguous = len(summary_lines(output or "")) > 1
     collected_m = _COLLECTED.search(output or "")
     collected = int(collected_m.group(1)) if collected_m else None
     collection_error = bool(_COLLECTION_ERROR.search(output or ""))

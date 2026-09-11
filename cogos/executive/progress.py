@@ -57,6 +57,7 @@ class VerifiableProgress(BaseModel):
 
 def measure(state: Any) -> VerifiableProgress:
     """Read the current verifiable-progress vector off mission state."""
+    from cogos.verification.attestation import CONTENT_SCOPE
     from cogos.verification.engine import artifact_integrity
 
     criteria = 0
@@ -66,7 +67,10 @@ def measure(state: Any) -> VerifiableProgress:
 
     artifacts = 0
     for a in state.artifacts:
-        if a.verified and artifact_integrity(a)[0]:
+        # Existence is integrity, not progress. A 20-byte `TODO: write this up` counted here
+        # identically to the finished deliverable, so the spend-vs-progress ratio reported
+        # movement for a file that had been created and not written.
+        if a.verified and CONTENT_SCOPE in (a.verified_scope or "") and artifact_integrity(a)[0]:
             artifacts += 1
 
     latest: dict[str, Any] = {}

@@ -1455,6 +1455,7 @@ class Executive:
         supported claim carrying at least one evidence item, or a task addressing the criterion that
         carries its own passing receipt. Model text about its own diligence is not material.
         """
+        from cogos.verification.attestation import CONTENT_SCOPE, at_least
         from cogos.verification.engine import _id_timestamp_ms, _iso_to_ms, artifact_integrity, token_overlap
 
         found: list[str] = []
@@ -1462,6 +1463,17 @@ class Executive:
 
         for a in state.artifacts:
             if not a.verified:
+                continue
+            # Same scope rule the test branch below already applies, and for the same reason: a
+            # verified artifact grounds a judgement about what it is *about*. Without this, any
+            # verified file grounded a confident judgement about any criterion — reproduced, an
+            # unrelated "meeting notes" file grounded a judgement about a GDPR-compliance
+            # criterion while the test branch correctly refused an unbound test record.
+            if token_overlap(criterion.description, f"{a.name} {a.summary}") < 0.2:
+                continue
+            if CONTENT_SCOPE not in (a.verified_scope or ""):
+                # Existence is not grounding. Without this an unrelated, or merely present, file
+                # supported a confident judgement about a criterion it says nothing about.
                 continue
             ok, _ = artifact_integrity(a)
             if ok:
@@ -1480,6 +1492,8 @@ class Executive:
                 continue
             if t.counts and t.executed <= 0:
                 continue  # a run that executed nothing grounds nothing
+            if not at_least(getattr(t, "authority", "")):
+                continue  # nor does one the engine could not attest
             found.append(f"passed test record '{t.name}'")
 
         for c in state.claims:

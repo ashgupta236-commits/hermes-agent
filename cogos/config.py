@@ -45,6 +45,25 @@ class GovernanceConfig(BaseModel):
     )
     denied_action_classes: list[str] = Field(default_factory=list)
     max_output_chars: int = 20_000
+    #: Whether the subject workspace's code may be treated as non-adversarial *towards the
+    #: verifier*. Default False, and the default is the honest one.
+    #:
+    #: A test run imports the code under test into the process that reports on it. That process
+    #: can rewrite pytest's internals, unregister the report plugin, mutate result objects, read
+    #: the report path out of its own argv and overwrite the file, and call `os._exit(0)`.
+    #: Measured, not assumed: a `conftest.py` hookwrapper on `pytest_runtest_makereport` turns
+    #: every failure into a pass and the *genuine* runner then writes a genuine, well-formed,
+    #: correctly located, freshly stamped report whose contents are false. `--noconftest` does not
+    #: change this, because the test modules are subject code too.
+    #:
+    #: So same-process verification of adversarial subject code is **not supported** by this
+    #: runtime, and with this flag False the runtime fails closed: an in-process test run is
+    #: capped at `process_observation`, which cannot close a behavioural criterion or pass the
+    #: completion gate. Setting it True is a statement by a human that this particular workspace's
+    #: code is not targeting the verifier — an authorization decision, not a tuning knob. It never
+    #: disables the trusted harness or the differential control; it only permits their result to
+    #: carry authority.
+    trust_workspace_code: bool = False
 
 
 class ExecutiveConfig(BaseModel):
