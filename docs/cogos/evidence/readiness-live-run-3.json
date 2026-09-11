@@ -1,0 +1,89 @@
+{
+  "sha": "5c960714a153dbd9980593bc6f8d4debeebaf7ab",
+  "dirty_tree": true,
+  "verdict": "BLOCKED",
+  "conditions": [
+    {
+      "n": 3,
+      "name": "Real isolation probes pass on the actual execution backend",
+      "met": true,
+      "evidence": "backend=docker 29.3.1 runtime=runc cgroup=v1 security=['name=seccomp,profile=builtin'] gvisor=False image=sha256:95b7828aa83c6e4c\u2026"
+    },
+    {
+      "n": 1,
+      "name": "Correct mission completes with production defaults, no trust exemption",
+      "met": true,
+      "evidence": "test_isolated_verifier.py: 68 passed in 99.64s (0:01:39); real-backend tests skipped: 0"
+    },
+    {
+      "n": 2,
+      "name": "Wrong-code and attack controls block under identical settings",
+      "met": true,
+      "evidence": "the same file's defective-work and forgery cases, same production defaults"
+    },
+    {
+      "n": 4,
+      "name": "Receipts cannot be supplied or promoted by the subject or executive",
+      "met": true,
+      "evidence": "forged-authority, forged-test-record and foreign-contract cases in the same run"
+    },
+    {
+      "n": 5,
+      "name": "Snapshot and resume integrity checks pass",
+      "met": true,
+      "evidence": "post-verification swap, snapshot refusal and persistence round-trip cases"
+    },
+    {
+      "n": 6,
+      "name": "Suites, evals, demo, lint, type checks and every mutation audit pass",
+      "met": true,
+      "evidence": "suite: 682 passed in 167.35s (0:02:47); ruff=clean; ty=clean; evals rc=0; demo rc=0; incident-repair-mutation-audit.sh: 17 guard(s) load-bearing, 0 problem(s); isolated-verifier-mutation-audit.sh: 42 guard(s) load-bearing, 0 problem(s); trust-boundary-mutation-audit.sh: 25 guard(s) load-bearing, 0 problem(s)"
+    },
+    {
+      "n": 7,
+      "name": "The run protocol is internally consistent and frozen",
+      "met": true,
+      "evidence": "stale frozen counts remaining: none; corrections logged in \u00a713"
+    },
+    {
+      "n": 8,
+      "name": "Required model, account access and budget are available",
+      "met": false,
+      "evidence": "requested=claude-fable-5-1; ok=False; models_used=[]; residency=UNKNOWN; error=\"You've reached your Fable limit. Switch to another model to continue.\""
+    },
+    {
+      "n": 9,
+      "name": "No unresolved finding contradicts the stated threat model",
+      "met": true,
+      "evidence": "every mutation guard load-bearing; acceptance matrix green; residual risks recorded in ISOLATION_DECISION.md \u00a71 and \u00a75"
+    }
+  ],
+  "audits": {
+    "incident-repair-mutation-audit.sh": {
+      "exit": 0,
+      "summary": "17 guard(s) load-bearing, 0 problem(s)"
+    },
+    "isolated-verifier-mutation-audit.sh": {
+      "exit": 0,
+      "summary": "42 guard(s) load-bearing, 0 problem(s)"
+    },
+    "trust-boundary-mutation-audit.sh": {
+      "exit": 0,
+      "summary": "25 guard(s) load-bearing, 0 problem(s)"
+    }
+  },
+  "backend": {
+    "available": true,
+    "backend": "docker",
+    "server_version": "29.3.1",
+    "runtime": "runc",
+    "cgroup_version": "1",
+    "security_options": [
+      "name=seccomp,profile=builtin"
+    ],
+    "gvisor": false,
+    "missing": ""
+  },
+  "image_id": "sha256:95b7828aa83c6e4c77bd29aaa2aab95e0818177b0471d073fbfa757c8232908e",
+  "isolation_policy_digest": "4a760409b06189581971ba06b2012f7bc841ec9171d99b772f05da05e160e021"
+}

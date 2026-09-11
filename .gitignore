@@ -147,3 +147,6 @@ infographic/
 
 # cogos runtime state (per-checkout; snapshots are exportable)
 .cogos/
+
+# Environment-specific proxy CA, copied in by cogos/verification/runtime/build.sh.
+cogos/verification/runtime/proxy-ca.crt

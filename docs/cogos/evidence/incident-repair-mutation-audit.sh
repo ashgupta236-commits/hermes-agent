@@ -6,6 +6,7 @@ SRC=/home/user/hermes-agent
 SP=/tmp/claude-0/-home-user-hermes-agent/fb16b1d9-2c4a-5e50-918a-3785ede49a38/scratchpad
 WORK="$SP/mutate"
 PY="$SRC/.venv/bin/python"
+PASS=0; FAIL=0
 
 run_case() {
   local name="$1" test="$2" pyedit="$3"
@@ -20,20 +21,24 @@ run_case() {
 import pathlib
 $pyedit
 PYEOF
-  ) || { printf '  %-52s %s\n' "$name" "EDIT-ERROR"; return; }
+  ) || { printf '  %-52s %s\n' "$name" "EDIT-ERROR"; FAIL=$((FAIL+1)); return; }
   after=$(cd "$WORK" && find cogos -name '*.py' -exec cat {} + | md5sum)
   if [ "$before" = "$after" ]; then
     printf '  %-52s %s\n' "$name" "MUTATION DID NOT APPLY  <-- fix the harness, not the test"
-    return
+    FAIL=$((FAIL+1)); return
   fi
   local out
-  out=$(cd "$WORK" && PYTHONPATH="$WORK" "$PY" -m pytest "tests/cogos/test_incident_pipeline.py::$test" -q 2>&1 | tail -3)
+  case "$test" in
+    tests/*) target="$test" ;;
+    *)       target="tests/cogos/test_incident_pipeline.py::$test" ;;
+  esac
+  out=$(cd "$WORK" && PYTHONPATH="$WORK" "$PY" -m pytest "$target" -q -p no:randomly 2>&1 | tail -3)
   if echo "$out" | grep -q "1 passed"; then
-    printf '  %-52s %s\n' "$name" "STILL PASSES  <-- test does not cover its guard"
+    printf '  %-52s %s\n' "$name" "STILL PASSES  <-- test does not cover its guard"; FAIL=$((FAIL+1))
   elif echo "$out" | grep -qE "1 failed|1 error"; then
-    printf '  %-52s %s\n' "$name" "fails as expected"
+    printf '  %-52s %s\n' "$name" "fails as expected"; PASS=$((PASS+1))
   else
-    printf '  %-52s %s\n' "$name" "UNCLEAR: $(echo "$out" | head -1)"
+    printf '  %-52s %s\n' "$name" "UNCLEAR: $(echo "$out" | head -1)"; FAIL=$((FAIL+1))
   fi
 }
 
@@ -44,9 +49,11 @@ run_case "composed-command detection" "test_ver1_a_composed_command_cannot_forge
 'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    if _COMPOSED.search(text):\n        return \"unknown\"\n","",1);p.write_text(s)'
 
 run_case "ambiguous-summary detection" "test_rule_ambiguous_output_is_inconclusive_without_a_report" \
-'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    ambiguous = (not report_backed) and len(summary_lines(output or \"\")) > 1","    ambiguous = False",1);p.write_text(s)'
+'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    ambiguous = len(summary_lines(output or \"\")) > 1","    ambiguous = False",1);p.write_text(s)'
 
-run_case "runner-report requirement" "test_a_shadowing_module_cannot_impersonate_the_test_runner" \
+# Repointed: the shadow is now stopped by the import-path guard before the report rule is reached,
+# so that test no longer isolates this one. `unittest` has no trusted path at all, which does.
+run_case "runner-report requirement" "tests/cogos/test_trust_boundary.py::test_unittest_has_no_trusted_path_and_is_never_authoritative" \
 'p=pathlib.Path("cogos/verification/test_outcome.py");s=p.read_text();s=s.replace("    if report_required and not report_backed and framework != \"unknown\":","    if False:",1);p.write_text(s)'
 
 run_case "report-path canonicalisation" "test_r7_two_spellings_of_the_same_file_are_one_artifact" \
@@ -76,10 +83,14 @@ run_case "tool-plan execution for VERIFY" "test_f1_tool_backed_verify_executes_i
 run_case "artifact candidate registration" "test_f3_an_authorized_executive_write_registers_an_unverified_candidate" \
 'p=pathlib.Path("cogos/executive/loop.py");s=p.read_text();s=s.replace("        self._register_written_artifacts(state, call, res, task, before)\n","",1);p.write_text(s)'
 
-run_case "observed-execution requirement" "test_f2b_an_authorized_expected_zero_run_still_does_not_prove_a_criterion" \
+# Repointed: an attested, bound, fresh record that executed nothing isolates this guard; the
+# expected-zero test is now refused earlier by the authority floor.
+run_case "observed-execution requirement" "tests/cogos/test_trust_boundary.py::test_an_attested_record_that_executed_nothing_still_closes_nothing" \
 'p=pathlib.Path("cogos/verification/engine.py");s=p.read_text();s=s.replace("        if not record.counts:\n            return True\n        return record.executed > 0","        return True",1);p.write_text(s)'
 
-run_case "criterion scope binding" "test_f2_an_unrelated_passing_suite_cannot_prove_a_differently_scoped_criterion" \
+# Repointed: the old fixture's records are unattested, so the authority floor refuses them before
+# scope is consulted. This one is attested and green, and differs only in what it was run for.
+run_case "criterion scope binding" "tests/cogos/test_trust_boundary.py::test_an_attested_record_scoped_to_another_criterion_closes_nothing" \
 'p=pathlib.Path("cogos/verification/engine.py");s=p.read_text();s=s.replace("                and self._test_addresses(t, criterion.id)\n","",1);p.write_text(s)'
 
 run_case "zero-execution classification" "test_f2_exit_zero_with_zero_collection_is_inconclusive_never_pass" \
@@ -91,4 +102,7 @@ run_case "judgement authoritative guard" "test_judgement_may_not_upgrade_a_deter
 run_case "receipt version binding at the gate" "test_g2_no_false_completion_when_the_implementation_is_swapped_after_verification" \
 'p=pathlib.Path("cogos/verification/engine.py");s=p.read_text();s=s.replace("    intact: dict[str, Artifact] = {}","    intact: dict[str, Artifact] = {}\n    _DISABLED = True",1);s=s.replace("        judged = [(receipt_inputs_intact(r), r) for r in crs]","        judged = [((True, \"\"), r) for r in crs]",1);s=s.replace("        ok, detail = artifact_integrity(a)","        ok, detail = (True, \"disabled\")",1);p.write_text(s)'
 
+echo "--------------------------------------------------------------------------"
+echo "  $PASS guard(s) load-bearing, $FAIL problem(s)"
 rm -rf "$WORK"
+[ "$FAIL" -eq 0 ]

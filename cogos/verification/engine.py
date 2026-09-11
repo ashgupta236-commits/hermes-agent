@@ -29,11 +29,14 @@ from cogos.ids import iso_now, new_id
 from cogos.schemas.beliefs import Claim, ClaimStatus, EvidenceKind
 from cogos.schemas.common import VerificationStatus
 from cogos.schemas.decisions import Decision
-from cogos.schemas.mission import Artifact, MissionState, SuccessCriterion, Task, TaskStatus, TestRecord
+from cogos.schemas.mission import Artifact, ArtifactOrigin, MissionState, SuccessCriterion, Task, TaskStatus, TestRecord
 from cogos.schemas.tools import ToolCall
 from cogos.schemas.verification import InputVersion, VerificationCheck, VerificationResult, cite
 from cogos.tools.fabric import ToolFabric
+from cogos.verification.contract import ACCEPTANCE_KEY, AcceptanceContract
+from cogos.verification.isolation import IsolationPolicy
 from cogos.verification.attestation import (
+    BEHAVIOUR_SCOPE,
     CONTENT_SCOPE,
     EXISTENCE_SCOPE,
     KNOWN_FRAMEWORKS,
@@ -440,6 +443,158 @@ class VerificationEngine:
             for p in _workspace_inputs(Path(cwd)):
                 _add(str(p), None)
         return out
+
+    # -- isolated behavioural verification -------------------------------------------
+
+    def verify_behaviour(
+        self,
+        contract: "AcceptanceContract",
+        workspace: str,
+        *,
+        task_id: Optional[str] = None,
+        criterion_ids: Optional[list[str]] = None,
+        policy: Optional["IsolationPolicy"] = None,
+    ) -> VerificationResult:
+        """Decide the approved contract against a workspace, inside the execution boundary.
+
+        This is the one path whose conclusion the controller reaches itself. Everything else in this
+        engine reads something a subject process wrote and decides whether to believe it; here the
+        controller chooses the inputs, holds the expected answers, and compares. The subject never
+        receives an expectation, so there is nothing for it to agree with, and a forged
+        ``"passed": true`` on the wire is a key nobody reads.
+
+        A receipt is issued per criterion so that binding, citation and the gate's input-version
+        re-check all work unchanged. **Only this method issues them**: an authority value arriving
+        from a subject or from executive output is data, and there is no path by which it becomes
+        one of these.
+        """
+        from cogos.verification.behavioural import BehaviouralVerifier
+
+        outcome = BehaviouralVerifier(contract, policy).verify(Path(workspace))
+        checks: list[VerificationCheck] = []
+
+        for entry in outcome.existence:
+            checks.append(
+                VerificationCheck(
+                    name=f"existence:{entry['deliverable']}",
+                    status=PASSED if entry["present"] else FAILED,
+                    detail=f"{'present' if entry['present'] else 'absent'}"
+                    + (f", sha256 {str(entry['sha256'])[:12]}…" if entry["present"] else "")
+                    + " (scope: existence only)",
+                    authoritative=True,
+                )
+            )
+        if contract.cases:
+            failed = [c for c in outcome.cases if not c.passed]
+            checks.append(
+                VerificationCheck(
+                    name="behaviour",
+                    status=PASSED if not failed else FAILED,
+                    detail=f"{outcome.cases_passed}/{len(outcome.cases)} controller-chosen cases matched expectations the subject never saw"
+                    + ("" if not failed else ": " + "; ".join(c.detail for c in failed[:3])),
+                    authoritative=True,
+                )
+            )
+        for entry in outcome.structural:
+            checks.append(
+                VerificationCheck(
+                    name=f"structure:{entry['check_id']}",
+                    status=PASSED if entry.get("passed") else FAILED,
+                    detail=str(entry.get("detail", "")),
+                    authoritative=True,
+                )
+            )
+        for entry in outcome.suite:
+            checks.append(
+                VerificationCheck(
+                    name=f"suite_differential:{entry['check_id']}",
+                    status=PASSED if entry.get("passed") else FAILED,
+                    detail=str(entry.get("detail", "")),
+                    authoritative=True,
+                )
+            )
+        if outcome.refusal:
+            # A boundary that could not be established is an absence of evidence. It must not read
+            # as a failing deliverable, and it must never read as a passing one.
+            checks.append(VerificationCheck(name="execution_boundary", status=INCONCLUSIVE, detail=outcome.refusal, authoritative=True))
+        execution_facts: dict[str, Any] = dict(outcome.provenance.get("execution") or {})
+        # The receipt names the contract, the snapshot and the policy it was produced under, so a
+        # contract approved *afterwards* cannot silently re-interpret evidence recorded against a
+        # different one. `_acceptance_checks` refuses a receipt whose contract is not the approved
+        # one rather than assuming they agree.
+        checks.append(
+            VerificationCheck(
+                name="provenance",
+                status=PASSED,
+                detail=(
+                    f"contract={contract.digest()} snapshot={outcome.provenance.get('snapshot_tree_digest', '')} "
+                    f"policy={outcome.provenance.get('isolation_policy_digest', '')} "
+                    f"image={execution_facts.get('image_id', '')} "
+                    f"verifier={outcome.provenance.get('verifier', '')}"
+                ),
+            )
+        )
+
+        # Bind the bytes that produced this result, at the paths the gate will re-read later, so a
+        # deliverable swapped after verification invalidates the receipt through the existing check.
+        snapshot_files = dict(outcome.provenance.get("snapshot_files") or {})
+        input_versions = [
+            InputVersion(path=str(Path(workspace) / name), content_hash=digest, changed_during_verification=False)
+            for name, digest in sorted(snapshot_files.items())
+        ]
+
+        status = _aggregate(checks) if checks else INCONCLUSIVE
+        authority = outcome.authority if status == PASSED else EvidenceAuthority.PROCESS_OBSERVATION
+        if outcome.refusal:
+            authority = EvidenceAuthority.UNTRUSTED_SELF_REPORT
+        summary = f"isolated behavioural verification: {outcome.summary}"
+
+        issued: list[VerificationResult] = []
+        for target_type, target_id in [("behaviour", cid) for cid in (criterion_ids or [])] or [("behaviour", task_id or "behaviour")]:
+            issued.append(
+                self.record(
+                    VerificationResult(
+                        target_type=target_type,
+                        target_id=target_id,
+                        status=status,
+                        summary=summary,
+                        checks=list(checks),
+                        input_versions=list(input_versions),
+                        authority=authority.value,
+                        produced_by_task_id=task_id,
+                    )
+                )
+            )
+        # The deliverables the contract decided are registered as artifacts carrying exactly the
+        # scope that was established: the gate's `required_artifacts` check asks whether the declared
+        # deliverable was delivered, and this is the verification that can answer it. `verified` is
+        # set only for files whose own predicates passed — existence for one it merely found, and
+        # content+behaviour for one the contract actually decided.
+        if self.state is not None:
+            decided = status == PASSED
+            for entry in outcome.existence:
+                name = str(entry["deliverable"])
+                if not entry["present"]:
+                    continue
+                path = str(Path(workspace) / name)
+                artifact = next((a for a in self.state.artifacts if a.path == path or a.name == name), None)
+                if artifact is None:
+                    artifact = Artifact(name=name, kind="code", path=path, summary=f"deliverable declared by {contract.contract_version}", origin=ArtifactOrigin.MISSION_WRITE)
+                    self.state.artifacts.append(artifact)
+                artifact.content_hash = str(entry["sha256"])
+                artifact.verified = decided
+                artifact.verified_hash = artifact.content_hash if decided else None
+                artifact.verified_at = iso_now() if decided else None
+                artifact.verified_scope = (
+                    f"{EXISTENCE_SCOPE}+{CONTENT_SCOPE}+{BEHAVIOUR_SCOPE}" if decided else EXISTENCE_SCOPE
+                )
+
+        # Provenance travels on the mission, keyed by receipt id, so the run can be re-derived.
+        ledger = self.state.resources.setdefault("behavioural_runs", []) if self.state is not None else []
+        if isinstance(ledger, list):
+            ledger.append({"receipt_ids": [r.id for r in issued], "ran_at": iso_now(), **outcome.provenance})
+            del ledger[:-20]
+        return issued[0]
 
     # -- test evidence attestation -------------------------------------------------
 
@@ -989,11 +1144,82 @@ class VerificationEngine:
         ]
         return versions, actions
 
+    def _acceptance_checks(self, criterion: SuccessCriterion, mapped: list[str], created_ms: int) -> list[VerificationCheck]:
+        """Decide a contract-mapped criterion from behavioural receipts alone.
+
+        Every mapped predicate must be carried by a passing check in a behavioural receipt bound to
+        this criterion and newer than it. A receipt that is missing a mapped predicate does not
+        partially satisfy the criterion — the predicate is simply unanswered, and an unanswered
+        predicate blocks rather than defaulting to satisfied.
+        """
+        receipts = [
+            r
+            for r in (self.state.verifications if self.state is not None else [])
+            if r.target_type == "behaviour" and r.target_id == criterion.id and (_iso_to_ms(r.ran_at) or -1) >= created_ms
+        ]
+        if not receipts:
+            return [
+                VerificationCheck(
+                    name="acceptance",
+                    status=FAILED,
+                    detail="no isolated behavioural verification has been run for this criterion",
+                    authoritative=True,
+                )
+            ]
+        receipt = receipts[-1]
+        approved = str(((self.state.resources or {}).get(ACCEPTANCE_KEY) or {}).get("contract_digest") or "")
+        cited = ""
+        for check in receipt.checks:
+            if check.name == "provenance" and "contract=" in check.detail:
+                cited = check.detail.split("contract=", 1)[1].split(" ", 1)[0]
+                break
+        if approved and cited != approved:
+            # Either the receipt predates the approved contract or it was produced against another
+            # one. Neither is evidence about the expectations this mission actually approved.
+            return [
+                VerificationCheck(
+                    name="acceptance",
+                    status=FAILED,
+                    detail=f"the behavioural receipt was produced against contract {cited[:12] or '(none)'}…, not the approved {approved[:12]}…",
+                    authoritative=True,
+                )
+            ]
+        if not at_least(receipt.authority):
+            return [
+                VerificationCheck(
+                    name="acceptance",
+                    status=FAILED,
+                    detail=f"the behavioural receipt carries {authority_of(receipt.authority).value}, below the floor for a behavioural claim: {receipt.summary[:120]}",
+                    authoritative=True,
+                )
+            ]
+        out: list[VerificationCheck] = []
+        for predicate in mapped:
+            covering = [c for c in receipt.checks if c.name == predicate or c.name.startswith(predicate + ":")]
+            if not covering:
+                out.append(VerificationCheck(name=f"acceptance:{predicate}", status=FAILED, detail="the approved contract maps this criterion to a predicate the receipt does not carry", authoritative=True))
+                continue
+            failed = [c for c in covering if c.status != PASSED]
+            out.append(
+                VerificationCheck(
+                    name=f"acceptance:{predicate}",
+                    status=PASSED if not failed else _aggregate(covering),
+                    detail=("; ".join(c.detail for c in failed[:2]) if failed else f"{len(covering)} check(s) held: " + "; ".join(c.detail for c in covering[:2]))[:400],
+                    authoritative=True,
+                )
+            )
+        return out
+
     def _criterion_authority(self, criterion: SuccessCriterion, status: VerificationStatus) -> EvidenceAuthority:
         """The strongest authority behind this criterion, or the weakest when nothing backs it."""
         if status != PASSED:
             return EvidenceAuthority.UNTRUSTED_SELF_REPORT
-        levels = [authority_of(t.authority) for t in self.state.tests if self._test_addresses(t, criterion.id) and t.status == PASSED]
+        levels = [
+            authority_of(r.authority)
+            for r in (self.state.verifications if self.state is not None else [])
+            if r.target_type == "behaviour" and r.target_id == criterion.id and r.status == PASSED
+        ]
+        levels += [authority_of(t.authority) for t in self.state.tests if self._test_addresses(t, criterion.id) and t.status == PASSED]
         levels += [
             EvidenceAuthority.PROCESS_OBSERVATION
             for a in self.state.artifacts
@@ -1063,7 +1289,16 @@ class VerificationEngine:
         evidence_ids: list[str] = []
         created_ms = _id_timestamp_ms(criterion.id) or 0
 
-        if re.search(r"\b(tests?|pytest|unit\s*tests?)\b", method):
+        # When the mission carries an approved acceptance contract and this criterion is mapped to
+        # predicates in it, that mapping is the *only* way the criterion closes. The token-overlap
+        # and "a green suite exists somewhere" routes are not consulted at all: they decide by
+        # resemblance, and resemblance is what let an unrelated passing suite and a placeholder file
+        # satisfy criteria they said nothing about.
+        acceptance = (self.state.resources or {}).get(ACCEPTANCE_KEY) if self.state is not None else None
+        mapped = list(((acceptance or {}).get("criteria") or {}).get(criterion.id) or [])
+        if mapped:
+            checks.extend(self._acceptance_checks(criterion, mapped, created_ms))
+        elif re.search(r"\b(tests?|pytest|unit\s*tests?)\b", method):
             # Scope binds the proof to the claim. A passing suite demonstrates something about the
             # criteria it was *run for*; without that link any unrelated green run would satisfy
             # any criterion whose method happens to mention tests.

@@ -760,6 +760,51 @@ def test_evidence_below_the_floor_cannot_close_a_behavioural_criterion(authority
     assert mission_completion_check(state).status != PASSED
 
 
+def test_an_attested_record_that_executed_nothing_still_closes_nothing():
+    """Isolated from the authority floor: the record is attested, bound and fresh — and empty.
+
+    Execution has to be observed, not inferred. A run that collected tests and executed none of them
+    is a true statement about a run and no statement at all about the code.
+    """
+    from cogos.ids import iso_now
+
+    state = MissionState(objective="executed nothing")
+    criterion = SuccessCriterion(description="the suite passes", verification_method="pytest tests pass")
+    state.success_criteria.append(criterion)
+    state.tests.append(
+        _TestRecord(
+            name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[criterion.id],
+            counts={"passed": 0, "failed": 0, "error": 0, "skipped": 4}, executed=0,
+            authority=EvidenceAuthority.TRUSTED_HARNESS.value,
+        )
+    )
+    engine = VerificationEngine(None, state)
+    assert engine.verify_criterion(criterion).status != PASSED
+    assert criterion.satisfied is False
+    assert mission_completion_check(state).status != PASSED
+
+
+def test_an_attested_record_scoped_to_another_criterion_closes_nothing():
+    """Isolated from the authority floor: fully attested, genuinely green, about something else."""
+    from cogos.ids import iso_now
+
+    state = MissionState(objective="scope binding")
+    target = SuccessCriterion(description="the payments module rounds correctly", verification_method="pytest tests pass")
+    other = SuccessCriterion(description="the linter passes", verification_method="pytest tests pass")
+    state.success_criteria += [target, other]
+    state.tests.append(
+        _TestRecord(
+            name="pytest", status=PASSED, ran_at=iso_now(), criterion_ids=[other.id],
+            counts={"passed": 12, "failed": 0, "error": 0, "skipped": 0}, executed=12,
+            authority=EvidenceAuthority.TRUSTED_HARNESS.value,
+        )
+    )
+    engine = VerificationEngine(None, state)
+    assert engine.verify_criterion(target).status != PASSED, "an unrelated suite closed a criterion it says nothing about"
+    assert target.satisfied is False
+    assert engine.verify_criterion(other).status == PASSED, "the criterion it was actually run for still closes"
+
+
 def test_authority_survives_persistence_and_resume(tmp_path):
     """The level has to be on the durable record, or resume restores evidence without its limits."""
     from cogos.ids import iso_now

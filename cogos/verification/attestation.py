@@ -137,6 +137,10 @@ def at_least(value: object, floor: EvidenceAuthority = BEHAVIOURAL_FLOOR) -> boo
 #: declared an expectation in advance and the engine checked the bytes against it.
 EXISTENCE_SCOPE = "existence"
 CONTENT_SCOPE = "content"
+#: Added when the isolated behavioural verifier decided this file against the approved contract —
+#: a claim about what the file *does*, which is strictly more than what it contains. Kept as a
+#: separate token so that every existing consumer keying on `content` keeps working unchanged.
+BEHAVIOUR_SCOPE = "behaviour"
 
 #: Frameworks the engine has a trusted verifier path for. A framework outside this set cannot
 #: produce evidence above `UNTRUSTED_SELF_REPORT` here, whatever its output looks like.
